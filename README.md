@@ -7,6 +7,14 @@ MORK seeks to retrofit Hyperon with a state-of-the-art graph database and a spec
 
 By rearchitecting certain Hyperon bottlenecks, MORK has the potential to accelerate important use cases by thousands to millions of times.  That kind of speedup represents a qualitative jump in capabilities.  It's the difference between running a training step vs. finishing the training in the same amount of time.  It's the difference between a thousand input samples vs. millions, or a crocodile's brain vs. a human's.  Deep learning has advanced due in part to the software platforms that exposed the full capabilities of underlying hardware, and we hope Hyperon + MORK can help do that for symbolic AI.
 
+## Install
+
+### Prerequisites
+
+- [PathMap](https://github.com/Adam-Vandervorst/PathMap)
+
+### Build
+
 ## Roadmap
 
 ### Deliverable 1 - Graph database with efficient queries
