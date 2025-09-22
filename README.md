@@ -11,9 +11,26 @@ By rearchitecting certain Hyperon bottlenecks, MORK has the potential to acceler
 
 ### Prerequisites
 
+- Rust 1.88 or above (you may need do `rustup update`)
 - [PathMap](https://github.com/Adam-Vandervorst/PathMap)
 
 ### Build
+
+Build PathMap
+
+```bash
+git clone git@github.com:Adam-Vandervorst/PathMap.git
+cd PathMap
+cargo build --release
+```
+
+Build MORK
+
+```bash
+git clone git@github.com:trueagi-io/MORK.git
+cd MORK/kernel
+cargo build --release
+```
 
 ## Roadmap
 
