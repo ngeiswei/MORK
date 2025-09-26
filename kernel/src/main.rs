@@ -1285,6 +1285,141 @@ fn lens_composition() {
     assert!(res.contains("(lens ((ns o aunt) (users (adam (experiments (poi $a)))) $a $b (users (adam (experiments (result ($b aunt of $a)))))))"));
 }
 
+// Attempt to implement the following program
+//     (double Z) = Z
+//     (double (S $k)) = (S (S (double $k)))
+// Foward version, generate all answers
+fn double_forward() {
+    let mut s = Space::new();
+    let SPACE = r#"
+    (DoubleOf Z Z)
+    (exec R (, (DoubleOf $x $y)
+               (exec R $p $r))
+            (, (DoubleOf (S $x) (S (S $y)))
+               (exec R $p $r)))
+    "#;
+
+    s.load_all_sexpr(SPACE.as_bytes()).unwrap();
+
+    let mut t0 = Instant::now();
+    let steps = s.metta_calculus(5);
+    println!("elapsed {} steps {} size {}",
+             t0.elapsed().as_millis(), steps, s.btm.val_count());
+
+    let mut v = vec![];
+    s.dump_all_sexpr(&mut v).unwrap();
+    let res = String::from_utf8(v).unwrap();
+
+    println!("{res}");
+    assert!(res.contains("(DoubleOf (S (S (S (S (S (S Z)))))) (S (S (S (S (S (S (S (S (S (S (S (S Z)))))))))))))"));
+}
+
+// Attempt to implement the following program
+//     (double Z) = Z
+//     (double (S $k)) = (S (S (double $k)))
+// Backward version, only generate answers leading to query
+fn double_backward() {
+    let mut s = Space::new();
+
+    // NEXT: implement string s-expr generators to experiment with
+    // different values
+
+    // Emulate a stack
+    // - ☐ represents the empty stack
+    // - ∷ represents the push constructor
+    // - ⧺ represents the double function
+    // - ↦ represents the mapping between input and output of double
+    let SPACE_STACK = r#"
+    (exec (s (s z))
+          (, (∷ (⧺ (S $x)) $tail)
+             (exec (s $l) $p $t))
+          (, (- (∷ (⧺ (S $x)) $tail))
+             (∷ (⧺ $x) (∷ (⧺ (S $x)) $tail))
+             (exec $l $p $t)))
+    (exec |
+          (, (∷ (⧺ Z) $tail))
+          (, (- (∷ (⧺ Z) $tail))
+             $tail
+             (↦ Z Z)))
+    (exec ~
+          (, (∷ (⧺ (S $x)) $tail)
+             (↦ $x $y)
+             (exec ~ $p $t))
+          (, (- (∷ (⧺ (S $x)) $tail))
+             $tail
+             (↦ (S $x) (S (S $y)))
+             (exec ~ $p $t)))
+
+    (∷ (⧺ (S (S Z))) ☐)
+    "#;
+
+    s.load_all_sexpr(SPACE_STACK.as_bytes()).unwrap();
+
+    let mut t0 = Instant::now();
+    let steps = s.metta_calculus(5);
+    println!("elapsed {} steps {} size {}",
+             t0.elapsed().as_millis(), steps, s.btm.val_count());
+
+    let mut v = vec![];
+    s.dump_all_sexpr(&mut v).unwrap();
+    let res = String::from_utf8(v).unwrap();
+
+    println!("{res}");
+    // assert!(res.contains("(DoubleOf (S (S (S (S (S (S Z)))))) (S (S (S (S (S (S (S (S (S (S (S (S Z)))))))))))))"));
+}
+
+// // Attempt to implement the following program
+// // (map inc xs)
+// // where inc is an incrementer over Nat and xs is a list of Nat
+// fn nat_map() {
+//     let mut s = Space::new();
+
+//     // let SPACE = r#"
+//     // ((= f Nil) Nil)
+//     // ((= f (Cons $h $t)) (Cons (S $h) (f $t)))
+
+//     // (exec P1 (, (Input $x) ((= foo $x) $y))
+//     //          (, (Output $y))
+//     // (exec P2 (, (Input (Cons $h $t)) ((= foo $x) $y))(OutputOf $t $rt)
+//     //          (, (OutputOf (Cons $h $t) (Cons (S $h) $rt))
+
+//     // (Input Nil)
+//     // "#;
+//     // let SPACE = r#"
+//     // (exec B (, (Input Nil))
+//     //         (, (OutputOf Nil Nil)))
+//     // (exec R (, (Input (Cons $h $t)) (OutputOf $t $rt)
+//     //            (exec R $p $r))
+//     //         (, (OutputOf (Cons $h $t) (Cons (S $h) $rt)))
+//     //            (exec R $p $r))
+
+//     // (Input (Cons Z Nil))
+//     // "#;
+//     let SPACE = r#"
+//     (OutputOf Nil Nil)
+//     (exec R (, (OutputOf $t $rt)
+//                (exec R $p $r))
+//             (, (OutputOf (Cons $h $t) (Cons (S $h) $rt)))
+//                (exec R $p $r))
+
+//     (Input (Cons Z Nil))
+//     "#;
+
+//     s.load_all_sexpr(SPACE.as_bytes()).unwrap();
+
+//     let mut t0 = Instant::now();
+//     let steps = s.metta_calculus(20);
+//     println!("elapsed {} steps {} size {}",
+//              t0.elapsed().as_millis(), steps, s.btm.val_count());
+
+//     let mut v = vec![];
+//     s.dump_all_sexpr(&mut v).unwrap();
+//     let res = String::from_utf8(v).unwrap();
+
+//     println!("{res}");
+//     assert!(res.contains("(OutputOf (Cons Z Nil) (Cons (S Z) Nil))"));
+// }
+
 fn bench_transitive_no_unify(nnodes: usize, nedges: usize) {
     use rand::{rngs::StdRng, SeedableRng, Rng};
     let mut rng = StdRng::from_seed([0; 32]);
