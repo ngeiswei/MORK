@@ -183,6 +183,11 @@ fn peano(x: usize) -> String {
     else { format!("(S {})", peano(x - 1)) }
 }
 
+fn peano_lc(x: usize) -> String {
+    if x == 0 { "z".to_string() }
+    else { format!("(s {})", peano(x - 1)) }
+}
+
 fn basic() {
     let mut s = Space::new();
 
