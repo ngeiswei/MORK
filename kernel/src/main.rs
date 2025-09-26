@@ -1204,22 +1204,22 @@ fn double_backward() {
     (exec (s (s z))
           (, (∷ (⧺ (S $x)) $tail)
              (exec (s $l) $p $t))
-          (, (- (∷ (⧺ (S $x)) $tail))
-             (∷ (⧺ $x) (∷ (⧺ (S $x)) $tail))
-             (exec $l $p $t)))
+          (O (- (∷ (⧺ (S $x)) $tail))
+             (+ (∷ (⧺ $x) (∷ (⧺ (S $x)) $tail)))
+             (+ (exec $l $p $t))))
     (exec |
           (, (∷ (⧺ Z) $tail))
-          (, (- (∷ (⧺ Z) $tail))
-             $tail
-             (↦ Z Z)))
+          (O (- (∷ (⧺ Z) $tail))
+             (+ $tail)
+             (+ (↦ Z Z))))
     (exec ~
           (, (∷ (⧺ (S $x)) $tail)
              (↦ $x $y)
              (exec ~ $p $t))
-          (, (- (∷ (⧺ (S $x)) $tail))
-             $tail
-             (↦ (S $x) (S (S $y)))
-             (exec ~ $p $t)))
+          (O (- (∷ (⧺ (S $x)) $tail))
+             (+ $tail)
+             (+ (↦ (S $x) (S (S $y))))
+             (+ (exec ~ $p $t))))
 
     (∷ (⧺ (S (S Z))) ☐)
     "#;
@@ -2156,7 +2156,8 @@ fn main() {
     // stv_roman();
     // mm1_forward();
     // mm2_bc();
-    // return;
+    double_backward();
+    return;
 
     let args = Cli::parse();
 
