@@ -1819,33 +1819,6 @@ fn double_replace_plus_right_gc(intermediate_prt: bool, mcs: usize, x: usize) {
     assert!(res.contains(expect.as_str()));
 }
 
-fn bug() {
-    let mut s = Space::new();
-
-    let space = r#"
-    (exec 0
-          (, (foo $x))
-          (O (- (foo $x))
-             (+ (bar $x))))
-    (foo a)
-    "#;
-
-    s.load_all_sexpr(space.as_bytes()).unwrap();
-    let mut initv = vec![];
-    s.dump_all_sexpr(&mut initv).unwrap();
-    let initcontent = String::from_utf8(initv).unwrap();
-    println!("Initial content - double_replace_plus_right_gc:\n{}", initcontent);
-
-    let mut t0 = Instant::now();
-    let steps = s.metta_calculus(0);
-    println!("Complete - double_replace_plus_right_gc: elapsed {}ms, size {}",
-             t0.elapsed().as_millis(), s.btm.val_count());
-    let mut v = vec![];
-    s.dump_all_sexpr(&mut v).unwrap();
-    let res = String::from_utf8(v).unwrap();
-    println!("{res}");
-}
-
 // Attempt to implement the following program
 //     (double Z) = Z
 //     (double (S $k)) = (S (S (double $k)))
@@ -3070,19 +3043,49 @@ fn main() {
     // bench_sink_odd_even_sort(2000);
 
     let x = 100;
-    // double_forward(true, x, x);               // 99ms
-    // double_forward_gc(false, x, x);            // 19ms
-    // double_forward_forloop(false, x+1, x);      // 128ms
-    // double_forward_forloop_gc(false, x+1, x);    // 16ms
-    // double_backward_stack(false, 2*x+3, x);    // 4377ms
-    // double_backward_stack_gc(false, 2*x+3, x); // 165ms
-    // double_backward_bang(false, 2*x+3, x);     // 363ms
-    // double_backward_bang_gc(false, 2*x+3, x);  // 213ms
-    // double_replace_plus_right_gc(false, x+4, x); // 17ms
-    // double_replace_plus_left_gc(false, x+4, x); // 13ms
-    // double_replace_combinator_gc(false, x+4, x); // 17ms
-    bug();
+    double_forward(false, x, x);
+    double_forward_gc(false, x, x);
+    double_forward_forloop(false, x+1, x);
+    double_forward_forloop_gc(false, x+1, x);
+    double_backward_stack(false, 2*x+3, x);
+    double_backward_stack_gc(false, 2*x+3, x);
+    double_backward_bang(false, 2*x+3, x);
+    double_backward_bang_gc(false, 2*x+3, x);
+    double_replace_plus_right_gc(false, x+4, x);
+    double_replace_plus_left_gc(false, x+4, x);
+    double_replace_combinator_gc(false, x+4, x);
     return;
+
+    // // Times are millisecond
+    // +----------------------------+-----------+------------+
+    // |function                    |time(x=100)|time(x=1000)|
+    // +----------------------------+-----------+------------+
+    // |double_forward              |99         |63978       |
+    // +----------------------------+-----------+------------+
+    // |double_forward_gc           |19         |419         |
+    // +----------------------------+-----------+------------+
+    // |double_forward_forloop      |128        |92163       |
+    // +----------------------------+-----------+------------+
+    // |double_forward_forloop_gc   |16         |531         |
+    // +----------------------------+-----------+------------+
+    // |double_backward_stack       |4377       |NAN         |
+    // +----------------------------+-----------+------------+
+    // |double_backward_stack_gc    |165        |NAN         |
+    // +----------------------------+-----------+------------+
+    // |double_backward_bang        |363        |1586842     |
+    // +----------------------------+-----------+------------+
+    // |double_backward_bang_gc     |213        |1189732     |
+    // +----------------------------+-----------+------------+
+    // |double_replace_plus_right_gc|17         |547         |
+    // +----------------------------+-----------+------------+
+    // |double_replace_plus_left_gc |13         |488         |
+    // +----------------------------+-----------+------------+
+    // |double_replace_combinator_gc|17         |768         |
+    // +----------------------------+-----------+------------+
+    // |double_petta                |78         |92          |
+    // +----------------------------+-----------+------------+
+    // |double_he                   |180        |9189        |
+    // +----------------------------+-----------+------------+
 
     let args = Cli::parse();
 
