@@ -183,9 +183,9 @@ fn peano(x: usize) -> String {
     else { format!("(S {})", peano(x - 1)) }
 }
 
-fn peano_lc(x: usize) -> String {
-    if x == 0 { "z".to_string() }
-    else { format!("(s {})", peano(x - 1)) }
+fn peano_combinator(x: usize) -> String {
+    if x == 0 { "I".to_string() }
+    else {format!("(. {} S)", peano_combinator(x - 1)) }
 }
 
 fn basic() {
@@ -1293,54 +1293,284 @@ fn lens_composition() {
 // Attempt to implement the following program
 //     (double Z) = Z
 //     (double (S $k)) = (S (S (double $k)))
-// Foward version, generate all answers
-fn double_forward() {
+// Forward version, generate all answers
+fn double_forward(intermediate_prt: bool, mcs: usize, x: usize) {
     let mut s = Space::new();
-    let SPACE = r#"
-    (DoubleOf Z Z)
-    (exec R (, (DoubleOf $x $y)
+
+    // - ↦ represents the mapping between input and output of double
+    let space = r#"
+    (↦ Z Z)
+    (exec R (, (↦ $x $y)
                (exec R $p $r))
-            (, (DoubleOf (S $x) (S (S $y)))
+            (, (↦ (S $x) (S (S $y)))
                (exec R $p $r)))
     "#;
 
-    s.load_all_sexpr(SPACE.as_bytes()).unwrap();
+    s.load_all_sexpr(space.as_bytes()).unwrap();
+    let mut initv = vec![];
+    s.dump_all_sexpr(&mut initv).unwrap();
+    let initcontent = String::from_utf8(initv).unwrap();
+    println!("Initial content - double_forward:\n{}", initcontent);
 
     let mut t0 = Instant::now();
-    let steps = s.metta_calculus(5);
-    println!("elapsed {} steps {} size {}",
-             t0.elapsed().as_millis(), steps, s.btm.val_count());
+    for i in 0..mcs {
+        let steps = s.metta_calculus(0);
+        if intermediate_prt {
+            println!("Iteration {}, steps {}", i, steps);
+            let mut iv = vec![];
+            s.dump_all_sexpr(&mut iv).unwrap();
+            let icontent = String::from_utf8(iv).unwrap();
+            println!("Content:\n{}", icontent);
+        }
+    }
+    println!("Complete - double_forward: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
 
     let mut v = vec![];
     s.dump_all_sexpr(&mut v).unwrap();
     let res = String::from_utf8(v).unwrap();
 
     println!("{res}");
-    assert!(res.contains("(DoubleOf (S (S (S (S (S (S Z)))))) (S (S (S (S (S (S (S (S (S (S (S (S Z)))))))))))))"));
+    let expect = format!("(↦ {} {})", peano(x), peano(2*x));
+    assert!(res.contains(expect.as_str()));
 }
 
 // Attempt to implement the following program
 //     (double Z) = Z
 //     (double (S $k)) = (S (S (double $k)))
-// Backward version, only generate answers leading to query
-fn double_backward() {
+// Forward version, only generate the last answer.
+fn double_forward_gc(intermediate_prt: bool, mcs: usize, x: usize) {
     let mut s = Space::new();
 
-    // NEXT: implement string s-expr generators to experiment with
-    // different values
+    // - ↦ represents the mapping between input and output of double
+    let space = r#"
+    (↦ Z Z)
+    (exec R (, (↦ $x $y)
+               (exec R $p $r))
+            (O (- (↦ $x $y))
+               (+ (↦ (S $x) (S (S $y))))
+               (+ (exec R $p $r))))
+    "#;
+
+    s.load_all_sexpr(space.as_bytes()).unwrap();
+    let mut initv = vec![];
+    s.dump_all_sexpr(&mut initv).unwrap();
+    let initcontent = String::from_utf8(initv).unwrap();
+    println!("Initial content - double_forward_gc:\n{}", initcontent);
+
+    let mut t0 = Instant::now();
+    for i in 0..mcs {
+        let steps = s.metta_calculus(0);
+        if intermediate_prt {
+            println!("Iteration {}, steps {}", i, steps);
+            let mut iv = vec![];
+            s.dump_all_sexpr(&mut iv).unwrap();
+            let icontent = String::from_utf8(iv).unwrap();
+            println!("Content:\n{}", icontent);
+        }
+    }
+    println!("Complete - double_forward_gc: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
+
+    let mut v = vec![];
+    s.dump_all_sexpr(&mut v).unwrap();
+    let res = String::from_utf8(v).unwrap();
+
+    println!("{res}");
+    let expect = format!("(↦ {} {})", peano(x), peano(2*x));
+    assert!(res.contains(expect.as_str()));
+}
+
+// Attempt to implement the following program
+//     (double Z) = Z
+//     (double (S $k)) = (S (S (double $k)))
+//
+// Forward version, generate all answers till the priority reaches
+// zero (emulating a for loop).
+fn double_forward_forloop(intermediate_prt: bool, mcs: usize, x: usize) {
+    let mut s = Space::new();
+
+    // - ↦ represents the mapping between input and output of double
+    let space = format!(r#"
+    (↦ Z Z)
+    (exec {px} (, (↦ $x $y)
+               (exec (S $l) $p $r))
+            (, (↦ (S $x) (S (S $y)))
+               (exec $l $p $r)))
+    "#, px = peano(x));
+
+    s.load_all_sexpr(space.as_bytes()).unwrap();
+    let mut initv = vec![];
+    s.dump_all_sexpr(&mut initv).unwrap();
+    let initcontent = String::from_utf8(initv).unwrap();
+    println!("Initial content - double_forward_forloop:\n{}", initcontent);
+
+    let mut t0 = Instant::now();
+    for i in 0..mcs {
+        let steps = s.metta_calculus(0);
+        if intermediate_prt {
+            println!("Iteration {}, steps {}", i, steps);
+            let mut iv = vec![];
+            s.dump_all_sexpr(&mut iv).unwrap();
+            let icontent = String::from_utf8(iv).unwrap();
+            println!("Content:\n{}", icontent);
+        }
+    }
+    println!("Complete - double_forward_forloop: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
+
+    let mut v = vec![];
+    s.dump_all_sexpr(&mut v).unwrap();
+    let res = String::from_utf8(v).unwrap();
+
+    println!("{res}");
+    let expect = format!("(↦ {} {})", peano(x), peano(2*x));
+    assert!(res.contains(expect.as_str()));
+}
+
+// Attempt to implement the following program
+//     (double Z) = Z
+//     (double (S $k)) = (S (S (double $k)))
+//
+// Forward version, generate all answers till the priority reaches
+// zero (emulating a for loop), with garbage collection.
+fn double_forward_forloop_gc(intermediate_prt: bool, mcs: usize, x: usize) {
+    let mut s = Space::new();
+
+    // - ↦ represents the mapping between input and output of double
+    let space = format!(r#"
+    (↦ Z Z)
+    (exec {px} (, (↦ $x $y)
+               (exec (S $l) $p $r))
+            (O (- (↦ $x $y))
+               (+ (↦ (S $x) (S (S $y))))
+               (+ (exec $l $p $r))))
+    "#, px = peano(x));
+
+    s.load_all_sexpr(space.as_bytes()).unwrap();
+    let mut initv = vec![];
+    s.dump_all_sexpr(&mut initv).unwrap();
+    let initcontent = String::from_utf8(initv).unwrap();
+    println!("Initial content - double_forward_forloop_gc:\n{}", initcontent);
+
+    let mut t0 = Instant::now();
+    for i in 0..mcs {
+        let steps = s.metta_calculus(0);
+        if intermediate_prt {
+            println!("Iteration {}, steps {}", i, steps);
+            let mut iv = vec![];
+            s.dump_all_sexpr(&mut iv).unwrap();
+            let icontent = String::from_utf8(iv).unwrap();
+            println!("Content:\n{}", icontent);
+        }
+    }
+    println!("Complete - double_forward_forloop_gc: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
+
+    let mut v = vec![];
+    s.dump_all_sexpr(&mut v).unwrap();
+    let res = String::from_utf8(v).unwrap();
+
+    println!("{res}");
+    let expect = format!("(↦ {} {})", peano(x), peano(2*x));
+    assert!(res.contains(expect.as_str()));
+}
+
+// Attempt to implement the following program
+//     (double Z) = Z
+//     (double (S $k)) = (S (S (double $k)))
+//
+// Type: backward, stack, only the stack building phase is garbage
+// collected.
+//
+// Inputs:
+// - mcs is the number of metta_calculus steps
+// - x is the number that is doubled
+fn double_backward_stack(intermediate_prt: bool, mcs: usize, x: usize) {
+    let mut s = Space::new();
 
     // Emulate a stack
     // - ☐ represents the empty stack
     // - ∷ represents the push constructor
     // - ⧺ represents the double function
     // - ↦ represents the mapping between input and output of double
-    let SPACE_STACK = r#"
-    (exec (s (s z))
+    let space_stack = format!(r#"
+    (exec (S Y)
           (, (∷ (⧺ (S $x)) $tail)
-             (exec (s $l) $p $t))
+             (exec (S $l) $p $t))
           (O (- (∷ (⧺ (S $x)) $tail))
              (+ (∷ (⧺ $x) (∷ (⧺ (S $x)) $tail)))
-             (+ (exec $l $p $t))))
+             (+ (exec $x $p $t))))
+    (exec |
+          (, (∷ (⧺ Z) $tail))
+          (, $tail
+             (↦ Z Z)))
+    (exec ~
+          (, (∷ (⧺ (S $x)) $tail)
+             (↦ $x $y)
+             (exec ~ $p $t))
+          (, (∷ (⧺ (S $x)) $tail)
+             (↦ $x $y)
+             $tail
+             (↦ (S $x) (S (S $y)))
+             (exec ~ $p $t)))
+
+    (∷ (⧺ {}) ☐)
+    "#, peano(x));
+
+    s.load_all_sexpr(space_stack.as_bytes()).unwrap();
+    let mut initv = vec![];
+    s.dump_all_sexpr(&mut initv).unwrap();
+    let initcontent = String::from_utf8(initv).unwrap();
+    println!("Initial content - double_backward_stack:\n{}", initcontent);
+
+    let mut t0 = Instant::now();
+    for i in 0..mcs {
+        let steps = s.metta_calculus(0);
+        if intermediate_prt {
+            println!("Iteration {}, steps {}", i, steps);
+            let mut iv = vec![];
+            s.dump_all_sexpr(&mut iv).unwrap();
+            let icontent = String::from_utf8(iv).unwrap();
+            println!("Content:\n{}", icontent);
+        }
+    }
+    println!("Complete - double_backward_stack: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
+
+    let mut v = vec![];
+    s.dump_all_sexpr(&mut v).unwrap();
+    let res = String::from_utf8(v).unwrap();
+
+    println!("{res}");
+    let expect = format!("(↦ {} {})", peano(x), peano(2*x));
+    assert!(res.contains(expect.as_str()));
+}
+
+// Attempt to implement the following program
+//     (double Z) = Z
+//     (double (S $k)) = (S (S (double $k)))
+//
+// Type: backward, stack, everything is garbage collected.
+//
+// Inputs:
+// - mcs is the number of metta_calculus steps
+// - x is the number that is doubled
+fn double_backward_stack_gc(intermediate_prt: bool, mcs: usize, x: usize) {
+    let mut s = Space::new();
+
+    // Emulate a stack
+    // - ☐ represents the empty stack
+    // - ∷ represents the push constructor
+    // - ⧺ represents the double function
+    // - ↦ represents the mapping between input and output of double
+    let space_stack = format!(r#"
+    (exec (S Y)
+          (, (∷ (⧺ (S $x)) $tail)
+             (exec (S $l) $p $t))
+          (O (- (∷ (⧺ (S $x)) $tail))
+             (+ (∷ (⧺ $x) (∷ (⧺ (S $x)) $tail)))
+             (+ (exec $x $p $t))))
     (exec |
           (, (∷ (⧺ Z) $tail))
           (O (- (∷ (⧺ Z) $tail))
@@ -1351,26 +1581,422 @@ fn double_backward() {
              (↦ $x $y)
              (exec ~ $p $t))
           (O (- (∷ (⧺ (S $x)) $tail))
+             (- (↦ $x $y))
              (+ $tail)
              (+ (↦ (S $x) (S (S $y))))
              (+ (exec ~ $p $t))))
 
-    (∷ (⧺ (S (S Z))) ☐)
-    "#;
+    (∷ (⧺ {}) ☐)
+    "#, peano(x));
 
-    s.load_all_sexpr(SPACE_STACK.as_bytes()).unwrap();
+    s.load_all_sexpr(space_stack.as_bytes()).unwrap();
+    let mut initv = vec![];
+    s.dump_all_sexpr(&mut initv).unwrap();
+    let initcontent = String::from_utf8(initv).unwrap();
+    println!("Initial content - double_backward_stack_gc:\n{}", initcontent);
 
     let mut t0 = Instant::now();
-    let steps = s.metta_calculus(5);
-    println!("elapsed {} steps {} size {}",
-             t0.elapsed().as_millis(), steps, s.btm.val_count());
+    for i in 0..mcs {
+        let steps = s.metta_calculus(0);
+        if intermediate_prt {
+            println!("Iteration {}, steps {}", i, steps);
+            let mut iv = vec![];
+            s.dump_all_sexpr(&mut iv).unwrap();
+            let icontent = String::from_utf8(iv).unwrap();
+            println!("Content:\n{}", icontent);
+        }
+    }
+    println!("Complete - double_backward_stack_gc: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
 
     let mut v = vec![];
     s.dump_all_sexpr(&mut v).unwrap();
     let res = String::from_utf8(v).unwrap();
 
     println!("{res}");
-    // assert!(res.contains("(DoubleOf (S (S (S (S (S (S Z)))))) (S (S (S (S (S (S (S (S (S (S (S (S Z)))))))))))))"));
+    let expect = format!("(↦ {} {})", peano(x), peano(2*x));
+    assert!(res.contains(expect.as_str()));
+}
+
+// Attempt to implement the following program
+//     (double Z) = Z
+//     (double (S $k)) = (S (S (double $k)))
+//
+// Type: backward, no stack, bang instead, nothing is garbage
+// collected.
+//
+// Inputs:
+// - mcs is the number of metta_calculus steps
+// - x is the number that is doubled
+fn double_backward_bang(intermediate_prt: bool, mcs: usize, x: usize) {
+    let mut s = Space::new();
+
+    // Emulate a stack
+    // - (! G) represents the goal
+    // - ⧺ represents the double function
+    // - ↦ represents the mapping between input and output of double
+    let space_stack = format!(r#"
+    (exec {px}
+          (, (! (⧺ (S $x)))
+             (exec (S $x) $p $t))
+          (, (! (⧺ $x))
+             (exec $x $p $t)))
+    (exec |
+          (, (! (⧺ Z)))
+          (, (↦ Z Z)))
+    (exec ~
+          (, (! (⧺ (S $x)))
+             (↦ $x $y)
+             (exec ~ $p $t))
+          (, (↦ (S $x) (S (S $y)))
+             (exec ~ $p $t)))
+
+    (! (⧺ {px}))
+    "#, px = peano(x));
+
+    s.load_all_sexpr(space_stack.as_bytes()).unwrap();
+    let mut initv = vec![];
+    s.dump_all_sexpr(&mut initv).unwrap();
+    let initcontent = String::from_utf8(initv).unwrap();
+    println!("Initial content - double_backward_bang:\n{}", initcontent);
+
+    let mut t0 = Instant::now();
+    for i in 0..mcs {
+        let steps = s.metta_calculus(0);
+        if intermediate_prt {
+            println!("Iteration {}, steps {}", i, steps);
+            let mut iv = vec![];
+            s.dump_all_sexpr(&mut iv).unwrap();
+            let icontent = String::from_utf8(iv).unwrap();
+            println!("Content:\n{}", icontent);
+        }
+    }
+    println!("Complete - double_backward_bang: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
+    let mut v = vec![];
+    s.dump_all_sexpr(&mut v).unwrap();
+    let res = String::from_utf8(v).unwrap();
+    println!("{res}");
+
+    let expect = format!("(↦ {} {})", peano(x), peano(2*x));
+    assert!(res.contains(expect.as_str()));
+}
+
+// Attempt to implement the following program
+//     (double Z) = Z
+//     (double (S $k)) = (S (S (double $k)))
+//
+// Type: backward, no stack, bang instead, everything is garbage
+// collected.
+//
+// Inputs:
+// - mcs is the number of metta_calculus steps
+// - x is the number that is doubled
+fn double_backward_bang_gc(intermediate_prt: bool, mcs: usize, x: usize) {
+    let mut s = Space::new();
+
+    // Emulate a stack
+    // - (! G) represents the goal
+    // - ⧺ represents the double function
+    // - ↦ represents the mapping between input and output of double
+    let space_stack = format!(r#"
+    (exec {px}
+          (, (! (⧺ (S $x)))
+             (exec (S $x) $p $t))
+          (, (! (⧺ $x))
+             (exec $x $p $t)))
+    (exec |
+          (, (! (⧺ Z)))
+          (O (- (! (⧺ Z)))
+             (+ (↦ Z Z))))
+    (exec ~
+          (, (! (⧺ (S $x)))
+             (↦ $x $y)
+             (exec ~ $p $t))
+          (O (- (! (⧺ (S $x))))
+             (- (↦ $x $y))
+             (+ (↦ (S $x) (S (S $y))))
+             (+ (exec ~ $p $t))))
+
+    (! (⧺ {px}))
+    "#, px = peano(x));
+
+    s.load_all_sexpr(space_stack.as_bytes()).unwrap();
+    let mut initv = vec![];
+    s.dump_all_sexpr(&mut initv).unwrap();
+    let initcontent = String::from_utf8(initv).unwrap();
+    println!("Initial content - double_backward_bang_gc:\n{}", initcontent);
+
+    let mut t0 = Instant::now();
+    for i in 0..mcs {
+        let steps = s.metta_calculus(0);
+        if intermediate_prt {
+            println!("Iteration {}, steps {}", i, steps);
+            let mut iv = vec![];
+            s.dump_all_sexpr(&mut iv).unwrap();
+            let icontent = String::from_utf8(iv).unwrap();
+            println!("Content:\n{}", icontent);
+        }
+    }
+    println!("Complete - double_backward_bang_gc: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
+    let mut v = vec![];
+    s.dump_all_sexpr(&mut v).unwrap();
+    let res = String::from_utf8(v).unwrap();
+    println!("{res}");
+
+    let expect = format!("(↦ {} {})", peano(x), peano(2*x));
+    assert!(res.contains(expect.as_str()));
+}
+
+// Attempt to implement the following program
+//     (double Z) = Z
+//     (double (S $k)) = (S (S (double $k)))
+//
+// Type: replace, plus, garbage collection.
+//
+// The double function is defined as
+//
+// (⧺ $x) = (+ $x $x)
+//
+// then
+//
+// (+ $x (S $y)) = (+ (S $x) $y)
+// (+ $x Z) = $x
+//
+// Inputs:
+// - mcs is the number of metta_calculus steps
+// - x is the number that is doubled
+fn double_replace_plus_right_gc(intermediate_prt: bool, mcs: usize, x: usize) {
+    let mut s = Space::new();
+
+    let space = format!(r#"
+    (exec 0
+          (, (⧺ $x))
+          (O (- (⧺ $x))
+             (+ (plus $x $x))))
+    (exec 1
+          (, (plus $x (S $y))
+             (exec 1 $p $t))
+          (O (- (plus $x (S $y)))
+             (+ (plus (S $x) $y))
+             (+ (exec 1 $p $t))))
+    (exec 2
+          (, (plus $x Z)
+             (exec 2 $p $t))
+          (O (- (plus $x Z))
+             (+ $x)
+             (+ (exec 2 $p $t))))
+
+    (⧺ {})
+    "#, peano(x));
+
+    s.load_all_sexpr(space.as_bytes()).unwrap();
+    let mut initv = vec![];
+    s.dump_all_sexpr(&mut initv).unwrap();
+    let initcontent = String::from_utf8(initv).unwrap();
+    println!("Initial content - double_replace_plus_right_gc:\n{}", initcontent);
+
+    let mut t0 = Instant::now();
+    for i in 0..mcs {
+        let steps = s.metta_calculus(0);
+        if intermediate_prt {
+            println!("Iteration {}, steps {}", i, steps);
+            let mut iv = vec![];
+            s.dump_all_sexpr(&mut iv).unwrap();
+            let icontent = String::from_utf8(iv).unwrap();
+            println!("Content:\n{}", icontent);
+        }
+    }
+    println!("Complete - double_replace_plus_right_gc: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
+    let mut v = vec![];
+    s.dump_all_sexpr(&mut v).unwrap();
+    let res = String::from_utf8(v).unwrap();
+    println!("{res}");
+
+    let expect = format!("{}", peano(2*x));
+    assert!(res.contains(expect.as_str()));
+}
+
+fn bug() {
+    let mut s = Space::new();
+
+    let space = r#"
+    (exec 0
+          (, (foo $x))
+          (O (- (foo $x))
+             (+ (bar $x))))
+    (foo a)
+    "#;
+
+    s.load_all_sexpr(space.as_bytes()).unwrap();
+    let mut initv = vec![];
+    s.dump_all_sexpr(&mut initv).unwrap();
+    let initcontent = String::from_utf8(initv).unwrap();
+    println!("Initial content - double_replace_plus_right_gc:\n{}", initcontent);
+
+    let mut t0 = Instant::now();
+    let steps = s.metta_calculus(0);
+    println!("Complete - double_replace_plus_right_gc: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
+    let mut v = vec![];
+    s.dump_all_sexpr(&mut v).unwrap();
+    let res = String::from_utf8(v).unwrap();
+    println!("{res}");
+}
+
+// Attempt to implement the following program
+//     (double Z) = Z
+//     (double (S $k)) = (S (S (double $k)))
+//
+// Type: replace, plus, garbage collection.
+//
+// The double function is defined as
+//
+// (⧺ $x) = (+ $x $x)
+//
+// then
+//
+// (+ (S $x) $y) = (+ $x (S $y))
+// (+ Z $x) = $x
+//
+// Inputs:
+// - mcs is the number of metta_calculus steps
+// - x is the number that is doubled
+fn double_replace_plus_left_gc(intermediate_prt: bool, mcs: usize, x: usize) {
+    let mut s = Space::new();
+
+    let space = format!(r#"
+    (exec 0
+          (, (⧺ $x))
+          (O (- (⧺ $x))
+             (+ (plus $x $x))))
+    (exec 1
+          (, (plus (S $x) $y)
+             (exec 1 $p $t))
+          (O (- (plus (S $x) $y))
+             (+ (plus $x (S $y)))
+             (+ (exec 1 $p $t))))
+    (exec 2
+          (, (plus Z $x)
+             (exec 2 $p $t))
+          (O (- (plus Z $x))
+             (+ $x)
+             (+ (exec 2 $p $t))))
+
+    (⧺ {})
+    "#, peano(x));
+
+    s.load_all_sexpr(space.as_bytes()).unwrap();
+    let mut initv = vec![];
+    s.dump_all_sexpr(&mut initv).unwrap();
+    let initcontent = String::from_utf8(initv).unwrap();
+    println!("Initial content - double_replace_plus_left_gc:\n{}", initcontent);
+
+    let mut t0 = Instant::now();
+    for i in 0..mcs {
+        let steps = s.metta_calculus(0);
+        if intermediate_prt {
+            println!("Iteration {}, steps {}", i, steps);
+            let mut iv = vec![];
+            s.dump_all_sexpr(&mut iv).unwrap();
+            let icontent = String::from_utf8(iv).unwrap();
+            println!("Content:\n{}", icontent);
+        }
+    }
+    println!("Complete - double_replace_plus_left_gc: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
+    let mut v = vec![];
+    s.dump_all_sexpr(&mut v).unwrap();
+    let res = String::from_utf8(v).unwrap();
+    println!("{res}");
+
+    let expect = format!("{}", peano(2*x));
+    assert!(res.contains(expect.as_str()));
+}
+
+// Attempt to implement the following program
+//     (double Z) = Z
+//     (double (S $k)) = (S (S (double $k)))
+//
+// Type: replace, combinators, so that
+//
+// Z is represented by I
+// (S Z) is represented by (. I S)
+// (S (S Z)) is represented by (. (. I S) S)
+// (S (S (S Z))) is represented by (. (. (. I S) S) S)
+// etc
+//
+// (. (. I S) (. $x S))
+// ===>
+// (. (. (. I S) S) $x)
+//
+// where S is the successor function, not the S combinator from
+// combinator logic, and I is the identity combinator.
+//
+// The double function is thus defined as
+//
+// (⧺ I) = I
+// (⧺ (. $x S)) = (. (. (⧺ $x) S) S)
+//
+// but we also have
+//
+// (⧺ $x) = (. $x $x)
+//
+// Inputs:
+// - mcs is the number of metta_calculus steps
+// - x is the number that is doubled
+fn double_replace_combinator_gc(intermediate_prt: bool, mcs: usize, x: usize) {
+    let mut s = Space::new();
+
+    let space = format!(r#"
+    (exec 0
+          (, (⧺ $x))
+          (O (- (⧺ $x))
+             (+ (. $x $x))))
+    (exec 1
+          (, (. $x (. $y S))
+             (exec 1 $p $t))
+          (O (- (. $x (. $y S)))
+             (+ (. (. $x S) $y))
+             (+ (exec 1 $p $t))))
+    (exec 2
+          (, (. $x I)
+             (exec 2 $p $t))
+          (O (- (. $x I))
+             (+ $x)
+             (+ (exec 2 $p $t))))
+
+    (⧺ {})
+    "#, peano_combinator(x));
+
+    s.load_all_sexpr(space.as_bytes()).unwrap();
+    let mut initv = vec![];
+    s.dump_all_sexpr(&mut initv).unwrap();
+    let initcontent = String::from_utf8(initv).unwrap();
+    println!("Initial content - double_replace_combinator_gc:\n{}", initcontent);
+
+    let mut t0 = Instant::now();
+    for i in 0..mcs {
+        let steps = s.metta_calculus(0);
+        if intermediate_prt {
+            println!("Iteration {}, steps {}", i, steps);
+            let mut iv = vec![];
+            s.dump_all_sexpr(&mut iv).unwrap();
+            let icontent = String::from_utf8(iv).unwrap();
+            println!("Content:\n{}", icontent);
+        }
+    }
+    println!("Complete - double_backward_combinator_gc: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
+    let mut v = vec![];
+    s.dump_all_sexpr(&mut v).unwrap();
+    let res = String::from_utf8(v).unwrap();
+    println!("{res}");
+
+    let expect = format!("{}", peano_combinator(2*x));
+    assert!(res.contains(expect.as_str()));
 }
 
 // // Attempt to implement the following program
@@ -2442,7 +3068,20 @@ fn main() {
     // sink_wasm_add();
     // bench_cm0(50);
     // bench_sink_odd_even_sort(2000);
-    double_backward();
+
+    let x = 100;
+    // double_forward(true, x, x);               // 99ms
+    // double_forward_gc(false, x, x);            // 19ms
+    // double_forward_forloop(false, x+1, x);      // 128ms
+    // double_forward_forloop_gc(false, x+1, x);    // 16ms
+    // double_backward_stack(false, 2*x+3, x);    // 4377ms
+    // double_backward_stack_gc(false, 2*x+3, x); // 165ms
+    // double_backward_bang(false, 2*x+3, x);     // 363ms
+    // double_backward_bang_gc(false, 2*x+3, x);  // 213ms
+    // double_replace_plus_right_gc(false, x+4, x); // 17ms
+    // double_replace_plus_left_gc(false, x+4, x); // 13ms
+    // double_replace_combinator_gc(false, x+4, x); // 17ms
+    bug();
     return;
 
     let args = Cli::parse();
