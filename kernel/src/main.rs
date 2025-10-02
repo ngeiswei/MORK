@@ -1290,6 +1290,18 @@ fn lens_composition() {
     assert!(res.contains("(lens ((ns o aunt) (users (adam (experiments (poi $a)))) $a $b (users (adam (experiments (result ($b aunt of $a)))))))"));
 }
 
+// Takes a prefix message, a space and print the space preceeded by
+// the message as follows
+//
+// <msg>:
+// <space_content>
+fn printlnSpace(msg: &str, space: &Space) {
+    let mut svec = vec![];
+    space.dump_all_sexpr(&mut svec).unwrap();
+    let scontent = String::from_utf8(svec).unwrap();
+    println!("{}:\n{}", msg, scontent);
+}
+
 // Attempt to implement the following program
 //     (double Z) = Z
 //     (double (S $k)) = (S (S (double $k)))
@@ -1307,20 +1319,14 @@ fn double_forward(intermediate_prt: bool, mcs: usize, x: usize) {
     "#;
 
     s.load_all_sexpr(space.as_bytes()).unwrap();
-    let mut initv = vec![];
-    s.dump_all_sexpr(&mut initv).unwrap();
-    let initcontent = String::from_utf8(initv).unwrap();
-    println!("Initial content - double_forward:\n{}", initcontent);
+    printlnSpace("Initial content - double_forward", &s);
 
     let mut t0 = Instant::now();
     for i in 0..mcs {
         let steps = s.metta_calculus(0);
         if intermediate_prt {
             println!("Iteration {}, steps {}", i, steps);
-            let mut iv = vec![];
-            s.dump_all_sexpr(&mut iv).unwrap();
-            let icontent = String::from_utf8(iv).unwrap();
-            println!("Content:\n{}", icontent);
+            printlnSpace("Content", &s);
         }
     }
     println!("Complete - double_forward: elapsed {}ms, size {}",
@@ -1329,7 +1335,6 @@ fn double_forward(intermediate_prt: bool, mcs: usize, x: usize) {
     let mut v = vec![];
     s.dump_all_sexpr(&mut v).unwrap();
     let res = String::from_utf8(v).unwrap();
-
     println!("{res}");
     let expect = format!("(↦ {} {})", peano(x), peano(2*x));
     assert!(res.contains(expect.as_str()));
@@ -3104,20 +3109,20 @@ fn main() {
     // bench_cm0(50);
     // bench_sink_odd_even_sort(2000);
 
-    let x = 100;
-    double_forward(false, x, x);
-    double_forward_gc(false, x, x);
-    double_forward_forloop(false, x+1, x);
-    double_forward_forloop_gc(false, x+1, x);
-    double_backward_stack(false, 2*x+3, x);
-    double_backward_stack_gc(false, 2*x+3, x);
-    double_backward_bang(false, 2*x+3, x);
-    double_backward_bang_gc(false, 2*x+3, x);
-    double_replace_plus_right_gc(false, x+4, x);
-    double_replace_plus_left_gc(false, x+4, x);
-    double_replace_combinator_gc(false, x+4, x);
+    let x = 2;
+    double_forward(true, x, x);
+    // double_forward_gc(false, x, x);
+    // double_forward_forloop(false, x+1, x);
+    // double_forward_forloop_gc(false, x+1, x);
+    // double_backward_stack(false, 2*x+3, x);
+    // double_backward_stack_gc(false, 2*x+3, x);
+    // double_backward_bang(false, 2*x+3, x);
+    // double_backward_bang_gc(false, 2*x+3, x);
+    // double_replace_plus_right_gc(false, x+4, x);
+    // double_replace_plus_left_gc(false, x+4, x);
+    // double_replace_combinator_gc(false, x+4, x);
 
-    fib_forward_forloop_gc(flase, x, x);
+    // fib_forward_forloop_gc(false, x, x);
     return;
 
     // // Times are millisecond
