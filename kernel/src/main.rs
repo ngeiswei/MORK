@@ -1972,6 +1972,68 @@ fn double_replace_combinator_gc(intermediate_prt: bool, mcs: usize, x: usize) {
     assert!(res.contains(expect.as_str()));
 }
 
+// Attempt to implement the following program
+//     (fib Z) = Z
+//     (fib (S Z)) = (S Z)
+//     (fib (S (S $k))) = (+ (fib (S $k)) (fib $k))
+// Forward version, only generate the last two answers.
+fn fib_forward_forloop_gc(intermediate_prt: bool, mcs: usize, x: usize) {
+    let mut s = Space::new();
+
+    // - ↦ represents the mapping between input and output of double
+    let space = format!(r#"
+    (↦ Z Z)
+    (↦ (S Z) (S Z))
+    (exec {px}
+          (, (↦ $x $y)
+             (↦ (S $x) $z)
+             (exec (S $l) $p $r))
+          (O (- (↦ $x $y))
+             (+ (↦ (S (S $x)) (plus $y $z)))
+             (+ (exec $l $p $r))))
+    (exec 1
+          (, (↦ $x (plus (S $y) $z))
+             (exec ? $p $t))
+          (O (- (↦ $x (plus (S $y) $z)))
+             (+ (↦ $x (plus $y (S $z))))
+             (+ (exec ? $p $t))))
+    (exec 2
+          (, (↦ $x (plus Z $y))
+             (exec ? $p $t))
+          (O (- (↦ $x (plus Z $x)))
+             (+ (↦ $x $y))
+             (+ (exec ? $p $t))))
+    "#, px = peano(x));
+
+    s.load_all_sexpr(space.as_bytes()).unwrap();
+    let mut initv = vec![];
+    s.dump_all_sexpr(&mut initv).unwrap();
+    let initcontent = String::from_utf8(initv).unwrap();
+    println!("Initial content - fib_forward_forloop_gc:\n{}", initcontent);
+
+    let mut t0 = Instant::now();
+    for i in 0..mcs {
+        let steps = s.metta_calculus(0);
+        if intermediate_prt {
+            println!("Iteration {}, steps {}", i, steps);
+            let mut iv = vec![];
+            s.dump_all_sexpr(&mut iv).unwrap();
+            let icontent = String::from_utf8(iv).unwrap();
+            println!("Content:\n{}", icontent);
+        }
+    }
+    println!("Complete - fib_forward_forloop_gc: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
+
+    let mut v = vec![];
+    s.dump_all_sexpr(&mut v).unwrap();
+    let res = String::from_utf8(v).unwrap();
+
+    println!("{res}");
+    let expect = format!("(↦ {} {})", peano(x), peano(2*x));
+    assert!(res.contains(expect.as_str()));
+}
+
 // // Attempt to implement the following program
 // // (map inc xs)
 // // where inc is an incrementer over Nat and xs is a list of Nat
@@ -3054,6 +3116,8 @@ fn main() {
     double_replace_plus_right_gc(false, x+4, x);
     double_replace_plus_left_gc(false, x+4, x);
     double_replace_combinator_gc(false, x+4, x);
+
+    fib_forward_forloop_gc(flase, x, x);
     return;
 
     // // Times are millisecond
