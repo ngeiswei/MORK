@@ -1938,23 +1938,29 @@ fn double_replace_depth(intermediate_prt: bool, mcs: usize, x: usize) {
     let mut s = Space::new();
 
     let space = format!(r#"
-    (exec (0 base_case)
-          (, (⧺ Z)
-          (, Z)))
+    (exec (2 base_case)
+          (, (⧺ Z))
+          (, Z))
     (exec (1 recursive_step)
           (, (⧺ (S $x))
+             (exec (2 base_case)
+                   (, $bp)
+                   (, $bt))
              (exec (1 recursive_step)
-                   (, $dsx $exec1)
-                   (, $sspx exec2)))
+                   (, $rp1 $rp2 $rp3)
+                   (, $rt1 $rt2 $rt3)))
           (, (S (S (⧺ $x)))
+             (exec (2 base_case)
+                   (, (S (S $bp)))
+                   (, (S (S $bt))))
              (exec (1 recursive_step)
-                   (, (S (S $dsx)) $exec1)
-                   (, $sspx $exec1))))
+                   (, (S (S $rp1)) $rp2 $rp3)
+                   (, (S (S $rt1)) $rt2 $rt3))))
     (⧺ {})
     "#, peano(x));
 
     s.load_all_sexpr(space.as_bytes()).unwrap();
-    printlnSpace("Initial content - double_replace_plus_left_gc", &s);
+    printlnSpace("Initial content - double_replace_depth", &s);
 
     let mut t0 = Instant::now();
     for i in 0..mcs {
@@ -1964,7 +1970,7 @@ fn double_replace_depth(intermediate_prt: bool, mcs: usize, x: usize) {
             printlnSpace("Content", &s);
         }
     }
-    println!("Complete - double_replace_plus_left_gc: elapsed {}ms, size {}",
+    println!("Complete - double_replace_depth: elapsed {}ms, size {}",
              t0.elapsed().as_millis(), s.btm.val_count());
     let res = spaceToString(&s);
     println!("{}:\n{}", "Final content", res);
