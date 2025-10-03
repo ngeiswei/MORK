@@ -3056,7 +3056,7 @@ fn main() {
     // bench_cm0(50);
     // bench_sink_odd_even_sort(2000);
 
-    let x = 3;
+    let x = 100;
     // double_forward(false, x, x);
     // double_forward_gc(false, x, x);
     // double_forward_forloop(false, x+1, x);
@@ -3068,12 +3068,10 @@ fn main() {
     // double_replace_plus_right_gc(false, x+4, x);
     // double_replace_plus_left_gc(false, x+4, x);
     // double_replace_combinator_gc(false, x+4, x);
-    // NEXT.1
-    double_replace_depth(true, x, x);
-    // double_replace_depth_gc(true, ?, x);
+    // double_replace_depth(false, x+2, x);
+    // double_replace_depth_gc(false, x+2, x);
 
     // fib_forward_forloop_gc(true, 3*x+100, x);
-    // plus_hierarchy(true, x+2, x);
     return;
 
     // // Times are millisecond
@@ -3102,11 +3100,18 @@ fn main() {
     // +----------------------------+-----------+------------+
     // |double_replace_combinator_gc|17         |768         |
     // +----------------------------+-----------+------------+
-    // |double_petta                |78         |92          |
+    // |double_replace              |408        |NAN         |
+    // +----------------------------+-----------+------------+
+    // |double_replace_depth_gc     |38         |NAN         |
     // +----------------------------+-----------+------------+
     // |double_he                   |180        |9189        |
     // +----------------------------+-----------+------------+
-    // NEXT: add mettalog
+    // |double_mettalog             |4980       |NAN         |
+    // +----------------------------+-----------+------------+
+    // |double_mettalog_compile     |NAN        |NAN         |
+    // +----------------------------+-----------+------------+
+    // |double_petta                |78         |92          |
+    // +----------------------------+-----------+------------+
 
     let args = Cli::parse();
 
