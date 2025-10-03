@@ -1978,60 +1978,49 @@ fn double_replace_depth(intermediate_prt: bool, mcs: usize, x: usize) {
     assert!(res.contains(expect.as_str()));
 }
 
-fn fib(x: usize) -> usize {
-    if (x == 0 || x == 1) {
-        x
-    } else {
-        fib(x - 1) + fib(x - 2)
-    }
-}
-
-// Attempt to implement the following program
-//     (fib Z) = Z
-//     (fib (S Z)) = (S Z)
-//     (fib (S (S $k))) = (+ (fib (S $k)) (fib $k))
-// Forward version, only generate the last two answers.
-fn fib_forward_forloop_gc(intermediate_prt: bool, mcs: usize, x: usize) {
+// Implement the following program:
+//
+//     (double Z) = Z
+//     (double (S $k)) = (S (S (double $k)))
+//
+// Type: push exec down to the leaves, garbage collect.
+//
+// Inputs:
+// - intermediate_prt prints spaces after each step
+// - mcs is the number of metta_calculus steps
+// - x is the number that is doubled
+fn double_replace_depth_gc(intermediate_prt: bool, mcs: usize, x: usize) {
     let mut s = Space::new();
 
-    // - ↦ represents the mapping between input and output of double
     let space = format!(r#"
-    (↦ Z Z)
-    (↦ (S Z) (S Z))
-    (exec {px}
-          (, (↦ $x $y)
-             (↦ (S $x) $z)
-             (exec (S $l) $p $r))
-          (O (- (↦ $x $y))
-             (+ (↦ (S (S $x)) (plus $y $z)))
-             (+ (exec $l $p $r))))
-    (exec 1
-          (, (↦ $x (plus (S $y) $z))
-             (exec 1 $p $t))
-          (O (- (↦ $x (plus (S $y) $z)))
-             (+ (↦ $x (plus $y (S $z))))
-             (+ (exec 1 $p $t))))
-    NEXT
-    (exec i
-          (, (↦ $x (plus $y $z))
-             (exec 1 $p $t))
-          (O (- (↦ $x (plus $y $z)))
-             (+ (↦ $x (plus (exec 1 $p $t))))))
-    (exec j
-          (, (↦ $x (plus $y $z)))
-          (O (- (↦ $x (plus $y $z)))
-             (+ (exec 1 (, 
-             (+ (↦ $x (plus (exec 1 $p $t))))))
-    ~NEXT
-    (exec 2
-          (, (↦ $x (plus Z $y))
-             (exec 2 $p $t))
-          (O (- (↦ $x (plus Z $x)))
-             (+ (↦ $x $y))
-             (+ (exec 2 $p $t))))
-    "#, px = peano(x));
+    (exec (2 base_case)
+          (, (⧺ Z))
+          (O (- (⧺ Z))
+             (+ Z)))
+    (exec (1 recursive_step)
+          (, (⧺ (S $x))
+             (exec (2 base_case)
+                   (, $bp)
+                   (O (- $bt1) (+ $bt2)))
+             (exec (1 recursive_step)
+                   (, $rp1 $rp2 $rp3)
+                   (O (- $rt1) (- $rt2) (+ $rt3) $rt4 $rt5)))
+          (O (- (⧺ (S $x)))
+             (- (exec (2 base_case)
+                      (, $bp)
+                      (O (- $bt1) (+ $bt2))))
+             (+ (S (S (⧺ $x))))
+             (+ (exec (2 base_case)
+                      (, (S (S $bp)))
+                      (O (- (S (S $bt1))) (+ (S (S $bt2))))))
+             (+ (exec (1 recursive_step)
+                      (, (S (S $rp1)) $rp2 $rp3)
+                      (O (- (S (S $rt1))) (- $rp2) (+ (S (S $rt3))) $rt4 $rt5)))))
+    (⧺ {})
+    "#, peano(x));
+
     s.load_all_sexpr(space.as_bytes()).unwrap();
-    printlnSpace("Initial content - fib_forward_forloop_gc", &s);
+    printlnSpace("Initial content - double_replace_depth_gc", &s);
 
     let mut t0 = Instant::now();
     for i in 0..mcs {
@@ -2041,117 +2030,13 @@ fn fib_forward_forloop_gc(intermediate_prt: bool, mcs: usize, x: usize) {
             printlnSpace("Content", &s);
         }
     }
-    println!("Complete - fib_forward_forloop_gc: elapsed {}ms, size {}",
+    println!("Complete - double_replace_depth_gc: elapsed {}ms, size {}",
              t0.elapsed().as_millis(), s.btm.val_count());
     let res = spaceToString(&s);
     println!("{}:\n{}", "Final content", res);
-    let expect = format!("(↦ {} {})", peano(x), peano(fib(x)));
+    let expect = format!("{}", peano(2*x));
     assert!(res.contains(expect.as_str()));
 }
-
-// Find a way to deal with a hierarchy of (plus (plus ...) (plus ...))
-// without brining the computation to the forefront.  Instead push the
-// computation deep down to the leaves.
-fn plus_hierarchy(intermediate_prt: bool, mcs: usize, x: usize) {
-    let mut s = Space::new();
-
-    // - ↦ represents the mapping between input and output of double
-    let space = format!(r#"
-    (↦ Z Z)
-    (↦ (S Z) (S Z))
-    (exec {px}
-          (, (↦ $x $y)
-             (↦ (S $x) $z)
-             (exec (S $l) $p $r))
-          (O (- (↦ $x $y))
-             (+ (↦ (S (S $x)) (plus $y $z)))
-             (+ (exec $l $p $r))))
-    (exec (1 remove_maps_to)
-          (, (↦ $x $y))
-          (O (- (↦ $x $y))
-             (+ $y)))
-    (exec (2 remove_zero)
-          (, (plus Z $y))
-          (, $y))
-    (exec (3 push_left)
-          (, (plus (plus $xp $yp) $zp)
-             NEXT
-             (exec (2 remove_zero) (, $pzy) $y)
-             (exec pushdeep $p $t))
-          (, (exec (2 remove_zero) (, (plus $w $pzy)) (, plus $w $y))
-             (exec (2 remove_zero) (, (plus $pzy $w)) (, plus $y $w))
-             (exec pushdeep $p $t)))
-    "#, px = peano(x));
-    s.load_all_sexpr(space.as_bytes()).unwrap();
-    printlnSpace("Initial content - plus_hierarchy", &s);
-
-    let mut t0 = Instant::now();
-    for i in 0..mcs {
-        let steps = s.metta_calculus(0);
-        if intermediate_prt {
-            println!("Iteration {}, steps {}", i, steps);
-            printlnSpace("Content", &s);
-        }
-    }
-    println!("Complete - plus_hierarchy: elapsed {}ms, size {}",
-             t0.elapsed().as_millis(), s.btm.val_count());
-    let res = spaceToString(&s);
-    println!("{}:\n{}", "Final content", res);
-    let expect = format!("(↦ {} {})", peano(x), peano(fib(x)));
-    assert!(res.contains(expect.as_str()));
-}
-
-// // Attempt to implement the following program
-// // (map inc xs)
-// // where inc is an incrementer over Nat and xs is a list of Nat
-// fn nat_map() {
-//     let mut s = Space::new();
-
-//     // let SPACE = r#"
-//     // ((= f Nil) Nil)
-//     // ((= f (Cons $h $t)) (Cons (S $h) (f $t)))
-
-//     // (exec P1 (, (Input $x) ((= foo $x) $y))
-//     //          (, (Output $y))
-//     // (exec P2 (, (Input (Cons $h $t)) ((= foo $x) $y))(OutputOf $t $rt)
-//     //          (, (OutputOf (Cons $h $t) (Cons (S $h) $rt))
-
-//     // (Input Nil)
-//     // "#;
-//     // let SPACE = r#"
-//     // (exec B (, (Input Nil))
-//     //         (, (OutputOf Nil Nil)))
-//     // (exec R (, (Input (Cons $h $t)) (OutputOf $t $rt)
-//     //            (exec R $p $r))
-//     //         (, (OutputOf (Cons $h $t) (Cons (S $h) $rt)))
-//     //            (exec R $p $r))
-
-//     // (Input (Cons Z Nil))
-//     // "#;
-//     let SPACE = r#"
-//     (OutputOf Nil Nil)
-//     (exec R (, (OutputOf $t $rt)
-//                (exec R $p $r))
-//             (, (OutputOf (Cons $h $t) (Cons (S $h) $rt)))
-//                (exec R $p $r))
-
-//     (Input (Cons Z Nil))
-//     "#;
-
-//     s.load_all_sexpr(SPACE.as_bytes()).unwrap();
-
-//     let mut t0 = Instant::now();
-//     let steps = s.metta_calculus(20);
-//     println!("elapsed {} steps {} size {}",
-//              t0.elapsed().as_millis(), steps, s.btm.val_count());
-
-//     let mut v = vec![];
-//     s.dump_all_sexpr(&mut v).unwrap();
-//     let res = String::from_utf8(v).unwrap();
-
-//     println!("{res}");
-//     assert!(res.contains("(OutputOf (Cons Z Nil) (Cons (S Z) Nil))"));
-// }
 
 fn bench_transitive_no_unify(nnodes: usize, nedges: usize) {
     use rand::{rngs::StdRng, SeedableRng, Rng};
