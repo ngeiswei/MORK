@@ -1335,11 +1335,8 @@ fn double_forward(intermediate_prt: bool, mcs: usize, x: usize) {
     }
     println!("Complete - double_forward: elapsed {}ms, size {}",
              t0.elapsed().as_millis(), s.btm.val_count());
-
-    let mut v = vec![];
-    s.dump_all_sexpr(&mut v).unwrap();
-    let res = String::from_utf8(v).unwrap();
-    println!("{res}");
+    let res = spaceToString(&s);
+    println!("{}:\n{}", "Final content", res);
     let expect = format!("(↦ {} {})", peano(x), peano(2*x));
     assert!(res.contains(expect.as_str()));
 }
@@ -1362,30 +1359,20 @@ fn double_forward_gc(intermediate_prt: bool, mcs: usize, x: usize) {
     "#;
 
     s.load_all_sexpr(space.as_bytes()).unwrap();
-    let mut initv = vec![];
-    s.dump_all_sexpr(&mut initv).unwrap();
-    let initcontent = String::from_utf8(initv).unwrap();
-    println!("Initial content - double_forward_gc:\n{}", initcontent);
+    printlnSpace("Initial content - double_forward_gc", &s);
 
     let mut t0 = Instant::now();
     for i in 0..mcs {
         let steps = s.metta_calculus(0);
         if intermediate_prt {
             println!("Iteration {}, steps {}", i, steps);
-            let mut iv = vec![];
-            s.dump_all_sexpr(&mut iv).unwrap();
-            let icontent = String::from_utf8(iv).unwrap();
-            println!("Content:\n{}", icontent);
+            printlnSpace("Content", &s);
         }
     }
     println!("Complete - double_forward_gc: elapsed {}ms, size {}",
              t0.elapsed().as_millis(), s.btm.val_count());
-
-    let mut v = vec![];
-    s.dump_all_sexpr(&mut v).unwrap();
-    let res = String::from_utf8(v).unwrap();
-
-    println!("{res}");
+    let res = spaceToString(&s);
+    println!("{}:\n{}", "Final content", res);
     let expect = format!("(↦ {} {})", peano(x), peano(2*x));
     assert!(res.contains(expect.as_str()));
 }
@@ -1409,30 +1396,20 @@ fn double_forward_forloop(intermediate_prt: bool, mcs: usize, x: usize) {
     "#, px = peano(x));
 
     s.load_all_sexpr(space.as_bytes()).unwrap();
-    let mut initv = vec![];
-    s.dump_all_sexpr(&mut initv).unwrap();
-    let initcontent = String::from_utf8(initv).unwrap();
-    println!("Initial content - double_forward_forloop:\n{}", initcontent);
+    printlnSpace("Initial content - double_forward_forloop", &s);
 
     let mut t0 = Instant::now();
     for i in 0..mcs {
         let steps = s.metta_calculus(0);
         if intermediate_prt {
             println!("Iteration {}, steps {}", i, steps);
-            let mut iv = vec![];
-            s.dump_all_sexpr(&mut iv).unwrap();
-            let icontent = String::from_utf8(iv).unwrap();
-            println!("Content:\n{}", icontent);
+            printlnSpace("Content", &s);
         }
     }
     println!("Complete - double_forward_forloop: elapsed {}ms, size {}",
              t0.elapsed().as_millis(), s.btm.val_count());
-
-    let mut v = vec![];
-    s.dump_all_sexpr(&mut v).unwrap();
-    let res = String::from_utf8(v).unwrap();
-
-    println!("{res}");
+    let res = spaceToString(&s);
+    println!("{}:\n{}", "Final content", res);
     let expect = format!("(↦ {} {})", peano(x), peano(2*x));
     assert!(res.contains(expect.as_str()));
 }
@@ -1457,30 +1434,20 @@ fn double_forward_forloop_gc(intermediate_prt: bool, mcs: usize, x: usize) {
     "#, px = peano(x));
 
     s.load_all_sexpr(space.as_bytes()).unwrap();
-    let mut initv = vec![];
-    s.dump_all_sexpr(&mut initv).unwrap();
-    let initcontent = String::from_utf8(initv).unwrap();
-    println!("Initial content - double_forward_forloop_gc:\n{}", initcontent);
+    printlnSpace("Initial content - double_forward_forloop_gc", &s);
 
     let mut t0 = Instant::now();
     for i in 0..mcs {
         let steps = s.metta_calculus(0);
         if intermediate_prt {
             println!("Iteration {}, steps {}", i, steps);
-            let mut iv = vec![];
-            s.dump_all_sexpr(&mut iv).unwrap();
-            let icontent = String::from_utf8(iv).unwrap();
-            println!("Content:\n{}", icontent);
+            printlnSpace("Content", &s);
         }
     }
     println!("Complete - double_forward_forloop_gc: elapsed {}ms, size {}",
              t0.elapsed().as_millis(), s.btm.val_count());
-
-    let mut v = vec![];
-    s.dump_all_sexpr(&mut v).unwrap();
-    let res = String::from_utf8(v).unwrap();
-
-    println!("{res}");
+    let res = spaceToString(&s);
+    println!("{}:\n{}", "Final content", res);
     let expect = format!("(↦ {} {})", peano(x), peano(2*x));
     assert!(res.contains(expect.as_str()));
 }
@@ -1528,30 +1495,20 @@ fn double_backward_stack(intermediate_prt: bool, mcs: usize, x: usize) {
     "#, peano(x));
 
     s.load_all_sexpr(space_stack.as_bytes()).unwrap();
-    let mut initv = vec![];
-    s.dump_all_sexpr(&mut initv).unwrap();
-    let initcontent = String::from_utf8(initv).unwrap();
-    println!("Initial content - double_backward_stack:\n{}", initcontent);
+    printlnSpace("Initial content - double_backward_stack", &s);
 
     let mut t0 = Instant::now();
     for i in 0..mcs {
         let steps = s.metta_calculus(0);
         if intermediate_prt {
             println!("Iteration {}, steps {}", i, steps);
-            let mut iv = vec![];
-            s.dump_all_sexpr(&mut iv).unwrap();
-            let icontent = String::from_utf8(iv).unwrap();
-            println!("Content:\n{}", icontent);
+            printlnSpace("Content", &s);
         }
     }
     println!("Complete - double_backward_stack: elapsed {}ms, size {}",
              t0.elapsed().as_millis(), s.btm.val_count());
-
-    let mut v = vec![];
-    s.dump_all_sexpr(&mut v).unwrap();
-    let res = String::from_utf8(v).unwrap();
-
-    println!("{res}");
+    let res = spaceToString(&s);
+    println!("{}:\n{}", "Final content", res);
     let expect = format!("(↦ {} {})", peano(x), peano(2*x));
     assert!(res.contains(expect.as_str()));
 }
@@ -1599,30 +1556,20 @@ fn double_backward_stack_gc(intermediate_prt: bool, mcs: usize, x: usize) {
     "#, peano(x));
 
     s.load_all_sexpr(space_stack.as_bytes()).unwrap();
-    let mut initv = vec![];
-    s.dump_all_sexpr(&mut initv).unwrap();
-    let initcontent = String::from_utf8(initv).unwrap();
-    println!("Initial content - double_backward_stack_gc:\n{}", initcontent);
+    printlnSpace("Initial content - double_backward_stack_gc", &s);
 
     let mut t0 = Instant::now();
     for i in 0..mcs {
         let steps = s.metta_calculus(0);
         if intermediate_prt {
             println!("Iteration {}, steps {}", i, steps);
-            let mut iv = vec![];
-            s.dump_all_sexpr(&mut iv).unwrap();
-            let icontent = String::from_utf8(iv).unwrap();
-            println!("Content:\n{}", icontent);
+            printlnSpace("Content", &s);
         }
     }
     println!("Complete - double_backward_stack_gc: elapsed {}ms, size {}",
              t0.elapsed().as_millis(), s.btm.val_count());
-
-    let mut v = vec![];
-    s.dump_all_sexpr(&mut v).unwrap();
-    let res = String::from_utf8(v).unwrap();
-
-    println!("{res}");
+    let res = spaceToString(&s);
+    println!("{}:\n{}", "Final content", res);
     let expect = format!("(↦ {} {})", peano(x), peano(2*x));
     assert!(res.contains(expect.as_str()));
 }
@@ -1664,29 +1611,20 @@ fn double_backward_bang(intermediate_prt: bool, mcs: usize, x: usize) {
     "#, px = peano(x));
 
     s.load_all_sexpr(space_stack.as_bytes()).unwrap();
-    let mut initv = vec![];
-    s.dump_all_sexpr(&mut initv).unwrap();
-    let initcontent = String::from_utf8(initv).unwrap();
-    println!("Initial content - double_backward_bang:\n{}", initcontent);
+    printlnSpace("Initial content - double_backward_bang", &s);
 
     let mut t0 = Instant::now();
     for i in 0..mcs {
         let steps = s.metta_calculus(0);
         if intermediate_prt {
             println!("Iteration {}, steps {}", i, steps);
-            let mut iv = vec![];
-            s.dump_all_sexpr(&mut iv).unwrap();
-            let icontent = String::from_utf8(iv).unwrap();
-            println!("Content:\n{}", icontent);
+            printlnSpace("Content", &s);
         }
     }
     println!("Complete - double_backward_bang: elapsed {}ms, size {}",
              t0.elapsed().as_millis(), s.btm.val_count());
-    let mut v = vec![];
-    s.dump_all_sexpr(&mut v).unwrap();
-    let res = String::from_utf8(v).unwrap();
-    println!("{res}");
-
+    let res = spaceToString(&s);
+    println!("{}:\n{}", "Final content", res);
     let expect = format!("(↦ {} {})", peano(x), peano(2*x));
     assert!(res.contains(expect.as_str()));
 }
@@ -1731,29 +1669,20 @@ fn double_backward_bang_gc(intermediate_prt: bool, mcs: usize, x: usize) {
     "#, px = peano(x));
 
     s.load_all_sexpr(space_stack.as_bytes()).unwrap();
-    let mut initv = vec![];
-    s.dump_all_sexpr(&mut initv).unwrap();
-    let initcontent = String::from_utf8(initv).unwrap();
-    println!("Initial content - double_backward_bang_gc:\n{}", initcontent);
+    printlnSpace("Initial content - double_backward_bang_gc", &s);
 
     let mut t0 = Instant::now();
     for i in 0..mcs {
         let steps = s.metta_calculus(0);
         if intermediate_prt {
             println!("Iteration {}, steps {}", i, steps);
-            let mut iv = vec![];
-            s.dump_all_sexpr(&mut iv).unwrap();
-            let icontent = String::from_utf8(iv).unwrap();
-            println!("Content:\n{}", icontent);
+            printlnSpace("Content", &s);
         }
     }
     println!("Complete - double_backward_bang_gc: elapsed {}ms, size {}",
              t0.elapsed().as_millis(), s.btm.val_count());
-    let mut v = vec![];
-    s.dump_all_sexpr(&mut v).unwrap();
-    let res = String::from_utf8(v).unwrap();
-    println!("{res}");
-
+    let res = spaceToString(&s);
+    println!("{}:\n{}", "Final content", res);
     let expect = format!("(↦ {} {})", peano(x), peano(2*x));
     assert!(res.contains(expect.as_str()));
 }
@@ -1801,29 +1730,20 @@ fn double_replace_plus_right_gc(intermediate_prt: bool, mcs: usize, x: usize) {
     "#, peano(x));
 
     s.load_all_sexpr(space.as_bytes()).unwrap();
-    let mut initv = vec![];
-    s.dump_all_sexpr(&mut initv).unwrap();
-    let initcontent = String::from_utf8(initv).unwrap();
-    println!("Initial content - double_replace_plus_right_gc:\n{}", initcontent);
+    printlnSpace("Initial content - double_replace_plus_right_gc", &s);
 
     let mut t0 = Instant::now();
     for i in 0..mcs {
         let steps = s.metta_calculus(0);
         if intermediate_prt {
             println!("Iteration {}, steps {}", i, steps);
-            let mut iv = vec![];
-            s.dump_all_sexpr(&mut iv).unwrap();
-            let icontent = String::from_utf8(iv).unwrap();
-            println!("Content:\n{}", icontent);
+            printlnSpace("Content", &s);
         }
     }
     println!("Complete - double_replace_plus_right_gc: elapsed {}ms, size {}",
              t0.elapsed().as_millis(), s.btm.val_count());
-    let mut v = vec![];
-    s.dump_all_sexpr(&mut v).unwrap();
-    let res = String::from_utf8(v).unwrap();
-    println!("{res}");
-
+    let res = spaceToString(&s);
+    println!("{}:\n{}", "Final content", res);
     let expect = format!("{}", peano(2*x));
     assert!(res.contains(expect.as_str()));
 }
@@ -1871,29 +1791,20 @@ fn double_replace_plus_left_gc(intermediate_prt: bool, mcs: usize, x: usize) {
     "#, peano(x));
 
     s.load_all_sexpr(space.as_bytes()).unwrap();
-    let mut initv = vec![];
-    s.dump_all_sexpr(&mut initv).unwrap();
-    let initcontent = String::from_utf8(initv).unwrap();
-    println!("Initial content - double_replace_plus_left_gc:\n{}", initcontent);
+    printlnSpace("Initial content - double_replace_plus_left_gc", &s);
 
     let mut t0 = Instant::now();
     for i in 0..mcs {
         let steps = s.metta_calculus(0);
         if intermediate_prt {
             println!("Iteration {}, steps {}", i, steps);
-            let mut iv = vec![];
-            s.dump_all_sexpr(&mut iv).unwrap();
-            let icontent = String::from_utf8(iv).unwrap();
-            println!("Content:\n{}", icontent);
+            printlnSpace("Content", &s);
         }
     }
     println!("Complete - double_replace_plus_left_gc: elapsed {}ms, size {}",
              t0.elapsed().as_millis(), s.btm.val_count());
-    let mut v = vec![];
-    s.dump_all_sexpr(&mut v).unwrap();
-    let res = String::from_utf8(v).unwrap();
-    println!("{res}");
-
+    let res = spaceToString(&s);
+    println!("{}:\n{}", "Final content", res);
     let expect = format!("{}", peano(2*x));
     assert!(res.contains(expect.as_str()));
 }
@@ -1954,31 +1865,73 @@ fn double_replace_combinator_gc(intermediate_prt: bool, mcs: usize, x: usize) {
     "#, peano_combinator(x));
 
     s.load_all_sexpr(space.as_bytes()).unwrap();
-    let mut initv = vec![];
-    s.dump_all_sexpr(&mut initv).unwrap();
-    let initcontent = String::from_utf8(initv).unwrap();
-    println!("Initial content - double_replace_combinator_gc:\n{}", initcontent);
+    printlnSpace("Initial content - double_replace_combinator_gc", &s);
 
     let mut t0 = Instant::now();
     for i in 0..mcs {
         let steps = s.metta_calculus(0);
         if intermediate_prt {
             println!("Iteration {}, steps {}", i, steps);
-            let mut iv = vec![];
-            s.dump_all_sexpr(&mut iv).unwrap();
-            let icontent = String::from_utf8(iv).unwrap();
-            println!("Content:\n{}", icontent);
+            printlnSpace("Content", &s);
         }
     }
     println!("Complete - double_backward_combinator_gc: elapsed {}ms, size {}",
              t0.elapsed().as_millis(), s.btm.val_count());
-    let mut v = vec![];
-    s.dump_all_sexpr(&mut v).unwrap();
-    let res = String::from_utf8(v).unwrap();
-    println!("{res}");
-
+    let res = spaceToString(&s);
+    println!("{}:\n{}", "Final content", res);
     let expect = format!("{}", peano_combinator(2*x));
     assert!(res.contains(expect.as_str()));
+}
+
+// Implement the following program
+//     (double Z) = Z
+//     (double (S $k)) = (S (S (double $k)))
+//
+// Type: push the exec down to the leaves.
+fn double_replace_depth(intermediate_prt: bool, mcs: usize, x: usize) {
+    let mut s = Space::new();
+
+    let space = format!(r#"
+    (exec (0 base_case)
+          (, (⧺ Z)
+          (, Z)))
+    (exec (1 recursive_step)
+          (, (⧺ (S $x))
+             (exec (1 recursive_step)
+                   (, $dsx $exec1)
+                   (, $sspx exec2)))
+          (, (S (S (⧺ $x)))
+             (exec (1 recursive_step)
+                   (, (S (S $dsx)) $exec1)
+                   (, $sspx $exec1))))
+    (⧺ {})
+    "#, peano(x));
+
+    s.load_all_sexpr(space.as_bytes()).unwrap();
+    printlnSpace("Initial content - double_replace_plus_left_gc", &s);
+
+    let mut t0 = Instant::now();
+    for i in 0..mcs {
+        let steps = s.metta_calculus(0);
+        if intermediate_prt {
+            println!("Iteration {}, steps {}", i, steps);
+            printlnSpace("Content", &s);
+        }
+    }
+    println!("Complete - double_replace_plus_left_gc: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
+    let res = spaceToString(&s);
+    println!("{}:\n{}", "Final content", res);
+    let expect = format!("{}", peano(2*x));
+    assert!(res.contains(expect.as_str()));
+}
+
+fn fib(x: usize) -> usize {
+    if (x == 0 || x == 1) {
+        x
+    } else {
+        fib(x - 1) + fib(x - 2)
+    }
 }
 
 // Attempt to implement the following program
