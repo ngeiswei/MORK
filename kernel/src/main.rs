@@ -1306,10 +1306,17 @@ fn printlnSpace(msg: &str, space: &Space) {
     println!("{}:\n{}", msg, spaceToString(space));
 }
 
-// Attempt to implement the following program
+// Implement the following program
+//
 //     (double Z) = Z
 //     (double (S $k)) = (S (S (double $k)))
-// Forward version, generate all answers
+//
+// Type: forward, generate all answers
+//
+// Inputs:
+// - intermediate_prt prints spaces after each step
+// - mcs is the number of metta_calculus steps
+// - x is the number that is doubled
 fn double_forward(intermediate_prt: bool, mcs: usize, x: usize) {
     let mut s = Space::new();
 
@@ -1341,10 +1348,17 @@ fn double_forward(intermediate_prt: bool, mcs: usize, x: usize) {
     assert!(res.contains(expect.as_str()));
 }
 
-// Attempt to implement the following program
+// Implement the following program
+//
 //     (double Z) = Z
 //     (double (S $k)) = (S (S (double $k)))
-// Forward version, only generate the last answer.
+//
+// Type: forward, only generate the last answer.
+//
+// Inputs:
+// - intermediate_prt prints spaces after each step
+// - mcs is the number of metta_calculus steps
+// - x is the number that is doubled
 fn double_forward_gc(intermediate_prt: bool, mcs: usize, x: usize) {
     let mut s = Space::new();
 
@@ -1377,12 +1391,18 @@ fn double_forward_gc(intermediate_prt: bool, mcs: usize, x: usize) {
     assert!(res.contains(expect.as_str()));
 }
 
-// Attempt to implement the following program
+// Implement the following program
+//
 //     (double Z) = Z
 //     (double (S $k)) = (S (S (double $k)))
 //
-// Forward version, generate all answers till the priority reaches
-// zero (emulating a for loop).
+// Type: forward, generate all answers till the priority reaches zero
+// (emulating a for loop).
+//
+// Inputs:
+// - intermediate_prt prints spaces after each step
+// - mcs is the number of metta_calculus steps
+// - x is the number that is doubled
 fn double_forward_forloop(intermediate_prt: bool, mcs: usize, x: usize) {
     let mut s = Space::new();
 
@@ -1414,12 +1434,18 @@ fn double_forward_forloop(intermediate_prt: bool, mcs: usize, x: usize) {
     assert!(res.contains(expect.as_str()));
 }
 
-// Attempt to implement the following program
+// Implement the following program
+//
 //     (double Z) = Z
 //     (double (S $k)) = (S (S (double $k)))
 //
-// Forward version, generate all answers till the priority reaches
-// zero (emulating a for loop), with garbage collection.
+// Type: forward, generate all answers till the priority reaches zero
+// (emulating a for loop), with garbage collection.
+//
+// Inputs:
+// - intermediate_prt prints spaces after each step
+// - mcs is the number of metta_calculus steps
+// - x is the number that is doubled
 fn double_forward_forloop_gc(intermediate_prt: bool, mcs: usize, x: usize) {
     let mut s = Space::new();
 
@@ -1452,7 +1478,8 @@ fn double_forward_forloop_gc(intermediate_prt: bool, mcs: usize, x: usize) {
     assert!(res.contains(expect.as_str()));
 }
 
-// Attempt to implement the following program
+// Implement the following program
+//
 //     (double Z) = Z
 //     (double (S $k)) = (S (S (double $k)))
 //
@@ -1460,6 +1487,7 @@ fn double_forward_forloop_gc(intermediate_prt: bool, mcs: usize, x: usize) {
 // collected.
 //
 // Inputs:
+// - intermediate_prt prints spaces after each step
 // - mcs is the number of metta_calculus steps
 // - x is the number that is doubled
 fn double_backward_stack(intermediate_prt: bool, mcs: usize, x: usize) {
@@ -1514,12 +1542,14 @@ fn double_backward_stack(intermediate_prt: bool, mcs: usize, x: usize) {
 }
 
 // Attempt to implement the following program
+//
 //     (double Z) = Z
 //     (double (S $k)) = (S (S (double $k)))
 //
 // Type: backward, stack, everything is garbage collected.
 //
 // Inputs:
+// - intermediate_prt prints spaces after each step
 // - mcs is the number of metta_calculus steps
 // - x is the number that is doubled
 fn double_backward_stack_gc(intermediate_prt: bool, mcs: usize, x: usize) {
@@ -1575,6 +1605,7 @@ fn double_backward_stack_gc(intermediate_prt: bool, mcs: usize, x: usize) {
 }
 
 // Attempt to implement the following program
+//
 //     (double Z) = Z
 //     (double (S $k)) = (S (S (double $k)))
 //
@@ -1582,6 +1613,7 @@ fn double_backward_stack_gc(intermediate_prt: bool, mcs: usize, x: usize) {
 // collected.
 //
 // Inputs:
+// - intermediate_prt prints spaces after each step
 // - mcs is the number of metta_calculus steps
 // - x is the number that is doubled
 fn double_backward_bang(intermediate_prt: bool, mcs: usize, x: usize) {
@@ -1630,6 +1662,7 @@ fn double_backward_bang(intermediate_prt: bool, mcs: usize, x: usize) {
 }
 
 // Attempt to implement the following program
+//
 //     (double Z) = Z
 //     (double (S $k)) = (S (S (double $k)))
 //
@@ -1637,6 +1670,7 @@ fn double_backward_bang(intermediate_prt: bool, mcs: usize, x: usize) {
 // collected.
 //
 // Inputs:
+// - intermediate_prt prints spaces after each step
 // - mcs is the number of metta_calculus steps
 // - x is the number that is doubled
 fn double_backward_bang_gc(intermediate_prt: bool, mcs: usize, x: usize) {
@@ -1688,6 +1722,7 @@ fn double_backward_bang_gc(intermediate_prt: bool, mcs: usize, x: usize) {
 }
 
 // Attempt to implement the following program
+//
 //     (double Z) = Z
 //     (double (S $k)) = (S (S (double $k)))
 //
@@ -1703,6 +1738,7 @@ fn double_backward_bang_gc(intermediate_prt: bool, mcs: usize, x: usize) {
 // (+ $x Z) = $x
 //
 // Inputs:
+// - intermediate_prt prints spaces after each step
 // - mcs is the number of metta_calculus steps
 // - x is the number that is doubled
 fn double_replace_plus_right_gc(intermediate_prt: bool, mcs: usize, x: usize) {
@@ -1749,6 +1785,7 @@ fn double_replace_plus_right_gc(intermediate_prt: bool, mcs: usize, x: usize) {
 }
 
 // Attempt to implement the following program
+//
 //     (double Z) = Z
 //     (double (S $k)) = (S (S (double $k)))
 //
@@ -1764,6 +1801,7 @@ fn double_replace_plus_right_gc(intermediate_prt: bool, mcs: usize, x: usize) {
 // (+ Z $x) = $x
 //
 // Inputs:
+// - intermediate_prt prints spaces after each step
 // - mcs is the number of metta_calculus steps
 // - x is the number that is doubled
 fn double_replace_plus_left_gc(intermediate_prt: bool, mcs: usize, x: usize) {
@@ -1809,7 +1847,8 @@ fn double_replace_plus_left_gc(intermediate_prt: bool, mcs: usize, x: usize) {
     assert!(res.contains(expect.as_str()));
 }
 
-// Attempt to implement the following program
+// Implement the following program
+//
 //     (double Z) = Z
 //     (double (S $k)) = (S (S (double $k)))
 //
@@ -1838,6 +1877,7 @@ fn double_replace_plus_left_gc(intermediate_prt: bool, mcs: usize, x: usize) {
 // (⧺ $x) = (. $x $x)
 //
 // Inputs:
+// - intermediate_prt prints spaces after each step
 // - mcs is the number of metta_calculus steps
 // - x is the number that is doubled
 fn double_replace_combinator_gc(intermediate_prt: bool, mcs: usize, x: usize) {
@@ -1884,10 +1924,16 @@ fn double_replace_combinator_gc(intermediate_prt: bool, mcs: usize, x: usize) {
 }
 
 // Implement the following program
+//
 //     (double Z) = Z
 //     (double (S $k)) = (S (S (double $k)))
 //
 // Type: push the exec down to the leaves.
+//
+// Inputs:
+// - intermediate_prt prints spaces after each step
+// - mcs is the number of metta_calculus steps
+// - x is the number that is doubled
 fn double_replace_depth(intermediate_prt: bool, mcs: usize, x: usize) {
     let mut s = Space::new();
 
