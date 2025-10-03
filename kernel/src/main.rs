@@ -1955,44 +1955,97 @@ fn fib_forward_forloop_gc(intermediate_prt: bool, mcs: usize, x: usize) {
              (+ (exec $l $p $r))))
     (exec 1
           (, (↦ $x (plus (S $y) $z))
-             (exec ? $p $t))
+             (exec 1 $p $t))
           (O (- (↦ $x (plus (S $y) $z)))
              (+ (↦ $x (plus $y (S $z))))
-             (+ (exec ? $p $t))))
+             (+ (exec 1 $p $t))))
+    NEXT
+    (exec i
+          (, (↦ $x (plus $y $z))
+             (exec 1 $p $t))
+          (O (- (↦ $x (plus $y $z)))
+             (+ (↦ $x (plus (exec 1 $p $t))))))
+    (exec j
+          (, (↦ $x (plus $y $z)))
+          (O (- (↦ $x (plus $y $z)))
+             (+ (exec 1 (, 
+             (+ (↦ $x (plus (exec 1 $p $t))))))
+    ~NEXT
     (exec 2
           (, (↦ $x (plus Z $y))
-             (exec ? $p $t))
+             (exec 2 $p $t))
           (O (- (↦ $x (plus Z $x)))
              (+ (↦ $x $y))
-             (+ (exec ? $p $t))))
+             (+ (exec 2 $p $t))))
     "#, px = peano(x));
-
     s.load_all_sexpr(space.as_bytes()).unwrap();
-    let mut initv = vec![];
-    s.dump_all_sexpr(&mut initv).unwrap();
-    let initcontent = String::from_utf8(initv).unwrap();
-    println!("Initial content - fib_forward_forloop_gc:\n{}", initcontent);
+    printlnSpace("Initial content - fib_forward_forloop_gc", &s);
 
     let mut t0 = Instant::now();
     for i in 0..mcs {
         let steps = s.metta_calculus(0);
         if intermediate_prt {
             println!("Iteration {}, steps {}", i, steps);
-            let mut iv = vec![];
-            s.dump_all_sexpr(&mut iv).unwrap();
-            let icontent = String::from_utf8(iv).unwrap();
-            println!("Content:\n{}", icontent);
+            printlnSpace("Content", &s);
         }
     }
     println!("Complete - fib_forward_forloop_gc: elapsed {}ms, size {}",
              t0.elapsed().as_millis(), s.btm.val_count());
+    let res = spaceToString(&s);
+    println!("{}:\n{}", "Final content", res);
+    let expect = format!("(↦ {} {})", peano(x), peano(fib(x)));
+    assert!(res.contains(expect.as_str()));
+}
 
-    let mut v = vec![];
-    s.dump_all_sexpr(&mut v).unwrap();
-    let res = String::from_utf8(v).unwrap();
+// Find a way to deal with a hierarchy of (plus (plus ...) (plus ...))
+// without brining the computation to the forefront.  Instead push the
+// computation deep down to the leaves.
+fn plus_hierarchy(intermediate_prt: bool, mcs: usize, x: usize) {
+    let mut s = Space::new();
 
-    println!("{res}");
-    let expect = format!("(↦ {} {})", peano(x), peano(2*x));
+    // - ↦ represents the mapping between input and output of double
+    let space = format!(r#"
+    (↦ Z Z)
+    (↦ (S Z) (S Z))
+    (exec {px}
+          (, (↦ $x $y)
+             (↦ (S $x) $z)
+             (exec (S $l) $p $r))
+          (O (- (↦ $x $y))
+             (+ (↦ (S (S $x)) (plus $y $z)))
+             (+ (exec $l $p $r))))
+    (exec (1 remove_maps_to)
+          (, (↦ $x $y))
+          (O (- (↦ $x $y))
+             (+ $y)))
+    (exec (2 remove_zero)
+          (, (plus Z $y))
+          (, $y))
+    (exec (3 push_left)
+          (, (plus (plus $xp $yp) $zp)
+             NEXT
+             (exec (2 remove_zero) (, $pzy) $y)
+             (exec pushdeep $p $t))
+          (, (exec (2 remove_zero) (, (plus $w $pzy)) (, plus $w $y))
+             (exec (2 remove_zero) (, (plus $pzy $w)) (, plus $y $w))
+             (exec pushdeep $p $t)))
+    "#, px = peano(x));
+    s.load_all_sexpr(space.as_bytes()).unwrap();
+    printlnSpace("Initial content - plus_hierarchy", &s);
+
+    let mut t0 = Instant::now();
+    for i in 0..mcs {
+        let steps = s.metta_calculus(0);
+        if intermediate_prt {
+            println!("Iteration {}, steps {}", i, steps);
+            printlnSpace("Content", &s);
+        }
+    }
+    println!("Complete - plus_hierarchy: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
+    let res = spaceToString(&s);
+    println!("{}:\n{}", "Final content", res);
+    let expect = format!("(↦ {} {})", peano(x), peano(fib(x)));
     assert!(res.contains(expect.as_str()));
 }
 
