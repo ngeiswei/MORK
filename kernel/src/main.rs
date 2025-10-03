@@ -1290,16 +1290,20 @@ fn lens_composition() {
     assert!(res.contains("(lens ((ns o aunt) (users (adam (experiments (poi $a)))) $a $b (users (adam (experiments (result ($b aunt of $a)))))))"));
 }
 
+// Convert the full content of a space into a string
+fn spaceToString(space: &Space) -> String {
+    let mut svec = vec![];
+    space.dump_all_sexpr(&mut svec).unwrap();
+    String::from_utf8(svec).unwrap()
+}
+
 // Takes a prefix message, a space and print the space preceeded by
 // the message as follows
 //
 // <msg>:
 // <space_content>
 fn printlnSpace(msg: &str, space: &Space) {
-    let mut svec = vec![];
-    space.dump_all_sexpr(&mut svec).unwrap();
-    let scontent = String::from_utf8(svec).unwrap();
-    println!("{}:\n{}", msg, scontent);
+    println!("{}:\n{}", msg, spaceToString(space));
 }
 
 // Attempt to implement the following program
