@@ -127,7 +127,7 @@ mod tests {
         assert_eq!(16, s.load_sexpr( SEXPRS0.as_bytes(), expr!(s, "$"), expr!(s, "_1"),).unwrap());
 
         let mut i = 0;
-        s.query(expr!(s, "[2] children [2] $ $"), |_, e| {
+        Space::query_multi(&s.btm, expr!(s, "[2] children [2] $ $"), |_, e| {
             match i {
                 0 => { assert_eq!(sexpr!(s, e), "(children (0 Catherine))") }
                 1 => { assert_eq!(sexpr!(s, e), "(children (1 Thomas))") }
@@ -135,6 +135,7 @@ mod tests {
                 _ => { assert!(false) }
             }
             i += 1;
+            true
         });
     }
 
@@ -145,7 +146,7 @@ mod tests {
 
         s.transform(expr!(s, "[2] children [2] $ $"), expr!(s, "[2] child_results _2"));
         let mut i = 0;
-        s.query(expr!(s, "[2] child_results $x"), |_, e| {
+        Space::query_multi(&s.btm, expr!(s, "[2] child_results $x"), |_, e| {
             match i {
                 0 => { assert_eq!(sexpr!(s, e), "(child_results Catherine)") }
                 1 => { assert_eq!(sexpr!(s, e), "(child_results Thomas)") }
@@ -153,6 +154,7 @@ mod tests {
                 _ => { assert!(false) }
             }
             i += 1;
+            true
         });
     }
 
