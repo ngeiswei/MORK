@@ -144,7 +144,7 @@ mod tests {
         let mut s = Space::new();
         assert_eq!(16, s.load_sexpr(SEXPRS0.as_bytes(), expr!(s, "$"), expr!(s, "_1"),).unwrap());
 
-        s.transform(expr!(s, "[2] children [2] $ $"), expr!(s, "[2] child_results _2"));
+        s.transform_multi_multi_(expr!(s, "[2] children [2] $ $"), expr!(s, "[2] child_results _2"), expr!(s, ""));
         let mut i = 0;
         Space::query_multi(&s.btm, expr!(s, "[2] child_results $x"), |_, e| {
             match i {
