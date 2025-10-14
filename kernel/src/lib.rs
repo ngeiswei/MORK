@@ -35,7 +35,7 @@ mod tests {
         let mut s = Space::new();
         assert_eq!(s.load_sexpr(input.as_bytes(), expr!(s, "$"), expr!(s, "[2] my [2] prefix _1")).unwrap(), 3);
         let mut res = Vec::<u8>::new();
-        s.dump_sexpr(expr!(s, "[2] my [2] prefix $"), expr!(s, "_1"), &mut res).unwrap();
+        s.dump_sexpr(expr!(s, "[2] my [2] prefix $"), expr!(s, "_1"), &mut res);
 
         // the order changed in the test for some reason so we need to use sets to not be concerened by this
         let out = String::from_utf8(res).unwrap();
@@ -49,7 +49,7 @@ mod tests {
         let mut s = Space::new();
         assert_eq!(s.load_csv(csv_input.as_bytes(), expr!(s, "$"), expr!(s, "_1"), b',').unwrap(), 2);
         let mut res = Vec::<u8>::new();
-        s.dump_sexpr(expr!(s, "$"), expr!(s, "_1"),&mut res).unwrap();
+        s.dump_sexpr(expr!(s, "$"), expr!(s, "_1"),&mut res);
         assert_eq!(reconstruction, String::from_utf8(res).unwrap());
     }
 
@@ -115,7 +115,7 @@ mod tests {
         assert_eq!(16, s.load_json(json_input.as_bytes()).unwrap());
 
         let mut res = Vec::<u8>::new();
-        s.dump_sexpr(expr!(s, "$"), expr!(s, "_1"), &mut res).unwrap();
+        s.dump_sexpr(expr!(s, "$"), expr!(s, "_1"), &mut res);
 
         let out = String::from_utf8(res).unwrap();
         assert_eq!(set_from_newlines(SEXPRS0), set_from_newlines(&out));
@@ -203,7 +203,7 @@ mod tests {
         assert_eq!(c_in, c_out);
 
         let mut res = Vec::<u8>::new();
-        s.dump_sexpr(expr!(s, "$"), expr!(s, "_1"), &mut res).unwrap();
+        s.dump_sexpr(expr!(s, "$"), expr!(s, "_1"), &mut res);
         println!("{}", String::from_utf8(res).unwrap());
     }
 
@@ -317,7 +317,7 @@ mod tests {
         s.metta_calculus(100);
 
         let mut v = vec![];
-        s.dump_sexpr(expr!(s, "$"), expr!(s, "_1"), &mut v).unwrap();
+        s.dump_sexpr(expr!(s, "$"), expr!(s, "_1"), &mut v);
 
         println!("\nRESULTS\n");
         let res = String::from_utf8(v).unwrap();
@@ -350,7 +350,7 @@ mod tests {
         s.metta_calculus(100);
 
         let mut writer = Vec::new();
-        s.dump_sexpr(expr!(s, "$"), expr!(s, "_1"), &mut writer).unwrap();
+        s.dump_sexpr(expr!(s, "$"), expr!(s, "_1"), &mut writer);
 
         let out = String::from(std::str::from_utf8(&writer).unwrap());
 
@@ -392,7 +392,7 @@ mod tests {
         s.metta_calculus(100);
 
         let mut writer = Vec::new();
-        s.dump_sexpr(expr!(s, "$"), expr!(s, "_1"), &mut writer).unwrap();
+        s.dump_sexpr(expr!(s, "$"), expr!(s, "_1"), &mut writer);
 
         let out = String::from(std::str::from_utf8(&writer).unwrap());
 
