@@ -303,6 +303,49 @@ fn double_forward_gc(intermediate_prt: bool, mcs: usize, x: usize) {
 //     (double Z) = Z
 //     (double (S $k)) = (S (S (double $k)))
 //
+// Type: forward, only generate the last answer.
+//
+// Inputs:
+// - intermediate_prt prints spaces after each step
+// - mcs is the number of metta_calculus steps
+// - x is the number that is doubled
+fn double_simple_forward_gc(intermediate_prt: bool, mcs: usize, x: usize) {
+    let mut s = Space::new();
+
+    // - ↦ represents the mapping between input and output of double
+    let space = r#"
+    (! Z)
+    (exec R (, (! $x)
+               (exec R $p $r))
+            (O (- (! $x))
+               (+ (! (S (S $x))))
+               (+ (exec R $p $r))))
+    "#;
+
+    s.add_sexpr(space.as_bytes(), expr!(s, "$"), expr!(s, "_1")).unwrap();
+    printlnSpace("Initial content - double_forward_gc", &s);
+
+    let mut t0 = Instant::now();
+    for i in 0..mcs {
+        let steps = s.metta_calculus(0);
+        if intermediate_prt {
+            println!("Iteration {}, steps {}", i, steps);
+            printlnSpace("Content", &s);
+        }
+    }
+    println!("Complete - double_forward_gc: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
+    let res = spaceToString(&s);
+    println!("{}:\n{}", "Final content", res);
+    let expect = format!("(! {})", peano(2*x));
+    assert!(res.contains(expect.as_str()));
+}
+
+// Implement the following program
+//
+//     (double Z) = Z
+//     (double (S $k)) = (S (S (double $k)))
+//
 // Type: forward, generate all answers till the priority reaches zero
 // (emulating a for loop).
 //
@@ -468,6 +511,7 @@ fn double_backward_stack_gc(intermediate_prt: bool, mcs: usize, x: usize) {
     // - ⧺ represents the double function
     // - ↦ represents the mapping between input and output of double
     let space = format!(r#"
+    ;; Push base case on the stack
     (exec (S Y)
           (, (∷ (⧺ (S $x)) $tail)
              (exec (S $l) $p $t))
@@ -1128,13 +1172,196 @@ fn insideout_bc(intermediate_prt: bool, mcs: usize) {
     println!("{}:\n{}", "Final content", res);
 }
 
-// Experiment with simple l, r, z tree trying accomplish backward
-// chaining by bringing the computation down to the tree.
+// Experiment with simple l, r, z backward chaining by using
+// a stack.
 //
 // Inputs:
 // - intermediate_prt prints spaces after each step
 // - mcs is the number of metta_calculus steps
-fn lrz_bc(intermediate_prt: bool, mcs: usize) {
+// - x is the depth of the tree
+fn lrz_bc(intermediate_prt: bool, mcs: usize, x: usize) {
+    let mut s = Space::new();
+
+    // - ☐ represents the empty stack
+    // - ∷ represents the push constructor
+    let space = format!(r#"
+    ;; Left recursive step, propagate query down
+    (exec {px}
+          (, (! (bc (S $k) (: (l $x) $a))))
+          (, (! (bc $k (: $x $a)))))
+    ;; Right recursive step, propagate query down
+    (exec ...
+          (, (! (bc (S $k) (: (r $x) $a))))
+          (, (! (bc $k (: $x $a)))))
+
+    ;; Base case mapping
+    (exec ...
+          (, (! (bc $_ (: z T))))
+          (, (= (bc $_ (: z T)) (: z T))))
+
+    ;; Left recursive step, propagate mapping up
+    (exec ...
+          (, (! (bc (S $k) (: (l $x) $a))))
+          (, (= (bc (S $k) (: (l $x) $a)) (bc $k (: $x $a))))))
+    ;; Right recursive step, propagate mapping up
+    (exec ...
+          (, (! (bc (S $k) (: (r $x) $a))))
+          (, (= (bc (S $k) (: (r $x) $a)) (bc $k (: $x $a)))))
+
+    ;; NEXT results
+    (exec ...
+          (, (! (bc (S $k) (: $x $a)))
+             (= (bc (S $k) (: $x $a)) (bc $k (: $y $a)))
+             (= (bc $k (: $y $a)) (: $z $a)))
+          (, (= 
+
+    ;; Goal
+    (! (: $x T))
+    "#, px = peano(x));
+
+    s.add_sexpr(space.as_bytes(), expr!(s, "$"), expr!(s, "_1")).unwrap();
+    printlnSpace("Initial content - lrz_bc", &s);
+
+    let mut t0 = Instant::now();
+    for i in 0..mcs {
+        let steps = s.metta_calculus(0);
+        if intermediate_prt {
+            println!("Iteration {}, steps {}", i, steps);
+            printlnSpace("Content", &s);
+        }
+    }
+    println!("Complete - lrz_bc: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
+    let res = spaceToString(&s);
+    println!("{}:\n{}", "Final content", res);
+}
+
+// Like lrz_cb but uses Adam's backward chainer bc3.
+//
+// Timestamps on steps and goals have been removed as they happen to
+// be irrelevant.
+//
+// Inputs:
+// - intermediate_prt prints spaces after each step
+// - mcs is the number of metta_calculus steps
+// - x is the depth of the tree
+fn adam_lrz_bc(intermediate_prt: bool, mcs: usize, x: usize) {
+    let mut s = Space::new();
+
+    let space = format!(r#"
+    ((step (0 base))
+      (, (goal (: $x $a)) (kb (: $x $a)))
+      (, (ev (: $x $a))))
+
+    ((step (1 abs))
+      (, (goal (: ($f $x) $b)))
+      (, (goal (: $f (-> $a $b)))))
+
+    ((step (2 rev))
+      (, (ev (: $f (-> $a $b))) (goal (: ($f $x) $b)))
+      (, (goal (: $x $a))))
+
+    ((step (3 app))
+      (, (ev (: $f (-> $a $b))) (ev (: $x $a)))
+      (, (ev (: ($f $x) $b))))
+
+    (exec (clocked {xp})
+            (, ((step $x) $p0 $t0)
+               (exec (clocked (S $k)) $p1 $t1))
+            (, (exec (a $x) $p0 $t0)
+               (exec (clocked $k) $p1 $t1)))
+
+    (kb (: z T))
+    (kb (: l (-> T T)))
+    (kb (: r (-> T T)))
+
+    (goal (: $x T))
+    "#, xp = peano(x));
+
+    s.add_sexpr(space.as_bytes(), expr!(s, "$"), expr!(s, "_1")).unwrap();
+    printlnSpace("Initial content - adam_lrz_bc", &s);
+
+    let mut t0 = Instant::now();
+    for i in 0..mcs {
+        let steps = s.metta_calculus(0);
+        if intermediate_prt {
+            println!("Iteration {}, steps {}", i, steps);
+            printlnSpace("Content", &s);
+        }
+    }
+    println!("Complete - adam_lrz_bc: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
+    let res = spaceToString(&s);
+    println!("{}:\n{}", "Final content", res);
+}
+
+// Like adam_lrz_cb but there is only the l rule.
+//
+// Timestamps on steps and goals have been removed as they happen to
+// be irrelevant.
+//
+// Inputs:
+// - intermediate_prt prints spaces after each step
+// - mcs is the number of metta_calculus steps
+// - x is the depth of the tree
+fn adam_lz_bc(intermediate_prt: bool, mcs: usize, x: usize) {
+    let mut s = Space::new();
+
+    let space = format!(r#"
+    ((step (0 base))
+      (, (goal (: $x $a)) (kb (: $x $a)))
+      (, (ev (: $x $a))))
+
+    ((step (1 abs))
+      (, (goal (: ($f $x) $b)))
+      (, (goal (: $f (-> $a $b)))))
+
+    ((step (2 rev))
+      (, (ev (: $f (-> $a $b))) (goal (: ($f $x) $b)))
+      (, (goal (: $x $a))))
+
+    ((step (3 app))
+      (, (ev (: $f (-> $a $b))) (ev (: $x $a)))
+      (, (ev (: ($f $x) $b))))
+
+    (exec (clocked {xp})
+            (, ((step $x) $p0 $t0)
+               (exec (clocked (S $k)) $p1 $t1))
+            (, (exec (a $x) $p0 $t0)
+               (exec (clocked $k) $p1 $t1)))
+
+    (kb (: z T))
+    (kb (: l (-> T T)))
+
+    (goal (: $x T))
+    "#, xp = peano(x));
+
+    s.add_sexpr(space.as_bytes(), expr!(s, "$"), expr!(s, "_1")).unwrap();
+    printlnSpace("Initial content - adam_lrz_bc", &s);
+
+    let mut t0 = Instant::now();
+    for i in 0..mcs {
+        let steps = s.metta_calculus(0);
+        if intermediate_prt {
+            println!("Iteration {}, steps {}", i, steps);
+            printlnSpace("Content", &s);
+        }
+    }
+    println!("Complete - adam_lrz_bc: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
+    let res = spaceToString(&s);
+    println!("{}:\n{}", "Final content", res);
+}
+
+// Experiment with simple l, r, z tree trying accomplish backward
+// chaining by bringing the computation down to the tree.  I call it
+// "slap" because it slaps the exec instructions on the tree till the
+// leaves.
+//
+// Inputs:
+// - intermediate_prt prints spaces after each step
+// - mcs is the number of metta_calculus steps
+fn lrz_bc_slap(intermediate_prt: bool, mcs: usize) {
     let mut s = Space::new();
 
     // // Full theory
@@ -1202,7 +1429,7 @@ fn lrz_bc(intermediate_prt: bool, mcs: usize) {
     "#;
 
     s.add_sexpr(space.as_bytes(), expr!(s, "$"), expr!(s, "_1")).unwrap();
-    printlnSpace("Initial content - lrz_bc", &s);
+    printlnSpace("Initial content - lrz_bc_slap", &s);
 
     let mut t0 = Instant::now();
     for i in 0..mcs {
@@ -1212,7 +1439,78 @@ fn lrz_bc(intermediate_prt: bool, mcs: usize) {
             printlnSpace("Content", &s);
         }
     }
-    println!("Complete - lrz_bc: elapsed {}ms, size {}",
+    println!("Complete - lrz_bc_slap: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
+    let res = spaceToString(&s);
+    println!("{}:\n{}", "Final content", res);
+}
+
+fn lrz_fc(intermediate_prt: bool, mcs: usize, x: usize) {
+    let mut s = Space::new();
+
+    // Full theory
+    let space = format!(r#"
+    ;; Theory
+    (: z T)
+
+    ;; Foward Chainer
+    (exec {px}
+          (, (: $x T)
+             (exec (S $l) $p $t))
+          (O (- (: $x T))
+             (+ (R (: $x T)))
+             (+ (: (l $x) T))
+             (+ (: (r $x) T))
+             (+ (exec $l $p $t))))
+    "#, px = peano(x));
+
+    s.add_sexpr(space.as_bytes(), expr!(s, "$"), expr!(s, "_1")).unwrap();
+    printlnSpace("Initial content - lrz_fc", &s);
+
+    let mut t0 = Instant::now();
+    for i in 0..mcs {
+        let steps = s.metta_calculus(0);
+        if intermediate_prt {
+            println!("Iteration {}, steps {}", i, steps);
+            printlnSpace("Content", &s);
+        }
+    }
+    println!("Complete - lrz_fc: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
+    let res = spaceToString(&s);
+    println!("{}:\n{}", "Final content", res);
+}
+
+fn lz_fc(intermediate_prt: bool, mcs: usize, x: usize) {
+    let mut s = Space::new();
+
+    // Full theory
+    let space = format!(r#"
+    ;; Theory
+    (: z T)
+
+    ;; Foward Chainer
+    (exec {px}
+          (, (: $x T)
+             (exec (S $l) $p $t))
+          (O (- (: $x T))
+             (+ (: (l $x) T))
+             (+ (R (: $x T)))
+             (+ (exec $l $p $t))))
+    "#, px = peano(x));
+
+    s.add_sexpr(space.as_bytes(), expr!(s, "$"), expr!(s, "_1")).unwrap();
+    printlnSpace("Initial content - lz_fc", &s);
+
+    let mut t0 = Instant::now();
+    for i in 0..mcs {
+        let steps = s.metta_calculus(0);
+        if intermediate_prt {
+            println!("Iteration {}, steps {}", i, steps);
+            printlnSpace("Content", &s);
+        }
+    }
+    println!("Complete - lz_fc: elapsed {}ms, size {}",
              t0.elapsed().as_millis(), s.btm.val_count());
     let res = spaceToString(&s);
     println!("{}:\n{}", "Final content", res);
@@ -5020,9 +5318,10 @@ fn main() {
     // bench_sink_hexlife_axial();
     // bench_pattern_mining_lensy();
 
-    let x = 100;
+    let x = 1000;
     // double_forward(false, x, x);
     // double_forward_gc(false, x, x);
+    double_simple_forward_gc(false, x, x);
     // double_forward_forloop(false, x+1, x);
     // double_forward_forloop_gc(false, x+1, x);
     // double_backward_stack(false, 2*x+3, x);
@@ -5077,7 +5376,11 @@ fn main() {
     // hard_bc_mm(true, 10);
     // bug(true, 1);
     // insideout_bc(true, 1);
-    lrz_bc(true, 2);
+    // lrz_bc(true, 2);
+    // lrz_fc(false, 17, 16); // 833ms
+    // adam_lrz_bc(false, 200, 16+1);
+    // lz_fc(false, 2000000, 1000);
+    // adam_lz_bc(false, 2000000, 62+1);
     return;
 
     let args = Cli::parse();
