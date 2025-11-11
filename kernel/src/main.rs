@@ -192,6 +192,1032 @@ fn peano(x: usize) -> String {
     else { format!("(S {})", peano(x - 1)) }
 }
 
+fn peano_combinator(x: usize) -> String {
+    if x == 0 { "I".to_string() }
+    else {format!("(. {} S)", peano_combinator(x - 1)) }
+}
+
+// Convert the full content of a space into a string
+fn spaceToString(space: &Space) -> String {
+    let mut svec = vec![];
+    space.dump_all_sexpr(&mut svec).unwrap();
+    String::from_utf8(svec).unwrap()
+}
+
+// Takes a prefix message, a space and print the space preceeded by
+// the message as follows
+//
+// <msg>:
+// <space_content>
+fn printlnSpace(msg: &str, space: &Space) {
+    println!("{}:\n{}", msg, spaceToString(space));
+}
+
+// Implement the following program
+//
+//     (double Z) = Z
+//     (double (S $k)) = (S (S (double $k)))
+//
+// Type: forward, generate all answers
+//
+// Inputs:
+// - intermediate_prt prints spaces after each step
+// - mcs is the number of metta_calculus steps
+// - x is the number that is doubled
+fn double_forward(intermediate_prt: bool, mcs: usize, x: usize) {
+    let mut s = Space::new();
+
+    // - ↦ represents the mapping between input and output of double
+    let space = r#"
+    (↦ Z Z)
+    (exec R (, (↦ $x $y)
+               (exec R $p $r))
+            (, (↦ (S $x) (S (S $y)))
+               (exec R $p $r)))
+    "#;
+
+    s.add_sexpr(space.as_bytes(), expr!(s, "$"), expr!(s, "_1")).unwrap();
+    printlnSpace("Initial content - double_forward", &s);
+
+    let mut t0 = Instant::now();
+    for i in 0..mcs {
+        let steps = s.metta_calculus(0);
+        if intermediate_prt {
+            println!("Iteration {}, steps {}", i, steps);
+            printlnSpace("Content", &s);
+        }
+    }
+    println!("Complete - double_forward: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
+    let res = spaceToString(&s);
+    println!("{}:\n{}", "Final content", res);
+    let expect = format!("(↦ {} {})", peano(x), peano(2*x));
+    assert!(res.contains(expect.as_str()));
+}
+
+// Implement the following program
+//
+//     (double Z) = Z
+//     (double (S $k)) = (S (S (double $k)))
+//
+// Type: forward, only generate the last answer.
+//
+// Inputs:
+// - intermediate_prt prints spaces after each step
+// - mcs is the number of metta_calculus steps
+// - x is the number that is doubled
+fn double_forward_gc(intermediate_prt: bool, mcs: usize, x: usize) {
+    let mut s = Space::new();
+
+    // - ↦ represents the mapping between input and output of double
+    let space = r#"
+    (↦ Z Z)
+    (exec R (, (↦ $x $y)
+               (exec R $p $r))
+            (O (- (↦ $x $y))
+               (+ (↦ (S $x) (S (S $y))))
+               (+ (exec R $p $r))))
+    "#;
+
+    s.add_sexpr(space.as_bytes(), expr!(s, "$"), expr!(s, "_1")).unwrap();
+    printlnSpace("Initial content - double_forward_gc", &s);
+
+    let mut t0 = Instant::now();
+    for i in 0..mcs {
+        let steps = s.metta_calculus(0);
+        if intermediate_prt {
+            println!("Iteration {}, steps {}", i, steps);
+            printlnSpace("Content", &s);
+        }
+    }
+    println!("Complete - double_forward_gc: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
+    let res = spaceToString(&s);
+    println!("{}:\n{}", "Final content", res);
+    let expect = format!("(↦ {} {})", peano(x), peano(2*x));
+    assert!(res.contains(expect.as_str()));
+}
+
+// Implement the following program
+//
+//     (double Z) = Z
+//     (double (S $k)) = (S (S (double $k)))
+//
+// Type: forward, generate all answers till the priority reaches zero
+// (emulating a for loop).
+//
+// Inputs:
+// - intermediate_prt prints spaces after each step
+// - mcs is the number of metta_calculus steps
+// - x is the number that is doubled
+fn double_forward_forloop(intermediate_prt: bool, mcs: usize, x: usize) {
+    let mut s = Space::new();
+
+    // - ↦ represents the mapping between input and output of double
+    let space = format!(r#"
+    (↦ Z Z)
+    (exec {px} (, (↦ $x $y)
+               (exec (S $l) $p $r))
+            (, (↦ (S $x) (S (S $y)))
+               (exec $l $p $r)))
+    "#, px = peano(x));
+
+    s.add_sexpr(space.as_bytes(), expr!(s, "$"), expr!(s, "_1")).unwrap();
+    printlnSpace("Initial content - double_forward_forloop", &s);
+
+    let mut t0 = Instant::now();
+    for i in 0..mcs {
+        let steps = s.metta_calculus(0);
+        if intermediate_prt {
+            println!("Iteration {}, steps {}", i, steps);
+            printlnSpace("Content", &s);
+        }
+    }
+    println!("Complete - double_forward_forloop: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
+    let res = spaceToString(&s);
+    println!("{}:\n{}", "Final content", res);
+    let expect = format!("(↦ {} {})", peano(x), peano(2*x));
+    assert!(res.contains(expect.as_str()));
+}
+
+// Implement the following program
+//
+//     (double Z) = Z
+//     (double (S $k)) = (S (S (double $k)))
+//
+// Type: forward, generate all answers till the priority reaches zero
+// (emulating a for loop), with garbage collection.
+//
+// Inputs:
+// - intermediate_prt prints spaces after each step
+// - mcs is the number of metta_calculus steps
+// - x is the number that is doubled
+fn double_forward_forloop_gc(intermediate_prt: bool, mcs: usize, x: usize) {
+    let mut s = Space::new();
+
+    // - ↦ represents the mapping between input and output of double
+    let space = format!(r#"
+    (↦ Z Z)
+    (exec {px} (, (↦ $x $y)
+               (exec (S $l) $p $r))
+            (O (- (↦ $x $y))
+               (+ (↦ (S $x) (S (S $y))))
+               (+ (exec $l $p $r))))
+    "#, px = peano(x));
+
+    s.add_sexpr(space.as_bytes(), expr!(s, "$"), expr!(s, "_1")).unwrap();
+    printlnSpace("Initial content - double_forward_forloop_gc", &s);
+
+    let mut t0 = Instant::now();
+    for i in 0..mcs {
+        let steps = s.metta_calculus(0);
+        if intermediate_prt {
+            println!("Iteration {}, steps {}", i, steps);
+            printlnSpace("Content", &s);
+        }
+    }
+    println!("Complete - double_forward_forloop_gc: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
+    let res = spaceToString(&s);
+    println!("{}:\n{}", "Final content", res);
+    let expect = format!("(↦ {} {})", peano(x), peano(2*x));
+    assert!(res.contains(expect.as_str()));
+}
+
+// Implement the following program
+//
+//     (double Z) = Z
+//     (double (S $k)) = (S (S (double $k)))
+//
+// Type: backward, stack, only the stack building phase is garbage
+// collected.
+//
+// Inputs:
+// - intermediate_prt prints spaces after each step
+// - mcs is the number of metta_calculus steps
+// - x is the number that is doubled
+fn double_backward_stack(intermediate_prt: bool, mcs: usize, x: usize) {
+    let mut s = Space::new();
+
+    // Emulate a stack
+    // - ☐ represents the empty stack
+    // - ∷ represents the push constructor
+    // - ⧺ represents the double function
+    // - ↦ represents the mapping between input and output of double
+    let space = format!(r#"
+    (exec (S Y)
+          (, (∷ (⧺ (S $x)) $tail)
+             (exec (S $l) $p $t))
+          (O (- (∷ (⧺ (S $x)) $tail))
+             (+ (∷ (⧺ $x) (∷ (⧺ (S $x)) $tail)))
+             (+ (exec $x $p $t))))
+    (exec |
+          (, (∷ (⧺ Z) $tail))
+          (, $tail
+             (↦ Z Z)))
+    (exec ~
+          (, (∷ (⧺ (S $x)) $tail)
+             (↦ $x $y)
+             (exec ~ $p $t))
+          (, (∷ (⧺ (S $x)) $tail)
+             (↦ $x $y)
+             $tail
+             (↦ (S $x) (S (S $y)))
+             (exec ~ $p $t)))
+
+    (∷ (⧺ {}) ☐)
+    "#, peano(x));
+
+    s.add_sexpr(space.as_bytes(), expr!(s, "$"), expr!(s, "_1")).unwrap();
+    printlnSpace("Initial content - double_backward_stack", &s);
+
+    let mut t0 = Instant::now();
+    for i in 0..mcs {
+        let steps = s.metta_calculus(0);
+        if intermediate_prt {
+            println!("Iteration {}, steps {}", i, steps);
+            printlnSpace("Content", &s);
+        }
+    }
+    println!("Complete - double_backward_stack: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
+    let res = spaceToString(&s);
+    println!("{}:\n{}", "Final content", res);
+    let expect = format!("(↦ {} {})", peano(x), peano(2*x));
+    assert!(res.contains(expect.as_str()));
+}
+
+// Attempt to implement the following program
+//
+//     (double Z) = Z
+//     (double (S $k)) = (S (S (double $k)))
+//
+// Type: backward, stack, everything is garbage collected.
+//
+// Inputs:
+// - intermediate_prt prints spaces after each step
+// - mcs is the number of metta_calculus steps
+// - x is the number that is doubled
+fn double_backward_stack_gc(intermediate_prt: bool, mcs: usize, x: usize) {
+    let mut s = Space::new();
+
+    // Emulate a stack
+    // - ☐ represents the empty stack
+    // - ∷ represents the push constructor
+    // - ⧺ represents the double function
+    // - ↦ represents the mapping between input and output of double
+    let space = format!(r#"
+    (exec (S Y)
+          (, (∷ (⧺ (S $x)) $tail)
+             (exec (S $l) $p $t))
+          (O (- (∷ (⧺ (S $x)) $tail))
+             (+ (∷ (⧺ $x) (∷ (⧺ (S $x)) $tail)))
+             (+ (exec $x $p $t))))
+    (exec |
+          (, (∷ (⧺ Z) $tail))
+          (O (- (∷ (⧺ Z) $tail))
+             (+ $tail)
+             (+ (↦ Z Z))))
+    (exec ~
+          (, (∷ (⧺ (S $x)) $tail)
+             (↦ $x $y)
+             (exec ~ $p $t))
+          (O (- (∷ (⧺ (S $x)) $tail))
+             (- (↦ $x $y))
+             (+ $tail)
+             (+ (↦ (S $x) (S (S $y))))
+             (+ (exec ~ $p $t))))
+
+    (∷ (⧺ {}) ☐)
+    "#, peano(x));
+
+    s.add_sexpr(space.as_bytes(), expr!(s, "$"), expr!(s, "_1")).unwrap();
+    printlnSpace("Initial content - double_backward_stack_gc", &s);
+
+    let mut t0 = Instant::now();
+    for i in 0..mcs {
+        let steps = s.metta_calculus(0);
+        if intermediate_prt {
+            println!("Iteration {}, steps {}", i, steps);
+            printlnSpace("Content", &s);
+        }
+    }
+    println!("Complete - double_backward_stack_gc: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
+    let res = spaceToString(&s);
+    println!("{}:\n{}", "Final content", res);
+    let expect = format!("(↦ {} {})", peano(x), peano(2*x));
+    assert!(res.contains(expect.as_str()));
+}
+
+// Attempt to implement the following program
+//
+//     (double Z) = Z
+//     (double (S $k)) = (S (S (double $k)))
+//
+// Type: backward, no stack, bang instead, nothing is garbage
+// collected.
+//
+// Inputs:
+// - intermediate_prt prints spaces after each step
+// - mcs is the number of metta_calculus steps
+// - x is the number that is doubled
+fn double_backward_bang(intermediate_prt: bool, mcs: usize, x: usize) {
+    let mut s = Space::new();
+
+    // Emulate a stack
+    // - (! G) represents the goal
+    // - ⧺ represents the double function
+    // - ↦ represents the mapping between input and output of double
+    let space = format!(r#"
+    (exec {px}
+          (, (! (⧺ (S $x)))
+             (exec (S $x) $p $t))
+          (, (! (⧺ $x))
+             (exec $x $p $t)))
+    (exec |
+          (, (! (⧺ Z)))
+          (, (↦ Z Z)))
+    (exec ~
+          (, (! (⧺ (S $x)))
+             (↦ $x $y)
+             (exec ~ $p $t))
+          (, (↦ (S $x) (S (S $y)))
+             (exec ~ $p $t)))
+
+    (! (⧺ {px}))
+    "#, px = peano(x));
+
+    s.add_sexpr(space.as_bytes(), expr!(s, "$"), expr!(s, "_1")).unwrap();
+    printlnSpace("Initial content - double_backward_bang", &s);
+
+    let mut t0 = Instant::now();
+    for i in 0..mcs {
+        let steps = s.metta_calculus(0);
+        if intermediate_prt {
+            println!("Iteration {}, steps {}", i, steps);
+            printlnSpace("Content", &s);
+        }
+    }
+    println!("Complete - double_backward_bang: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
+    let res = spaceToString(&s);
+    println!("{}:\n{}", "Final content", res);
+    let expect = format!("(↦ {} {})", peano(x), peano(2*x));
+    assert!(res.contains(expect.as_str()));
+}
+
+// Attempt to implement the following program
+//
+//     (double Z) = Z
+//     (double (S $k)) = (S (S (double $k)))
+//
+// Type: backward, no stack, bang instead, everything is garbage
+// collected.
+//
+// Inputs:
+// - intermediate_prt prints spaces after each step
+// - mcs is the number of metta_calculus steps
+// - x is the number that is doubled
+fn double_backward_bang_gc(intermediate_prt: bool, mcs: usize, x: usize) {
+    let mut s = Space::new();
+
+    // Emulate a stack
+    // - (! G) represents the goal
+    // - ⧺ represents the double function
+    // - ↦ represents the mapping between input and output of double
+    let space = format!(r#"
+    (exec {px}
+          (, (! (⧺ (S $x)))
+             (exec (S $x) $p $t))
+          (, (! (⧺ $x))
+             (exec $x $p $t)))
+    (exec |
+          (, (! (⧺ Z)))
+          (O (- (! (⧺ Z)))
+             (+ (↦ Z Z))))
+    (exec ~
+          (, (! (⧺ (S $x)))
+             (↦ $x $y)
+             (exec ~ $p $t))
+          (O (- (! (⧺ (S $x))))
+             (- (↦ $x $y))
+             (+ (↦ (S $x) (S (S $y))))
+             (+ (exec ~ $p $t))))
+
+    (! (⧺ {px}))
+    "#, px = peano(x));
+
+    s.add_sexpr(space.as_bytes(), expr!(s, "$"), expr!(s, "_1")).unwrap();
+    printlnSpace("Initial content - double_backward_bang_gc", &s);
+
+    let mut t0 = Instant::now();
+    for i in 0..mcs {
+        let steps = s.metta_calculus(0);
+        if intermediate_prt {
+            println!("Iteration {}, steps {}", i, steps);
+            printlnSpace("Content", &s);
+        }
+    }
+    println!("Complete - double_backward_bang_gc: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
+    let res = spaceToString(&s);
+    println!("{}:\n{}", "Final content", res);
+    let expect = format!("(↦ {} {})", peano(x), peano(2*x));
+    assert!(res.contains(expect.as_str()));
+}
+
+// Attempt to implement the following program
+//
+//     (double Z) = Z
+//     (double (S $k)) = (S (S (double $k)))
+//
+// Type: replace, plus, garbage collection.
+//
+// The double function is defined as
+//
+// (⧺ $x) = (+ $x $x)
+//
+// then
+//
+// (+ $x (S $y)) = (+ (S $x) $y)
+// (+ $x Z) = $x
+//
+// Inputs:
+// - intermediate_prt prints spaces after each step
+// - mcs is the number of metta_calculus steps
+// - x is the number that is doubled
+fn double_replace_plus_right_gc(intermediate_prt: bool, mcs: usize, x: usize) {
+    let mut s = Space::new();
+
+    let space = format!(r#"
+    (exec 0
+          (, (⧺ $x))
+          (O (- (⧺ $x))
+             (+ (plus $x $x))))
+    (exec 1
+          (, (plus $x (S $y))
+             (exec 1 $p $t))
+          (O (- (plus $x (S $y)))
+             (+ (plus (S $x) $y))
+             (+ (exec 1 $p $t))))
+    (exec 2
+          (, (plus $x Z)
+             (exec 2 $p $t))
+          (O (- (plus $x Z))
+             (+ $x)
+             (+ (exec 2 $p $t))))
+
+    (⧺ {})
+    "#, peano(x));
+
+    s.add_sexpr(space.as_bytes(), expr!(s, "$"), expr!(s, "_1")).unwrap();
+    printlnSpace("Initial content - double_replace_plus_right_gc", &s);
+
+    let mut t0 = Instant::now();
+    for i in 0..mcs {
+        let steps = s.metta_calculus(0);
+        if intermediate_prt {
+            println!("Iteration {}, steps {}", i, steps);
+            printlnSpace("Content", &s);
+        }
+    }
+    println!("Complete - double_replace_plus_right_gc: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
+    let res = spaceToString(&s);
+    println!("{}:\n{}", "Final content", res);
+    let expect = format!("{}", peano(2*x));
+    assert!(res.contains(expect.as_str()));
+}
+
+// Attempt to implement the following program
+//
+//     (double Z) = Z
+//     (double (S $k)) = (S (S (double $k)))
+//
+// Type: replace, plus, garbage collection.
+//
+// The double function is defined as
+//
+// (⧺ $x) = (+ $x $x)
+//
+// then
+//
+// (+ (S $x) $y) = (+ $x (S $y))
+// (+ Z $x) = $x
+//
+// Inputs:
+// - intermediate_prt prints spaces after each step
+// - mcs is the number of metta_calculus steps
+// - x is the number that is doubled
+fn double_replace_plus_left_gc(intermediate_prt: bool, mcs: usize, x: usize) {
+    let mut s = Space::new();
+
+    let space = format!(r#"
+    (exec 0
+          (, (⧺ $x))
+          (O (- (⧺ $x))
+             (+ (plus $x $x))))
+    (exec 1
+          (, (plus (S $x) $y)
+             (exec 1 $p $t))
+          (O (- (plus (S $x) $y))
+             (+ (plus $x (S $y)))
+             (+ (exec 1 $p $t))))
+    (exec 2
+          (, (plus Z $x)
+             (exec 2 $p $t))
+          (O (- (plus Z $x))
+             (+ $x)
+             (+ (exec 2 $p $t))))
+
+    (⧺ {})
+    "#, peano(x));
+
+    s.add_sexpr(space.as_bytes(), expr!(s, "$"), expr!(s, "_1")).unwrap();
+    printlnSpace("Initial content - double_replace_plus_left_gc", &s);
+
+    let mut t0 = Instant::now();
+    for i in 0..mcs {
+        let steps = s.metta_calculus(0);
+        if intermediate_prt {
+            println!("Iteration {}, steps {}", i, steps);
+            printlnSpace("Content", &s);
+        }
+    }
+    println!("Complete - double_replace_plus_left_gc: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
+    let res = spaceToString(&s);
+    println!("{}:\n{}", "Final content", res);
+    let expect = format!("{}", peano(2*x));
+    assert!(res.contains(expect.as_str()));
+}
+
+// Implement the following program
+//
+//     (double Z) = Z
+//     (double (S $k)) = (S (S (double $k)))
+//
+// Type: replace, combinators, so that
+//
+// Z is represented by I
+// (S Z) is represented by (. I S)
+// (S (S Z)) is represented by (. (. I S) S)
+// (S (S (S Z))) is represented by (. (. (. I S) S) S)
+// etc
+//
+// (. (. I S) (. $x S))
+// ===>
+// (. (. (. I S) S) $x)
+//
+// where S is the successor function, not the S combinator from
+// combinator logic, and I is the identity combinator.
+//
+// The double function is thus defined as
+//
+// (⧺ I) = I
+// (⧺ (. $x S)) = (. (. (⧺ $x) S) S)
+//
+// but we also have
+//
+// (⧺ $x) = (. $x $x)
+//
+// Inputs:
+// - intermediate_prt prints spaces after each step
+// - mcs is the number of metta_calculus steps
+// - x is the number that is doubled
+fn double_replace_combinator_gc(intermediate_prt: bool, mcs: usize, x: usize) {
+    let mut s = Space::new();
+
+    let space = format!(r#"
+    (exec 0
+          (, (⧺ $x))
+          (O (- (⧺ $x))
+             (+ (. $x $x))))
+    (exec 1
+          (, (. $x (. $y S))
+             (exec 1 $p $t))
+          (O (- (. $x (. $y S)))
+             (+ (. (. $x S) $y))
+             (+ (exec 1 $p $t))))
+    (exec 2
+          (, (. $x I)
+             (exec 2 $p $t))
+          (O (- (. $x I))
+             (+ $x)
+             (+ (exec 2 $p $t))))
+
+    (⧺ {})
+    "#, peano_combinator(x));
+
+    s.add_sexpr(space.as_bytes(), expr!(s, "$"), expr!(s, "_1")).unwrap();
+    printlnSpace("Initial content - double_replace_combinator_gc", &s);
+
+    let mut t0 = Instant::now();
+    for i in 0..mcs {
+        let steps = s.metta_calculus(0);
+        if intermediate_prt {
+            println!("Iteration {}, steps {}", i, steps);
+            printlnSpace("Content", &s);
+        }
+    }
+    println!("Complete - double_backward_combinator_gc: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
+    let res = spaceToString(&s);
+    println!("{}:\n{}", "Final content", res);
+    let expect = format!("{}", peano_combinator(2*x));
+    assert!(res.contains(expect.as_str()));
+}
+
+// Implement the following program
+//
+//     (double Z) = Z
+//     (double (S $k)) = (S (S (double $k)))
+//
+// Type: push the exec down to the leaves.
+//
+// Inputs:
+// - intermediate_prt prints spaces after each step
+// - mcs is the number of metta_calculus steps
+// - x is the number that is doubled
+fn double_replace_depth(intermediate_prt: bool, mcs: usize, x: usize) {
+    let mut s = Space::new();
+
+    let space = format!(r#"
+    (exec (2 base_case)
+          (, (⧺ Z))
+          (, Z))
+    (exec (1 recursive_step)
+          (, (⧺ (S $x))
+             (exec (2 base_case)
+                   (, $bp)
+                   (, $bt))
+             (exec (1 recursive_step)
+                   (, $rp1 $rp2 $rp3)
+                   (, $rt1 $rt2 $rt3)))
+          (, (S (S (⧺ $x)))
+             (exec (2 base_case)
+                   (, (S (S $bp)))
+                   (, (S (S $bt))))
+             (exec (1 recursive_step)
+                   (, (S (S $rp1)) $rp2 $rp3)
+                   (, (S (S $rt1)) $rt2 $rt3))))
+    (⧺ {})
+    "#, peano(x));
+
+    s.add_sexpr(space.as_bytes(), expr!(s, "$"), expr!(s, "_1")).unwrap();
+    printlnSpace("Initial content - double_replace_depth", &s);
+
+    let mut t0 = Instant::now();
+    for i in 0..mcs {
+        let steps = s.metta_calculus(0);
+        if intermediate_prt {
+            println!("Iteration {}, steps {}", i, steps);
+            printlnSpace("Content", &s);
+        }
+    }
+    println!("Complete - double_replace_depth: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
+    let res = spaceToString(&s);
+    println!("{}:\n{}", "Final content", res);
+    let expect = format!("{}", peano(2*x));
+    assert!(res.contains(expect.as_str()));
+}
+
+// Implement the following program:
+//
+//     (double Z) = Z
+//     (double (S $k)) = (S (S (double $k)))
+//
+// Type: push exec down to the leaves, garbage collect.
+//
+// Inputs:
+// - intermediate_prt prints spaces after each step
+// - mcs is the number of metta_calculus steps
+// - x is the number that is doubled
+fn double_replace_depth_gc(intermediate_prt: bool, mcs: usize, x: usize) {
+    let mut s = Space::new();
+
+    let space = format!(r#"
+    (exec (2 base_case)
+          (, (⧺ Z))
+          (O (- (⧺ Z))
+             (+ Z)))
+    (exec (1 recursive_step)
+          (, (⧺ (S $x))
+             (exec (2 base_case)
+                   (, $bp)
+                   (O (- $bt1) (+ $bt2)))
+             (exec (1 recursive_step)
+                   (, $rp1 $rp2 $rp3)
+                   (O (- $rt1) (- $rt2) (+ $rt3) $rt4 $rt5)))
+          (O (- (⧺ (S $x)))
+             (- (exec (2 base_case)
+                      (, $bp)
+                      (O (- $bt1) (+ $bt2))))
+             (+ (S (S (⧺ $x))))
+             (+ (exec (2 base_case)
+                      (, (S (S $bp)))
+                      (O (- (S (S $bt1))) (+ (S (S $bt2))))))
+             (+ (exec (1 recursive_step)
+                      (, (S (S $rp1)) $rp2 $rp3)
+                      (O (- (S (S $rt1))) (- $rp2) (+ (S (S $rt3))) $rt4 $rt5)))))
+    (⧺ {})
+    "#, peano(x));
+
+    s.add_sexpr(space.as_bytes(), expr!(s, "$"), expr!(s, "_1")).unwrap();
+    printlnSpace("Initial content - double_replace_depth_gc", &s);
+
+    let mut t0 = Instant::now();
+    for i in 0..mcs {
+        let steps = s.metta_calculus(0);
+        if intermediate_prt {
+            println!("Iteration {}, steps {}", i, steps);
+            printlnSpace("Content", &s);
+        }
+    }
+    println!("Complete - double_replace_depth_gc: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
+    let res = spaceToString(&s);
+    println!("{}:\n{}", "Final content", res);
+    let expect = format!("{}", peano(2*x));
+    assert!(res.contains(expect.as_str()));
+}
+
+// Attempt to port the hard backward chaining Metamath test to prove
+//
+// (⟨=⟩ ⟨t⟩ ⟨t⟩)
+//
+// Inputs:
+// - intermediate_prt prints spaces after each step
+// - mcs is the number of metta_calculus steps
+fn hard_bc_mm(intermediate_prt: bool, mcs: usize) {
+    let mut s = Space::new();
+
+    // - ↦ represents the mapping between input and output of double
+    let space = r#"
+    ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+    ;; Theory as collection of typing relationships ;;
+    ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+    ;; Zero is a term
+    (Thry (: ⟨0⟩ ⟨term⟩))
+
+    ;; Adding two terms outputs a term
+    (Thry (: ⟨-⟩ (-> (: $t ⟨term⟩)
+                     ⟨term⟩)))
+
+    ;; ;; Adding two terms outputs a term
+    ;; (Thry (: ⟨+⟩ (-> (: $t ⟨term⟩)
+    ;;                  (: $r ⟨term⟩)
+    ;;                  ⟨term⟩)))
+
+    ;; ;; Equality between two terms is a well formed formula
+    ;; (Thry (: ⟨=⟩ (-> (: $t ⟨term⟩)
+    ;;                  (: $r ⟨term⟩)
+    ;;                  ⟨wff⟩)))
+
+    ;; ;; Implication between two well formed formulas is a well formed formula
+    ;; (Thry (: ⟨->⟩ (-> (: $P ⟨wff⟩)
+    ;;                   (: $Q ⟨wff⟩)
+    ;;                   ⟨wff⟩)))
+
+    ;; ;; Equality is right Euclidean
+    ;; (Thry (: a1 (-> (: $t ⟨term⟩)
+    ;;                 (: $r ⟨term⟩)
+    ;;                 (: $s ⟨term⟩)
+    ;;                 (⟨->⟩ (⟨=⟩ $t $r) (⟨->⟩ (⟨=⟩ $t $s) (⟨=⟩ $r $s))))))
+
+    ;; ;; Zero is a right identity of addition
+    ;; (Thry (: a2 (-> (: $t ⟨term⟩)
+    ;;                 (⟨=⟩ (⟨+⟩ $t ⟨0⟩) $t))))
+
+    ;; ;; Modus ponens
+    ;; (Thry (: mp (-> (: $maj (⟨->⟩ $P $Q))
+    ;;                 (: $P ⟨wff⟩)
+    ;;                 (: $Q ⟨wff⟩)
+    ;;                 (: $min $P) $Q)))
+
+    ;; ;; Term variable (ideally should be a MM2 variable, but it's OK for now)
+    ;; (Thry (: ⟨t⟩ ⟨term⟩))
+
+    ;;;;;;;;;;
+    ;; Goal ;;
+    ;;;;;;;;;;
+
+    (! (: $prf ⟨term⟩))
+
+    ;;;;;;;;;;;;;;;;;;;;;;
+    ;; Backward Chainer ;;
+    ;;;;;;;;;;;;;;;;;;;;;;
+
+    ; NEXT: use the fully annotated proof tree as computing structure.
+
+    (exec (0 0)
+          (, (Thry (: $prf $thrm))
+             (! (: $prf $thrm)))
+          (, (: $prf $thrm)))
+
+    (exec (0 1)
+          (, (Thry (: $prfabs (-> (: $prfarg $prms) $thrm)))
+             (! (: ($prfabs (: $prfarg $prms)) $thrm)))
+          (, (: ($prfabs (: $prfarg $prms)) $thrm)
+             ;; Respawn nullary rule
+             (exec (0 0)
+                   (, (Thry (: $prfarg $prms))
+                      (! (: ($prfabs (: $prfarg $prms)) $thrm)))
+                   (, (: ($prfabs (: $prfarg $prms)) $thrm)))
+             ;; Respawn unary rule
+             (exec (0 1)
+                   (, (Thry (: $prfarg (-> (: $prfarg_d $prms_d) $prms)))
+                      (! (: ($prfabs (: ($prfarg (: $prfarg_d $prms_d) $prms))) $thrm)))
+                   (, (: ($prfabs (: ($prfarg (: $prfarg_d $prms_d) $prms))) $thrm)))))
+
+    ;; (exec (0 binary)
+    ;;       (, (! (: (: $prfabs (-> $prms1 $prms2 $thrm)
+    ;;                   (: $prfarg1 $prms1)
+    ;;                   (: $prfarg2 $prms2))
+    ;;                $thrm)
+    ;;          (Thry (: $prfabs (-> (: $prfarg1 $prms1)
+    ;;                               (: $prfarg2 $prms2)
+    ;;                               $thrm)))
+    ;;       (, (: ((: $prfabs (-> $prms1 $prms2 $thrm)
+    ;;                 (: $prfarg1 $prms1)
+    ;;                 (: $prfarg2 $prms2))
+    ;;             $thrm)))
+
+    ;; NEXT: how to unify $prf
+    "#;
+
+    s.add_sexpr(space.as_bytes(), expr!(s, "$"), expr!(s, "_1")).unwrap();
+    printlnSpace("Initial content - hard_bc_mm", &s);
+
+    let mut t0 = Instant::now();
+    for i in 0..mcs {
+        let steps = s.metta_calculus(0);
+        if intermediate_prt {
+            println!("Iteration {}, steps {}", i, steps);
+            printlnSpace("Content", &s);
+        }
+    }
+    println!("Complete - hard_bc_mm: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
+    let res = spaceToString(&s);
+    println!("{}:\n{}", "Final content", res);
+}
+
+// Experiment with inside-out backward chaining, where the leaves are
+// at the top and the root at the bottom.
+//
+// A proof of D is represented as
+//
+// ((. (. cd bc) ab) a)
+//
+// or
+//
+// ((. (. (. id cd) bc) ab) a)
+//
+// instead of
+//
+// (cd (bc (ab a)))
+//
+// Inputs:
+// - intermediate_prt prints spaces after each step
+// - mcs is the number of metta_calculus steps
+fn insideout_bc(intermediate_prt: bool, mcs: usize) {
+    let mut s = Space::new();
+
+    let space = r#"
+    ;; Theory
+    (Γ (: a A))
+    (Γ (: ab (-> A B)))
+    (Γ (: bc (-> B C)))
+    (Γ (: cd (-> C D)))
+
+    ;; Goal
+    (! (: (. id $prf) (-> A D)))
+
+    ;; Backward Chainer
+    ;; Base case
+    (exec (0 0)
+          (, (Γ (: $f (-> $a $b)))
+             (! (: $f (-> $a $b))))
+          (, (: $f (-> $a $b))))
+    ;; Recursive step
+    (exec (0 1)
+          (, (Γ (: $f (- $b $c)))
+             (! (: (. $f $g) (- $a $c))))
+          (, (: (. $f $g) (- $a $c))))
+    "#;
+
+    s.add_sexpr(space.as_bytes(), expr!(s, "$"), expr!(s, "_1")).unwrap();
+    printlnSpace("Initial content - insideout_bc", &s);
+
+    let mut t0 = Instant::now();
+    for i in 0..mcs {
+        let steps = s.metta_calculus(0);
+        if intermediate_prt {
+            println!("Iteration {}, steps {}", i, steps);
+            printlnSpace("Content", &s);
+        }
+    }
+    println!("Complete - insideout_bc: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
+    let res = spaceToString(&s);
+    println!("{}:\n{}", "Final content", res);
+}
+
+// Experiment with simple l, r, z tree trying accomplish backward
+// chaining by bringing the computation down to the tree.
+//
+// Inputs:
+// - intermediate_prt prints spaces after each step
+// - mcs is the number of metta_calculus steps
+fn lrz_bc(intermediate_prt: bool, mcs: usize) {
+    let mut s = Space::new();
+
+    // // Full theory
+    // let space = r#"
+    // ;; Theory
+    // (Γ (: z T))
+    // (Γ (: l (→ T T)))
+    // (Γ (: r (→ T T)))
+
+    // ;; Goal
+    // (: $x T)
+
+    // ;; Backward Chainer
+    // ;; Base case
+    // (exec (0 0)
+    //       (, (Γ (: $x $t))
+    //          (: $x $t))
+    //       (, (: $x $t)))
+    // ;; Recursive case
+    // (exec (0 1)
+    //       (, (Γ (: $f (→ $a $b)))
+    //          (: ($f $x) $b)
+    //          (exec (0 0) $p0 $t0)
+    //          (exec (0 1) $p1 $t1))
+    //       (, (: ($f $x) $b)
+    //          (: ($f (exec (0 0) $p0 $t0)) $b)
+    //          (: ($f (exec (0 1) $p1 $t1)) $b)))
+    // "#;
+
+    // // Local exec
+    // let space = r#"
+    // ;; Theory
+    // (Γ (: l (→ T T)))
+    // (Γ (: r (→ T T)))
+
+    // ;; Goal
+    // (: $x T)
+
+    // ;; Backward Chainer
+    // ;; Recursive case
+    // (exec (0 1)
+    //       (, (Γ (: $f (→ $a $b)))
+    //          (: ($f $x) $b)
+    //          (exec (0 1) $p1 $t1))
+    //       (, (: ($f $x) $b)
+    //          (: ($f (exec (0 1) $p1 $t1)) $b)))
+    // "#;
+
+    // Replace local exec by custom structure
+    let space = r#"
+    ;; Theory
+    (Γ (: l (→ T T)))
+    (Γ (: r (→ T T)))
+
+    ;; Goal
+    (: $x T)
+
+    ;; Backward Chainer
+    ;; Recursive case
+    (exec (0 1)
+          (, (Γ (: $f (→ $a $b)))
+             (: ($f $x) $b))
+          (, (: ($f $x) $b)
+             (: ($f (Γ (: $g (→ $c $d)))) $b)))
+    "#;
+
+    s.add_sexpr(space.as_bytes(), expr!(s, "$"), expr!(s, "_1")).unwrap();
+    printlnSpace("Initial content - lrz_bc", &s);
+
+    let mut t0 = Instant::now();
+    for i in 0..mcs {
+        let steps = s.metta_calculus(0);
+        if intermediate_prt {
+            println!("Iteration {}, steps {}", i, steps);
+            printlnSpace("Content", &s);
+        }
+    }
+    println!("Complete - lrz_bc: elapsed {}ms, size {}",
+             t0.elapsed().as_millis(), s.btm.val_count());
+    let res = spaceToString(&s);
+    println!("{}:\n{}", "Final content", res);
+}
+
 fn basic() {
     let mut s = Space::new();
 
@@ -3993,7 +5019,66 @@ fn main() {
     // sink_act_readback();
     // bench_sink_hexlife_axial();
     // bench_pattern_mining_lensy();
-    // return;
+
+    let x = 100;
+    // double_forward(false, x, x);
+    // double_forward_gc(false, x, x);
+    // double_forward_forloop(false, x+1, x);
+    // double_forward_forloop_gc(false, x+1, x);
+    // double_backward_stack(false, 2*x+3, x);
+    // double_backward_stack_gc(false, 2*x+3, x);
+    // double_backward_bang(false, 2*x+3, x);
+    // double_backward_bang_gc(false, 2*x+3, x);
+    // double_replace_plus_right_gc(false, x+4, x);
+    // double_replace_plus_left_gc(false, x+4, x);
+    // double_replace_combinator_gc(false, x+4, x);
+    // double_replace_depth(false, x+2, x);
+    // double_replace_depth_gc(false, x+3, x);
+    // // Times are millisecond
+    // +----------------------------+-----------+------------+
+    // |function                    |time(x=100)|time(x=1000)|
+    // +----------------------------+-----------+------------+
+    // |double_forward              |99         |63978       |
+    // +----------------------------+-----------+------------+
+    // |double_forward_gc           |19         |419         |
+    // +----------------------------+-----------+------------+
+    // |double_forward_forloop      |128        |92163       |
+    // +----------------------------+-----------+------------+
+    // |double_forward_forloop_gc   |16         |531         |
+    // +----------------------------+-----------+------------+
+    // |double_backward_stack       |4377       |NAN         |
+    // +----------------------------+-----------+------------+
+    // |double_backward_stack_gc    |165        |NAN         |
+    // +----------------------------+-----------+------------+
+    // |double_backward_bang        |363        |1586842     |
+    // +----------------------------+-----------+------------+
+    // |double_backward_bang_gc     |213        |1189732     |
+    // +----------------------------+-----------+------------+
+    // |double_replace_plus_right_gc|17         |547         |
+    // +----------------------------+-----------+------------+
+    // |double_replace_plus_left_gc |13         |488         |
+    // +----------------------------+-----------+------------+
+    // |double_replace_combinator_gc|17         |768         |
+    // +----------------------------+-----------+------------+
+    // |double_replace              |408        |NAN         |
+    // +----------------------------+-----------+------------+
+    // |double_replace_depth_gc     |38         |NAN         |
+    // +----------------------------+-----------+------------+
+    // |double_he                   |180        |9189        |
+    // +----------------------------+-----------+------------+
+    // |double_mettalog             |4980       |NAN         |
+    // +----------------------------+-----------+------------+
+    // |double_mettalog_compile     |NAN        |NAN         |
+    // +----------------------------+-----------+------------+
+    // |double_petta                |78         |92          |
+    // +----------------------------+-----------+------------+
+    // understand(true, 10, 3);
+    // meta_ana_exec();
+    // hard_bc_mm(true, 10);
+    // bug(true, 1);
+    // insideout_bc(true, 1);
+    lrz_bc(true, 2);
+    return;
 
     let args = Cli::parse();
 
