@@ -83,12 +83,18 @@ pub(crate) const VARS: [u64; 4] = {
 // - use descend_to and re-evaluated the added sub-path to do much better on long paths
 fn coreferential_transition<Z : ZipperMoving + Zipper + ZipperAbsolutePath + ZipperIteration, F: FnMut(&mut Z) -> ()>(
     loc: &mut Z, mut stack: &mut Vec<ExprEnv>, references: &mut Vec<u32>, f: &mut F) {
+    println!("coreferential_transition(loc={:?}, stack={:?}, references={:?})", 0, stack, references);
     macro_rules! vs {
         ($e:expr, $nv:expr) => {{
+	    println!("vs $e: {:?}", $e);
+	    println!("vs $nv: {:?}", $nv);
             let m = loc.child_mask().and(&ByteMask(VARS));
+	    println!("vs m: {:?}", m);
             let mut it = m.iter();
+	    println!("vs it: {:?}", it);
 
             while let Some(b) = it.next() {
+		println!("vs b: {:?}", b);
                 // technically requires us to replace references to this NewVar on the stack with e
                 // if !$nv && item_byte(Tag::NewVar) == b {
                 //     if $e.n == 0 {
@@ -110,7 +116,9 @@ fn coreferential_transition<Z : ZipperMoving + Zipper + ZipperAbsolutePath + Zip
     match stack.pop() {
         None => { f(loc) }
         Some(e) => {
+	    println!("e: {:?}", e);
             let e_byte = *e.base.ptr.add(e.offset as usize);
+	    println!("e_byte: {:?}", e_byte);
 
             match byte_item(e_byte) {
                 Tag::NewVar => {
@@ -123,8 +131,10 @@ fn coreferential_transition<Z : ZipperMoving + Zipper + ZipperAbsolutePath + Zip
                     vs!(e, true);
 
                     let m = loc.child_mask().and(&ByteMask(SIZES));
+		    println!("m: {:?}", m);
                     let mut it = m.iter();
                     while let Some(b) = it.next() {
+			println!("b: {:?}", b);
                         let Tag::SymbolSize(size) = byte_item(b) else { unreachable_unchecked() };
                         loc.descend_to_byte(b);
                         debug_assert!(loc.path_exists());
@@ -183,8 +193,13 @@ fn coreferential_transition<Z : ZipperMoving + Zipper + ZipperAbsolutePath + Zip
                     vs!(e, false);
                     if loc.descend_to_existing_byte(e_byte) {
                         let stackl = stack.len();
+                        println!("stack[1]: {:?}", stack);
+                        println!("stackl: {:?}", stackl);
                         e.args(&mut stack);
+                        println!("stack[2]: {:?}", stack);
+                        println!("e: {:?}", e);
                         stack[stackl..].reverse();
+                        println!("stack[3]: {:?}", stack);
                         coreferential_transition(loc, stack, references, f);
                         stack.truncate(stack.len() - arity as usize);
                         loc.ascend_byte();
@@ -994,6 +1009,7 @@ impl Space {
         trace!(target: "query_multi", "pattern (newvars={}) {:?}", pat_newvars, serialize(unsafe { pat_expr.span().as_ref().unwrap() }));
         let mut pat_args = vec![];
         ExprEnv::new(0, pat_expr).args(&mut pat_args);
+	println!("pat_args: {:?}", pat_args);
 
         if pat_args.len() <= 1 { return 0 }
 
@@ -1001,6 +1017,7 @@ impl Space {
             btm.read_zipper()
         }));
         prz.reserve_buffers(1 << 32, 32);
+	println!("prz: {:?}", prz);
 
         Self::query_multi_raw(&mut prz, &pat_args[1..], effect)
     }
@@ -1107,6 +1124,7 @@ impl Space {
     #[cfg(not(feature="no_search"))]
     #[inline(always)]
     pub fn query_multi_raw<PZ : ZipperProduct, F : FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(mut prz: &mut PZ, sources: &[ExprEnv], mut effect: F) -> usize {
+	println!("query_multi_raw(prz={:?}, sources={:?})", 0, sources);
         let mut stack = sources[0..].iter().rev().cloned().collect::<Vec<_>>();
 
         let mut references: Vec<u32> = vec![];
@@ -1223,12 +1241,16 @@ impl Space {
         unsafe { buffer.set_len(1 << 32); }
         let mut tpl_args = Vec::with_capacity(64);
         ExprEnv::new(0, tpl_expr).args(&mut tpl_args);
+	println!("tpl_args: {:?}", tpl_args);
         let mut templates: Vec<_> = tpl_args[1..].iter().map(|ee| ee.subsexpr()).collect();
         let mut template_prefixes: Vec<_> = templates.iter().map(|e| unsafe { e.prefix().unwrap_or_else(|x| e.span()).as_ref().unwrap() }).collect();
+	println!("template_prefixes: {:?}", template_prefixes);
         let mut subsumption = Self::prefix_subsumption(&template_prefixes[..]);
+	println!("subsumption: {:?}", subsumption);
         let mut placements = subsumption.clone();
         let mut read_copy = self.btm.clone();
         let mut zh = self.btm.zipper_head();
+	println!("zh: {:?}", zh);
         read_copy.insert(unsafe { add.span().as_ref().unwrap() }, ());
         let mut template_wzs: Vec<_> = Vec::with_capacity(64);
         template_prefixes.iter().enumerate().for_each(|(i, x)| {
@@ -1574,6 +1596,9 @@ impl Space {
             if let Tag::Arity(i) = byte_item(*tpl_expr.ptr) { if i == 0 { panic!("template expression can not be empty"); } } else { panic!("template must be an expression") }
             if *tpl_expr.ptr.add(1) != item_byte(Tag::SymbolSize(1)) { panic!("template functor can only be , or O") }
 
+            println!("rt: {:?}", rt);
+            println!("pat_expr: {:?}", pat_expr);
+            println!("tpl_expr: {:?}", tpl_expr);
             let res = match (*pat_expr.ptr.add(2), *tpl_expr.ptr.add(2)) {
                 (b',', b',') => { self.transform_multi_multi_(pat_expr, tpl_expr, rt) }
                 (b'I', b',') => { self.transform_multi_multi_i(pat_expr, tpl_expr, rt) }
@@ -1586,21 +1611,25 @@ impl Space {
     }
 
     pub fn metta_calculus(&mut self, steps: usize) -> usize {
-        println!("metta_calculus");
+        println!("metta_calculus(steps={:?})", steps);
         let mut done = 0;
         let prefix_e = expr!(self, "[4] exec $ $ $");
         println!("prefix_e = {:?}", prefix_e);
         let prefix = unsafe { prefix_e.prefix().unwrap().as_ref().unwrap() };
 
-        println!("btm:\n{:?}", self.btm);
+        println!("btm[1]:\n{:?}", self.btm);
         while {
             let mut rz = self.btm.read_zipper_at_borrowed_path(prefix);
-            println!("rz:\n{:?}", rz);
+            println!("rz[1]:\n{:?}", rz);
             if rz.to_next_val() {
+                println!("rz[2]:\n{:?}", rz);
                 // cannot be here `rz` conflicts potentially with zippers(rz.path())
+                println!("rz.origin_path(): {:?}", rz.origin_path());
                 let mut x: Box<[u8]> = rz.origin_path().into(); // should use local buffer
                 drop(rz);
+                println!("x: {:?}", x);
                 self.btm.remove(&x[..]);
+                println!("btm[2]:\n{:?}", self.btm);
                 // println!("expr {:?}", Expr{ ptr: x.as_mut_ptr() });
                 self.interpret(Expr{ ptr: x.as_mut_ptr() });
                 done < steps

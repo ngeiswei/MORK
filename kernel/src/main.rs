@@ -1425,6 +1425,7 @@ fn lrz_bc_slap(intermediate_prt: bool, mcs: usize) {
           (, (Γ (: $f (→ $a $b)))
              (: ($f (: $x $a)) $b))
           (, (: ($f (: $x $a)) $b)))
+    (exec (0 0) (, (A $x $y) (B $x $y)) (, (C $x $y) (D $x $y)))
     "#;
 
     s.add_sexpr(space.as_bytes(), expr!(s, "$"), expr!(s, "_1")).unwrap();
@@ -5380,7 +5381,7 @@ fn main() {
     // adam_lrz_bc(false, 200, 16+1);
     // lz_fc(false, 2000000, 1000);
     // adam_lz_bc(false, 2000000, 62+1);
-    lrz_bc_slap(false, 1);
+    lrz_bc_slap(true, 1);
     return;
 
     let args = Cli::parse();
