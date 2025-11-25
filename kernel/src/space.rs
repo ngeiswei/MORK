@@ -1586,12 +1586,16 @@ impl Space {
     }
 
     pub fn metta_calculus(&mut self, steps: usize) -> usize {
+        println!("metta_calculus");
         let mut done = 0;
         let prefix_e = expr!(self, "[4] exec $ $ $");
+        println!("prefix_e = {:?}", prefix_e);
         let prefix = unsafe { prefix_e.prefix().unwrap().as_ref().unwrap() };
 
+        println!("btm:\n{:?}", self.btm);
         while {
             let mut rz = self.btm.read_zipper_at_borrowed_path(prefix);
+            println!("rz:\n{:?}", rz);
             if rz.to_next_val() {
                 // cannot be here `rz` conflicts potentially with zippers(rz.path())
                 let mut x: Box<[u8]> = rz.origin_path().into(); // should use local buffer
