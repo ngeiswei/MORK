@@ -1423,9 +1423,8 @@ fn lrz_bc_slap(intermediate_prt: bool, mcs: usize) {
     ;; Recursive case
     (exec (0 1)
           (, (Γ (: $f (→ $a $b)))
-             (: ($f $x) $b))
-          (, (: ($f $x) $b)
-             (: ($f (Γ (: $g (→ $c $d)))) $b)))
+             (: ($f (: $x $a)) $b))
+          (, (: ($f (: $x $a)) $b)))
     "#;
 
     s.add_sexpr(space.as_bytes(), expr!(s, "$"), expr!(s, "_1")).unwrap();
@@ -5321,7 +5320,7 @@ fn main() {
     let x = 1000;
     // double_forward(false, x, x);
     // double_forward_gc(false, x, x);
-    double_simple_forward_gc(false, x, x);
+    // double_simple_forward_gc(false, x, x);
     // double_forward_forloop(false, x+1, x);
     // double_forward_forloop_gc(false, x+1, x);
     // double_backward_stack(false, 2*x+3, x);
@@ -5381,6 +5380,7 @@ fn main() {
     // adam_lrz_bc(false, 200, 16+1);
     // lz_fc(false, 2000000, 1000);
     // adam_lz_bc(false, 2000000, 62+1);
+    lrz_bc_slap(false, 1);
     return;
 
     let args = Cli::parse();
