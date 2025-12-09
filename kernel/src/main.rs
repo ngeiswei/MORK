@@ -1413,6 +1413,7 @@ fn lrz_bc_slap(intermediate_prt: bool, mcs: usize) {
     // Replace local exec by custom structure
     let space = r#"
     ;; Theory
+    (Γ (: z T))
     (Γ (: l (→ T T)))
     (Γ (: r (→ T T)))
 
@@ -1425,7 +1426,6 @@ fn lrz_bc_slap(intermediate_prt: bool, mcs: usize) {
           (, (Γ (: $f (→ $a $b)))
              (: ($f (: $x $a)) $b))
           (, (: ($f (: $x $a)) $b)))
-    (exec (0 0) (, (A $x $y) (B $x $y)) (, (C $x $y) (D $x $y)))
     "#;
 
     s.add_sexpr(space.as_bytes(), expr!(s, "$"), expr!(s, "_1")).unwrap();
