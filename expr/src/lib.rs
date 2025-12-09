@@ -700,7 +700,7 @@ impl Expr {
         let x = Expr{ ptr: transformation.as_mut_ptr() };
         let y = Expr{ ptr: data.as_mut_ptr() };
         let mut s = vec![(ExprEnv::new(0, x), ExprEnv::new(1, y))];
-        
+
         if let Ok(bindings) = unify(s) {
             let mut cycled = BTreeMap::<ExprVar, u8>::new();
             let mut stack: Vec<ExprVar> = vec![];
