@@ -1008,6 +1008,7 @@ impl Space {
         let pat_newvars = pat_expr.newvars();
         trace!(target: "query_multi", "pattern (newvars={}) {:?}", pat_newvars, serialize(unsafe { pat_expr.span().as_ref().unwrap() }));
         let mut pat_args = vec![];
+	println!("pat_expr: {:?}", pat_expr);
         ExprEnv::new(0, pat_expr).args(&mut pat_args);
 	println!("pat_args: {:?}", pat_args);
 
@@ -1157,6 +1158,7 @@ impl Space {
                         // pairs.iter().for_each(|(x, y)| println!("pair {} {}", x.show(), y.show()));
 
                         let bindings = unify(pairs);
+                        println!("bindings: {:?}", bindings);
 
                         match bindings {
                             Ok(bs) => {
