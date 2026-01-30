@@ -13,7 +13,7 @@ use std::task::Poll;
 use std::time::Instant;
 use futures::StreamExt;
 use pathmap::ring::{AlgebraicStatus, Lattice};
-use mork_expr::{byte_item, Expr, ExprZipper, ExtractFailure, item_byte, parse, serialize, Tag, traverseh, ExprEnv, unify, UnificationFailure, apply, destruct};
+use mork_expr::{byte_item_dbg, byte_item, Expr, ExprZipper, ExtractFailure, item_byte, parse, serialize, Tag, traverseh, ExprEnv, unify, UnificationFailure, apply, destruct};
 use mork_frontend::bytestring_parser::{Parser, ParserError, Context};
 use mork_interning::{WritePermit, SharedMapping, SharedMappingHandle};
 use pathmap::utils::{BitMask, ByteMask};
@@ -83,7 +83,7 @@ pub(crate) const VARS: [u64; 4] = {
 // - use descend_to and re-evaluated the added sub-path to do much better on long paths
 fn coreferential_transition<Z : ZipperMoving + Zipper + ZipperAbsolutePath + ZipperIteration, F: FnMut(&mut Z) -> ()>(
     loc: &mut Z, mut stack: &mut Vec<ExprEnv>, references: &mut Vec<u32>, f: &mut F) {
-    println!("coreferential_transition(loc={:?}, stack={:?}, references={:?})", 0, stack, references);
+    println!("coreferential_transition(loc={:?}, stack={:?}, references={:?})", serialize(loc.path()), stack, references);
     macro_rules! vs {
         ($e:expr, $nv:expr) => {{
 	    println!("vs $e: {:?}", $e);
@@ -110,8 +110,10 @@ fn coreferential_transition<Z : ZipperMoving + Zipper + ZipperAbsolutePath + Zip
     }
     unsafe {
     trace!(target: "coref trans", "loc {}    len {}", serialize(loc.path()), loc.path().len());
-    // trace!(target: "coref trans", "loc {} ({:?})    len {}    ops {:?} ({:?})", serialize(loc.path()), loc.path(), loc.path().len(), loc.child_mask(), loc.child_mask().iter().map(byte_item).collect::<Vec<_>>());
-    trace!(target: "coref trans", "top {}", stack.last().map(|x| x.show()).unwrap_or_else(|| "empty".into()));
+	// trace!(target: "coref trans", "loc {} ({:?})    len {}    ops {:?} ({:?})", serialize(loc.path()), loc.path(), loc.path().len(), loc.child_mask(), loc.child_mask().iter().map(byte_item).collect::<Vec<_>>());
+    // let top = stack.last().map(|x| format!("{:?}", x)).unwrap_or_else(|| "empty".into());
+    // trace!(target: "coref trans", "top {}", top);
+    trace!(target: "coref trans", "top {}", stack.last().map(|x| x.show()).unwrap_or_else(|| "empty".into()), );
     unsafe { transitions += 1 };
     match stack.pop() {
         None => { f(loc) }
@@ -119,15 +121,18 @@ fn coreferential_transition<Z : ZipperMoving + Zipper + ZipperAbsolutePath + Zip
 	    println!("e: {:?}", e);
             let e_byte = *e.base.ptr.add(e.offset as usize);
 	    println!("e_byte: {:?}", e_byte);
-
+	    byte_item_dbg(e_byte);
             match byte_item(e_byte) {
                 Tag::NewVar => {
+		    println!("coreferential_transition NewVar");
                     if e.n == 0 {
+			println!("e.offset = {}, loc.path().len() = {}", e.offset, loc.path().len());
                         references.push(loc.path().len() as u32);
                     } else {
                         trace!(target: "coref trans", "not putting {} {}", e.n, e.show());
                         // trace!(target: "coref trans", "not putting against {:?}", loc.child_mask());
                     }
+		    println!("references[0]: {:?}", references);
                     vs!(e, true);
 
                     let m = loc.child_mask().and(&ByteMask(SIZES));
@@ -135,12 +140,13 @@ fn coreferential_transition<Z : ZipperMoving + Zipper + ZipperAbsolutePath + Zip
                     let mut it = m.iter();
                     while let Some(b) = it.next() {
 			println!("b: {:?}", b);
+			byte_item_dbg(b);
                         let Tag::SymbolSize(size) = byte_item(b) else { unreachable_unchecked() };
                         loc.descend_to_byte(b);
                         debug_assert!(loc.path_exists());
                         if !loc.descend_first_k_path(size as _) { unreachable_unchecked() }
                         loop {
-                            coreferential_transition(loc, stack, references, f);   
+                            coreferential_transition(loc, stack, references, f);
                             if !loc.to_next_k_path(size as _) { break }
                         }
                         if !loc.ascend_byte() { unreachable_unchecked() }
@@ -181,9 +187,12 @@ fn coreferential_transition<Z : ZipperMoving + Zipper + ZipperAbsolutePath + Zip
                     stack.pop();
                 }
                 Tag::SymbolSize(size) => {
+		    println!("coreferential_transition SymbolSize({:?})", size);
                     vs!(e, false);
                     if loc.descend_to_existing_byte(e_byte) {
+			println!("loc[0]: {:?}", serialize(loc.path()));
                         if loc.descend_to_check(&*slice_from_raw_parts(e.base.ptr.byte_add(e.offset as usize + 1), size as usize)) {
+			    println!("loc[1]: {:?}", serialize(loc.path()));
                             coreferential_transition(loc, stack, references, f);
                         }
                         loc.ascend((size as usize) + 1); // The expression length + the e_byte
@@ -192,6 +201,7 @@ fn coreferential_transition<Z : ZipperMoving + Zipper + ZipperAbsolutePath + Zip
                 Tag::Arity(arity) => {
                     vs!(e, false);
                     if loc.descend_to_existing_byte(e_byte) {
+			trace!(target: "coref trans", "AFTER descend_to_existing_byte loc {}    len {}", serialize(loc.path()), loc.path().len());
                         let stackl = stack.len();
                         println!("stack[1]: {:?}", stack);
                         println!("stackl: {:?}", stackl);
@@ -202,6 +212,7 @@ fn coreferential_transition<Z : ZipperMoving + Zipper + ZipperAbsolutePath + Zip
                         println!("stack[3]: {:?}", stack);
                         coreferential_transition(loc, stack, references, f);
                         stack.truncate(stack.len() - arity as usize);
+                        println!("stack[4]: {:?}", stack);
                         loc.ascend_byte();
                     }
                 }

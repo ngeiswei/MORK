@@ -120,14 +120,16 @@ pub const fn item_byte(b: Tag) -> u8 {
 }
 
 #[inline(always)]
-// pub fn byte_item(b: u8) -> Tag {
-//     println!("byte_item(b={:?})", b);
-//     if b == 0b1100_0000 { println!("Tag::NewVar"); return Tag::NewVar; }
-//     else if (b & 0b1100_0000) == 0b1100_0000 { println!("Tag::SymbolSize({:?})", b & 0b0011_1111); return Tag::SymbolSize(b & 0b0011_1111) }
-//     else if (b & 0b1100_0000) == 0b1000_0000 { println!("Tag::VarRef({:?})", b & 0b0011_1111); return Tag::VarRef(b & 0b0011_1111) }
-//     else if (b & 0b1100_0000) == 0b0000_0000 { println!("Tag::Arity({:?})", b & 0b0011_1111); return Tag::Arity(b & 0b0011_1111) }
-//     else { println!("panic({:?})", b); panic!("reserved {}", b) }
-// }
+pub fn byte_item_dbg(b: u8) -> Tag {
+    println!("byte_item_dbg(b={:?})", b);
+    if b == 0b1100_0000 { println!("Tag::NewVar"); return Tag::NewVar; }
+    else if (b & 0b1100_0000) == 0b1100_0000 { println!("Tag::SymbolSize({:?})", b & 0b0011_1111); return Tag::SymbolSize(b & 0b0011_1111) }
+    else if (b & 0b1100_0000) == 0b1000_0000 { println!("Tag::VarRef({:?})", b & 0b0011_1111); return Tag::VarRef(b & 0b0011_1111) }
+    else if (b & 0b1100_0000) == 0b0000_0000 { println!("Tag::Arity({:?})", b & 0b0011_1111); return Tag::Arity(b & 0b0011_1111) }
+    else { println!("panic({:?})", b); panic!("reserved {}", b) }
+}
+
+#[inline(always)]
 pub fn byte_item(b: u8) -> Tag {
     if b == 0b1100_0000 { return Tag::NewVar; }
     else if (b & 0b1100_0000) == 0b1100_0000 { return Tag::SymbolSize(b & 0b0011_1111) }

@@ -1295,7 +1295,7 @@ fn adam_lrz_bc(intermediate_prt: bool, mcs: usize, x: usize) {
     println!("{}:\n{}", "Final content", res);
 }
 
-// Like adam_lrz_cb but there is only the l rule.
+// Like adam_lrz_bc but there is only the l rule.
 //
 // Timestamps on steps and goals have been removed as they happen to
 // be irrelevant.
@@ -1423,8 +1423,7 @@ fn lrz_bc_slap(intermediate_prt: bool, mcs: usize) {
     ;; Backward Chainer
     ;; Recursive case
     (exec (0 1)
-          (, (Γ (: $f (→ $a $b)))
-             (: ($f (: $x $a)) $b))
+          (, (Γ (: $f (→ $a $b))) (: ($f (: $x $a)) $b))
           (, (: ($f (: $x $a)) $b)))
     "#;
 
