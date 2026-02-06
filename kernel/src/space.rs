@@ -181,6 +181,7 @@ fn coreferential_transition<Z : ZipperMoving + Zipper + ZipperAbsolutePath + Zip
                         static nv: u8 = item_byte(Tag::NewVar);
                         ExprEnv{ n: 255, v: 0, offset: 0, base: Expr{ ptr: ((&nv) as *const u8).cast_mut() } }
                     };
+		    println!("coreferential_transition addition: {:?}", addition);
                     stack.push(addition);
                     vs!(e, false);
                     coreferential_transition(loc, stack, references, f);

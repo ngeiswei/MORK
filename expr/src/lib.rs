@@ -1644,7 +1644,7 @@ impl Traversal<(), ()> for TraverseSide {
 impl ExprEnv {
     pub fn new(i: u8, e: Expr) -> Self {
         Self {
-            n: i,
+            n: i,		// What is this?
             v: 0,
             offset: 0,
             base: e,
