@@ -1092,8 +1092,21 @@ impl Sink for PureSink {
         PureSink { e, unique: PathMap::new(), scope }
     }
     fn request(&self) ->  impl Iterator<Item=WriteResourceRequest> {
-        let p = &unsafe { self.e.prefix().unwrap_or_else(|x| { let s = self.e.span(); slice_from_raw_parts(self.e.ptr, s.len() - 1) }).as_ref().unwrap() }[6..];
-        trace!(target: "sink", "count requesting {}", serialize(p));
+        // The root has to contain every path this sink writes, and what it writes are
+        // instantiations of the template alone. Taking the prefix of the whole
+        // `(pure <template> <pattern> <call>)` runs past the template and into the
+        // pattern and call whenever the template is constant, which leaves the root
+        // longer than what gets emitted. The template sits at offset 6, after
+        // `[Arity(4)][SymbolSize(4)]pure`.
+        let tpl = Expr { ptr: unsafe { self.e.ptr.add(6) } };
+        let p = unsafe { tpl.prefix().unwrap_or_else(|_| {
+            // A constant template is its own prefix, so keep the root one byte above
+            // it; the arms here emit at `absolute[root_prefix_path().len()..]` and need
+            // that to be non-empty.
+            let s = tpl.span();
+            slice_from_raw_parts(tpl.ptr, s.len() - 1)
+        }).as_ref().unwrap() };
+        trace!(target: "sink", "pure requesting {}", serialize(p));
         std::iter::once(WriteResourceRequest::BTM(p))
     }
     fn sink<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, mut it: It, path: &[u8]) where 'a : 'w, 'k : 'w {
@@ -1148,7 +1161,11 @@ impl Sink for PureSink {
             if prz.descend_to_existing_byte(item_byte(Tag::NewVar)) {
                 let ignored = &prz.path()[..prz.path().len()-1];
                 trace!(target: "sink", "ignored guard {}", serialize(ignored));
-                wz.move_to_path(ignored);
+                // `prz` is rooted at the top of the grafted input, so `ignored` is the
+                // absolute template path and has to be cut down to the write root the
+                // same way the var-ref arm below does. Writing it whole appended the
+                // template to the root rather than replacing it.
+                wz.move_to_path(&ignored[wz.root_prefix_path().len()..]);
                 wz.set_val(());
                 changed |= true;
                 prz.ascend_byte();

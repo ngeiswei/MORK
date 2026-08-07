@@ -1146,6 +1146,39 @@ fn sink_pure_explode_collapse_ident() {
     assert_eq!(res, "(result foo)\n");
 }
 
+fn sink_pure_ignored_guard_addressing() {
+    let mut s = Space::new();
+
+    // The NewVar ("ignored") arm moved to the absolute template path without cutting it
+    // down to the write root, so it emitted root ++ template. That is only visible when
+    // the root is shorter than the template, i.e. when the template holds a variable:
+    // exec 0 came out as `(tag (tag $a))`. With a constant template the surplus bytes
+    // trail a complete expression and dump reads the leading part, so exec 1 looked
+    // right either way and is here to keep that case pinned once the root moves.
+    const SPACE_EXPRS: &str = r#"
+(exec 0 (,) (O (pure (tag $q) $ (reverse_symbol 123))))
+(exec 1 (,) (O (pure ignored $ (reverse_symbol 123))))
+    "#;
+
+    s.add_all_sexpr(SPACE_EXPRS.as_bytes()).unwrap();
+
+    let mut t0 = Instant::now();
+    let steps = s.metta_calculus(1000000000000000);
+    println!("elapsed {} steps {} size {}", t0.elapsed().as_millis(), steps, s.btm.val_count());
+
+    // The execs are consumed, so the whole space is the emitted set. Sorted, because the
+    // space is a set and dump order is not what this pins down.
+    let mut v = vec![];
+    s.dump_sexpr(expr!(s, "$"), expr!(s, "_1"), &mut v);
+    let dumped = String::from_utf8_lossy_owned(v);
+    let mut lines: Vec<&str> = dumped.lines().filter(|l| !l.is_empty()).collect();
+    lines.sort();
+    let res = lines.join("\n");
+
+    println!("result: {res}");
+    assert_eq!(res, "(tag $a)\nignored");
+}
+
 fn sink_bass64url_ident() {
     let mut s = Space::new();
 
@@ -6224,6 +6257,7 @@ fn main() {
             sink_pure_dynamic_subformula();
             sink_pure_quote_collapse_symbol();
             sink_pure_explode_collapse_ident();
+            sink_pure_ignored_guard_addressing();
             sink_bass64url_ident();
             sink_hex_ident();
             sink_hash_expr();
