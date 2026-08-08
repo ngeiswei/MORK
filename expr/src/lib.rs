@@ -1826,6 +1826,17 @@ impl ExprEnv {
                     base: self.base,
                 };
                 for sk in 0..k {
+                    let ne = env.clone();
+                    dest.push(ne);
+                    // The traversal below exists only to advance `env` past this child to reach
+                    // the NEXT one, so after the last child it is pure waste -- and it costs
+                    // O(child span). On a right-nested pattern, where each level's last child is
+                    // the whole remaining term, paying it at every level made a descent that
+                    // calls `args` per node (`Space::coreferential_transition`) quadratic in the
+                    // pattern's size. Skipping it makes such a descent linear.
+                    if sk + 1 == k {
+                        break;
+                    }
                     let (se_c, _, se_offset) = traverseh!((), (), u8, env.subsexpr(), 0,
                         |c: &mut u8, o| { *c += 1; },
                         |_, o, r| {},
@@ -1834,8 +1845,6 @@ impl ExprEnv {
                         |_, o, x, y| {},
                         |_, _, _| {});
 
-                    let ne = env.clone();
-                    dest.push(ne);
                     env.offset += se_offset as u32;
                     env.v += se_c;
                 }
