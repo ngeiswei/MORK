@@ -977,6 +977,35 @@ fn is_wildcard_term(k: &[u8]) -> bool {
     k.len() == 1 && matches!(byte_item(k[0]), Tag::NewVar | Tag::VarRef(_))
 }
 
+/// Whether a stored complete subterm is symbol-headed, hence GROUND and a leaf of the encoding.
+///
+/// MORK's tag bytes order the shapes: `Arity(a)` is `0b00aaaaaa` (0x00..=0x3F), `VarRef(i)` is
+/// `0b10iiiiii` (0x80..=0xBF), `NewVar` is 0xC0, and `SymbolSize(s)` is `0b11ssssss` with `s > 0`
+/// (0xC1..=0xFF). So every symbol byte sorts ABOVE every compound and variable byte, and a
+/// cursor's ascending enumeration of a column therefore ends in a contiguous run of ground
+/// symbols. [`UnifyJoin::fill_lead_candidates`] leans on both facts: that run is the part of the
+/// domain an exact-match intersection may prune, because over ground terms unifiability is byte
+/// equality.
+#[inline]
+fn is_symbol_head(k: &[u8]) -> bool {
+    matches!(byte_item(k[0]), Tag::SymbolSize(_))
+}
+
+/// Whether a column whose trie children are `mask` can only match a value by EQUALITY: it holds no
+/// stored variable at this position. A stored variable is a complete single-byte subterm, so its
+/// presence is exactly a variable tag byte among the column's children (the same fact
+/// [`UnifyJoin::ground_probe`] and [`UnifyJoin::match_compound_at_current`] use to enumerate the
+/// stored wildcards from one mask read). A column that does offer one unifies with ANYTHING and so
+/// must never restrict an intersection. Reserved bytes (0x40..=0x7F, which no valid encoding
+/// produces) would answer "not equality-only", which is the conservative side.
+#[inline]
+fn column_matches_by_equality(mask: &ByteMask) -> bool {
+    !matches!(
+        least_ge(mask, item_byte(Tag::VarRef(0))),
+        Some(b) if b <= item_byte(Tag::NewVar)
+    )
+}
+
 /// A factor is inverted when its columns are not in `var_order` order, so the join cannot seek it
 /// forward (a later column's variable is bound before an earlier one). The triangle's third factor
 /// `(e $z $x)` under order `$x,$y,$z` is the case: its `$x` column comes second but binds first.
@@ -1325,6 +1354,7 @@ fn join_state<'a>(
         free_bufs: Vec::new(),
         fixed: FixedTerms::build(&plan.factors),
         free_child_bufs: Vec::new(),
+        lead_max: Vec::new(),
         out: BTreeSet::new(),
         want_coordinated,
         coordinated: BTreeSet::new(),
@@ -2228,6 +2258,10 @@ struct UnifyJoin<'a> {
     /// their allocations intact. Pure storage reuse: the children and their order are exactly what
     /// a fresh `Vec<ExprEnv>` collection produced.
     free_child_bufs: Vec<Vec<ExprEnv>>,
+    /// Reusable scratch for the mutual seek's running key in [`Self::fill_lead_candidates`]. Only
+    /// live inside that call, which completes before the node recurses, so one buffer serves every
+    /// depth.
+    lead_max: Vec<u8>,
     /// Answer rows, one `Option` per query variable: `Some(bytes)` for a resolved term, `None` for
     /// a still-free variable. The all-ground entry filters to fully-ground rows.
     out: BTreeSet<Vec<Option<Vec<u8>>>>,
@@ -2310,37 +2344,103 @@ impl UnifyJoin<'_> {
             return;
         }
         // The leapfrog principle: lead with the smallest domain so the leading factor enumerates
-        // few candidates and the rest seek. A bounded subterm count under each factor's current
-        // position is the estimate. This is what makes a selective factor, say (e a $y) with a few
-        // edges, drive the join instead of the whole relation. Estimates are precomputed (the held
-        // cursors make `domain_estimate` `&mut self`); the stable sort on them keys exactly as
-        // `sort_by_key(domain_estimate)` did, so the lead choice and visit order are unchanged.
-        let mut keyed: Vec<(usize, usize)> = parts
-            .iter()
-            .map(|&f| (self.domain_estimate(f), f))
-            .collect();
-        keyed.sort_by_key(|&(estimate, _)| estimate);
-        parts = keyed.into_iter().map(|(_, f)| f).collect();
-        self.consume_var_parts(&parts, 0, v, i);
+        // few candidates and the rest seek. This is what makes a selective factor, say (e a $y)
+        // with a few edges, drive the join instead of the whole relation.
+        self.rank_parts(&mut parts);
+        let nr = self.partition_restrictors(&mut parts);
+        self.consume_lead(&parts, nr, v, i);
     }
 
-    /// Domain-size estimate for lead selection, bounded so it is independent of the space size.
-    /// Count the distinct subterm values under the factor's current position, but stop at a small
-    /// cap. The leapfrog only needs to know which factor has the fewest candidates, not the exact
-    /// count, so a bounded count suffices and stays O(cap). A full `val_count` is O(subtree), which
-    /// would make a selective join's cost climb with the whole relation rather than the answer.
-    /// Enumerates on the held cursor (already at prefix+bound) and restores it to the floor.
-    fn domain_estimate(&mut self, f: usize) -> usize {
-        const CAP: usize = 32;
-        let cur = &mut self.cursors[f];
-        cur.first();
-        let mut n = 0;
-        while !cur.at_end() && n < CAP {
-            n += 1;
-            cur.next();
+    /// Order the participating factors by domain size, smallest first, so `parts[0]` leads.
+    ///
+    /// The count is a ROUND ROBIN: every participating cursor is stepped one value per round, and
+    /// counting stops at the end of the round in which some cursor runs out. That cursor is the
+    /// exact argmin, so a tiny domain wins the lead even against a domain of millions. The former
+    /// per-factor count-to-32 could not: it scored every domain over the cap equal and left the
+    /// choice to syntactic factor order, so a 100k-value factor beat a 100-value one and the join
+    /// enumerated 100k candidates to keep 100.
+    ///
+    /// The bound is self-financing rather than a fixed cap. The scan costs
+    /// `parts.len() * (min_domain + 1)` cursor steps, and the node then enumerates the lead's
+    /// `min_domain` candidates, matching every other participating factor against each one -- at
+    /// least `min_domain * (parts.len() - 1)` steps. So the estimate stays within a constant factor
+    /// of the enumeration it is choosing, and it never scales with the total space size: nothing
+    /// here reads more than the SMALLEST participating domain (plus one step per larger one), which
+    /// is why a full `val_count` (O(subtree), climbing with the whole relation) is still refused.
+    /// `HARD_ROUNDS` only stops a node whose EVERY domain is huge from an unbounded pre-scan; that
+    /// node is about to enumerate at least that many candidates anyway.
+    fn rank_parts(&mut self, parts: &mut [usize]) {
+        const HARD_ROUNDS: usize = 512;
+        if parts.len() < 2 {
+            return;
         }
-        cur.reset_to_floor();
-        n
+        // (values counted, exhausted, factor). One allocation, as the former keyed sort had.
+        let mut rows: Vec<(usize, bool, usize)> = parts.iter().map(|&f| (0usize, false, f)).collect();
+        for row in rows.iter() {
+            self.cursors[row.2].first();
+        }
+        let mut round = 0usize;
+        loop {
+            round += 1;
+            let mut alive = false;
+            let mut exhausted = false;
+            for row in rows.iter_mut() {
+                if row.1 {
+                    continue;
+                }
+                let cur = &mut self.cursors[row.2];
+                if cur.at_end() {
+                    row.1 = true;
+                    exhausted = true;
+                    continue;
+                }
+                row.0 += 1;
+                cur.next();
+                alive = true;
+            }
+            if !alive || exhausted || round >= HARD_ROUNDS {
+                break;
+            }
+        }
+        for row in rows.iter() {
+            self.cursors[row.2].reset_to_floor();
+        }
+        // A cursor that ran out carries its EXACT domain size, and one still alive carries the
+        // round count, which is strictly larger, so exact counts always sort first. The sort is
+        // stable, so equal counts keep syntactic factor order, as the former estimate sort did.
+        rows.sort_by_key(|row| row.0);
+        for (j, row) in rows.iter().enumerate() {
+            parts[j] = row.2;
+        }
+    }
+
+    /// Stable-partition `parts[1..]` so the factors whose current column matches only by equality
+    /// come first, and return how many there are. Those are the ones the mutual seek in
+    /// [`Self::fill_lead_candidates`] may intersect the lead against; a factor holding a stored
+    /// variable at this column unifies with anything and stays in the ordinary cascade.
+    /// Every cursor sits at its column floor here, which is where the child mask is read.
+    fn partition_restrictors(&mut self, parts: &mut [usize]) -> usize {
+        // Only symbol-headed lead values are prunable, so a lead column offering none (a column of
+        // compounds, say) has nothing to intersect: answer 0 off ONE mask read instead of scanning
+        // every other factor's.
+        if least_ge(
+            &self.cursors[parts[0]].floor_child_mask(),
+            item_byte(Tag::SymbolSize(1)),
+        )
+        .is_none()
+        {
+            return 0;
+        }
+        let mut nr = 0usize;
+        for j in 1..parts.len() {
+            if column_matches_by_equality(&self.cursors[parts[j]].floor_child_mask()) {
+                nr += 1;
+                // Rotate the entry down to the end of the restrictor group, keeping both groups'
+                // relative order.
+                parts[nr..=j].rotate_right(1);
+            }
+        }
+        nr
     }
 
     fn factor_path(&self, f: usize) -> Vec<u8> {
@@ -2398,6 +2498,88 @@ impl UnifyJoin<'_> {
             cur.next();
         }
         cur.reset_to_floor();
+    }
+
+    /// Fill `buf` with the LEAD's candidate values for a still-free join variable and return the
+    /// index of the first candidate the mutual seek confirmed present in every restrictor.
+    ///
+    /// This is the true leapfrog intersection, modelled on [`GroundJoin::leapfrog`]: seek every
+    /// restrictor to the candidate, and when one answers with a larger value, leap the lead
+    /// straight there instead of walking (and then unifying, binding, and unwinding) the values in
+    /// between. `restrictors` are the other participating factors whose column matches only by
+    /// equality ([`column_matches_by_equality`]).
+    ///
+    /// Soundness, which is the whole subtlety here, rests on [`is_symbol_head`]: this join UNIFIES,
+    /// so a stored value may match a candidate without equalling it, and an exact intersection would
+    /// silently drop answers. A candidate is prunable only where unifiability IS equality. Symbol-
+    /// headed candidates are ground, and a restrictor's column holds no stored variable, so at that
+    /// column only the same symbol unifies with them (a stored compound cannot unify with a symbol
+    /// at all). Symbol bytes sort above every compound and variable byte, so those candidates form
+    /// a SUFFIX of the enumeration: everything before it -- stored wildcards, and compounds that a
+    /// stored schematic compound like `(f $x)` unifies with without equalling -- is pushed
+    /// unfiltered, and the seek never skips over any of it. The surviving candidates are therefore a
+    /// subsequence of the unfiltered ones in the same order, so the join's visit order is unchanged.
+    fn fill_lead_candidates(
+        &mut self,
+        f: usize,
+        restrictors: &[usize],
+        buf: &mut CandidateBuf,
+    ) -> usize {
+        {
+            let cur = &mut self.cursors[f];
+            cur.first();
+            while let Some(k) = cur.key() {
+                if is_symbol_head(k) {
+                    break;
+                }
+                buf.push_from(k);
+                cur.next();
+            }
+        }
+        let confirmed_from = buf.len;
+        if restrictors.is_empty() {
+            let cur = &mut self.cursors[f];
+            while let Some(k) = cur.key() {
+                buf.push_from(k);
+                cur.next();
+            }
+            cur.reset_to_floor();
+            return confirmed_from;
+        }
+        'candidates: while !self.cursors[f].at_end() {
+            // Copy the candidate out once so `seek` can take the cursors mutably below.
+            let (lead_max, cursors) = (&mut self.lead_max, &self.cursors);
+            lead_max.clear();
+            lead_max.extend_from_slice(cursors[f].key().unwrap());
+            for &r in restrictors {
+                let (cursors, lead_max) = (&mut self.cursors, &self.lead_max);
+                cursors[r].seek(lead_max);
+                if cursors[r].at_end() {
+                    // Nothing stored at or above the candidate: every remaining candidate is a
+                    // ground symbol at least as large, so none of them can match this factor.
+                    break 'candidates;
+                }
+                if cursors[r].key().unwrap() != self.lead_max.as_slice() {
+                    // The restrictor's least value at or above the candidate is larger, so every
+                    // lead value in between is a ground symbol absent from this factor. Leap there.
+                    // The target is a symbol, so the lead lands on a symbol too and skips nothing
+                    // outside the prunable suffix.
+                    let (lead_max, cursors) = (&mut self.lead_max, &self.cursors);
+                    lead_max.clear();
+                    lead_max.extend_from_slice(cursors[r].key().unwrap());
+                    let (cursors, lead_max) = (&mut self.cursors, &self.lead_max);
+                    cursors[f].seek(lead_max);
+                    continue 'candidates;
+                }
+            }
+            buf.push_from(&self.lead_max);
+            self.cursors[f].next();
+        }
+        self.cursors[f].reset_to_floor();
+        for &r in restrictors {
+            self.cursors[r].reset_to_floor();
+        }
+        confirmed_from
     }
 
     /// Probe factor `f`'s current ground column: whether the trie holds the exact ground subterm,
@@ -2607,6 +2789,110 @@ impl UnifyJoin<'_> {
         self.consume_col(f, v, &mut |this| {
             this.consume_var_parts(parts, pi + 1, v, i);
         });
+    }
+
+    /// The lead level for a still-free join variable `v`: `parts[0]` offers its column's values and
+    /// the remaining participating factors match against each accepted value.
+    ///
+    /// `parts[1..][..nr]` are the equality-matching restrictors ([`Self::partition_restrictors`]),
+    /// which the mutual seek in [`Self::fill_lead_candidates`] has already intersected with the lead
+    /// over the ground-symbol candidates. For those candidates the restrictors' columns are consumed
+    /// right here -- their only possible match is that exact value, already located -- and the
+    /// cascade handles only the rest; every other candidate goes through the full cascade over all
+    /// of `parts[1..]`, so stored wildcards and schematic compounds keep the unchanged path.
+    ///
+    /// The binding of the lead's own candidate is exactly what [`Self::match_expr_at_current`]'s
+    /// free-variable branch does, including its ground fast bind.
+    fn consume_lead(&mut self, parts: &[usize], nr: usize, v: usize, i: usize) {
+        if self.stopped {
+            return;
+        }
+        let f = parts[0];
+        let pattern = self.query_var_env(v);
+        let free_key = self
+            .deref_env(pattern)
+            .var_opt()
+            .expect("the lead level runs only for a still-free join variable");
+        let mut buf = self.free_bufs.pop().unwrap_or_default();
+        let confirmed_from = self.fill_lead_candidates(f, &parts[1..1 + nr], &mut buf);
+        for ci in 0..buf.len {
+            if self.stopped {
+                break;
+            }
+            let (restrictors, rest) = if ci >= confirmed_from {
+                (&parts[1..1 + nr], &parts[1 + nr..])
+            } else {
+                (&parts[..0], &parts[1..])
+            };
+            let cand = &buf.entries[ci];
+            let mut cont = |this: &mut Self| {
+                this.next_col[f] += 1;
+                this.descend_restrictors(restrictors, 0, cand, &mut |this| {
+                    this.consume_var_parts(rest, 0, v, i);
+                });
+                this.next_col[f] -= 1;
+            };
+            if first_subterm_is_ground(cand) {
+                // The ground fast bind, with the same precondition and reasoning as the general
+                // free-variable branch in `match_expr_at_current`.
+                let arena_mark = self.arena.len();
+                let data_env = self.data_env_for(f, cand);
+                let previous = self.bindings.insert(free_key, data_env);
+                debug_assert!(previous.is_none(), "deref ended at a bound var");
+                self.with_bound_term(f, cand, &mut cont);
+                self.bindings.remove(&free_key);
+                self.arena.truncate(arena_mark);
+            } else {
+                self.match_candidate(f, pattern, cand, &mut cont);
+            }
+        }
+        buf.len = 0;
+        self.free_bufs.push(buf);
+    }
+
+    /// Consume the confirmed column of each restrictor in turn, then continue. The mutual seek
+    /// established that `value` -- a ground symbol -- is stored at this column and that the column
+    /// holds no stored variable, so `consume_col` would seek to exactly this value, bind it with no
+    /// intro of its own, and find no wildcard alternative: that is what happens here, without the
+    /// mask read and the ascend-then-re-descend the general path pays. The cursor's FLOOR descends
+    /// into the value it is already positioned on, in place, and `bound[r]` grows by the same bytes
+    /// `with_bound_path_bytes` would have appended. Every exit leaves the cursor back at its column
+    /// floor, which the ancestors' `ascend_raw` requires.
+    fn descend_restrictors(
+        &mut self,
+        restrictors: &[usize],
+        j: usize,
+        value: &[u8],
+        cont: &mut dyn FnMut(&mut Self),
+    ) {
+        if j == restrictors.len() {
+            cont(self);
+            return;
+        }
+        let r = restrictors[j];
+        self.cursors[r].seek(value);
+        if self.cursors[r].key() != Some(value) {
+            // Unreachable given the mutual seek's agreement; treated as "no match", which is what
+            // the general path would conclude from the same probe.
+            debug_assert!(false, "the mutual seek's agreement must still hold");
+            self.cursors[r].reset_to_floor();
+            return;
+        }
+        let len = self.bound[r].len();
+        self.bound[r].extend_from_slice(value);
+        self.cursors[r].descend_floor();
+        self.next_col[r] += 1;
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            self.cursors[r].floor_len(),
+            self.bound[r].len(),
+            "held cursor drifted from prefix+bound"
+        );
+        self.descend_restrictors(restrictors, j + 1, value, cont);
+        self.next_col[r] -= 1;
+        self.cursors[r].ascend_floor();
+        self.bound[r].truncate(len);
+        self.cursors[r].reset_to_floor();
     }
 
     /// Match `env` against factor `f`'s current column and recurse with the column consumed
@@ -3497,6 +3783,48 @@ mod tests {
                 assert_eq!(least_ge(&mask, k), want, "set={set:?} k={k}");
             }
         }
+    }
+
+    /// The lead's mutual-seek intersection prunes exactly the symbol-headed (hence ground)
+    /// candidates, and it may only skip forward over them, so it needs every symbol byte to sort
+    /// above every compound and variable byte -- otherwise the leap could jump a compound the
+    /// intersection is not allowed to prune. Pin that property of the tag encoding, and pin
+    /// `column_matches_by_equality`'s mask test against the variable byte range it stands for.
+    #[test]
+    fn symbol_terms_sort_above_every_other_tag() {
+        use mork_expr::maybe_byte_item;
+        for b in 0u8..=255 {
+            // Reserved bytes are not a valid encoding and never reach a stored subterm.
+            let Ok(tag) = maybe_byte_item(b) else { continue };
+            let symbol = matches!(tag, Tag::SymbolSize(_));
+            assert_eq!(symbol, is_symbol_head(&[b]), "byte {b}");
+            let variable = matches!(tag, Tag::NewVar | Tag::VarRef(_));
+            // A single variable byte is a complete subterm; nothing else one byte long is.
+            assert_eq!(variable, is_wildcard_term(&[b]), "byte {b}");
+            if symbol {
+                // Every non-symbol byte is strictly below every symbol byte.
+                for c in 0u8..=255 {
+                    if matches!(
+                        maybe_byte_item(c),
+                        Ok(Tag::NewVar | Tag::VarRef(_) | Tag::Arity(_))
+                    ) {
+                        assert!(c < b, "tag byte {c} must sort below symbol byte {b}");
+                    }
+                }
+            }
+            // The mask test sees a variable byte exactly when one is present.
+            assert_eq!(
+                !column_matches_by_equality(&mask_of(&[b])),
+                variable,
+                "byte {b}"
+            );
+        }
+        assert!(column_matches_by_equality(&mask_of(&[])));
+        assert!(!column_matches_by_equality(&mask_of(&[
+            item_byte(Tag::Arity(2)),
+            item_byte(Tag::NewVar),
+            item_byte(Tag::SymbolSize(3)),
+        ])));
     }
 
     #[test]
