@@ -1068,6 +1068,83 @@ fn emit_reordered(items_by_col: &[Vec<Item>], new_order: &[usize]) -> Vec<u8> {
     out
 }
 
+/// The regions of the source map a factor's re-index has to walk, or `None` when no sound scoping
+/// exists and the whole same-arity prefix must be read.
+///
+/// A parsed factor's `prefix` is the ARITY BYTE ALONE (the relation head is kept as column 0 on
+/// purpose, so a stored WILDCARD head still unifies under a ground query head), so "the factor's
+/// region" is otherwise every same-arity fact in the space — unrelated relations included.
+///
+/// Scoping is sound exactly when the head column is a ground SYMBOL. At that trie position a
+/// stored subterm is a symbol, a compound, or a top-level wildcard, and a ground symbol query
+/// column unifies only with the identical symbol bytes or with a wildcard (see
+/// [`UnifyJoin::match_expr_at_current`]'s `Tag::SymbolSize` arm: an exact `ground_probe` hit plus
+/// the wildcard bytes of the child mask). So the union of `prefix + head bytes` and
+/// `prefix + w` for every wildcard byte `w` present at that position holds every fact the factor
+/// can ever match, and nothing outside it is reachable. Re-emitting preserves each column's shape
+/// (a stored variable stays a variable, a symbol stays the same symbol), so no excluded fact could
+/// re-enter through the re-indexed key either.
+///
+/// A ground COMPOUND head is deliberately NOT scoped: a stored compound head may carry variables
+/// inside it (`(g $x)` unifies with `(g a)`) and would live outside `prefix + head bytes`. A
+/// variable or compound head column is not scoped either.
+///
+/// Related to [`factor_scan_path`], which the dispatch gate uses for approximate counts and
+/// samples; that one accepts any ground head and does not take the wildcard union, so it is not
+/// sound for this purpose and is left alone.
+fn reindex_regions(map: &PathMap<()>, factor: &Factor) -> Option<Vec<Vec<u8>>> {
+    let FactorColumn::Term(head) = factor.cols.first()? else {
+        return None;
+    };
+    if !matches!(head.tag(), Tag::SymbolSize(_)) {
+        return None;
+    }
+    // Only the head's first subterm is what the join matches; ignore any trailing bytes.
+    let hlen = try_parse_first_subterm(&head.bytes)?.0;
+    let mut regions = Vec::new();
+    let mut ground = factor.prefix.clone();
+    ground.extend_from_slice(&head.bytes[..hlen]);
+    regions.push(ground);
+    let mask = map.read_zipper_at_path(&factor.prefix).child_mask();
+    for w in mask.iter() {
+        if is_wildcard_term(&[w]) {
+            let mut wild = factor.prefix.clone();
+            wild.push(w);
+            regions.push(wild);
+        }
+    }
+    Some(regions)
+}
+
+/// Fold every fact under `region` into `reindex`, permuted by `new_order`. `plen` is the factor's
+/// prefix length, so the column bytes start at `plen` of the absolute path regardless of how deep
+/// `region` reaches.
+fn fold_region_into_reindex(
+    map: &PathMap<()>,
+    region: &[u8],
+    plen: usize,
+    ncols: usize,
+    new_order: &[usize],
+    reindex: &mut PathMap<()>,
+) {
+    let mut insert = |col_bytes: &[u8]| {
+        let cols = split_columns(col_bytes, ncols);
+        let items = columns_to_items(&cols);
+        reindex.insert(&emit_reordered(&items, new_order), ());
+    };
+    let mut rz = map.read_zipper_at_path(region);
+    // `to_next_val` starts strictly below the zipper's root, so a fact stored exactly AT the region
+    // root needs folding explicitly. Only a single-column factor can reach that, and a
+    // single-column factor is never inverted, but the walk stays total either way.
+    if rz.val().is_some() {
+        insert(&region[plen..]);
+    }
+    while rz.to_next_val() {
+        let full = rz.origin_path();
+        insert(&full[plen..]);
+    }
+}
+
 /// Re-index an inverted factor: copy its facts into a fresh PathMap with the columns permuted into
 /// `var_order` position order (variables renumbered to stay canonical). Returns that map, the new
 /// column-variable list, now non-decreasing, so the join seeks it like any compatible factor, and
@@ -1075,6 +1152,9 @@ fn emit_reordered(items_by_col: &[Vec<Item>], new_order: &[usize]) -> Vec<u8> {
 /// can reconstruct the stored fact's original bytes. This is the one partial materialization the
 /// cyclic case needs, and only the inverted factor pays it; re-keying into another attribute order
 /// is the standard worst-case-optimal answer to a cycle.
+///
+/// The walk is scoped to the factor's OWN relation whenever [`reindex_regions`] can prove that
+/// sound, instead of re-materializing every same-arity fact in the space.
 fn build_reindex(
     map: &PathMap<()>,
     factor: &Factor,
@@ -1094,12 +1174,9 @@ fn build_reindex(
 
     let mut reindex = PathMap::<()>::new();
     let plen = factor.prefix.len();
-    let mut rz = map.read_zipper_at_path(&factor.prefix);
-    while rz.to_next_val() {
-        let full = rz.origin_path();
-        let cols = split_columns(&full[plen..], ncols);
-        let items = columns_to_items(&cols);
-        reindex.insert(&emit_reordered(&items, &new_order), ());
+    let regions = reindex_regions(map, factor).unwrap_or_else(|| vec![factor.prefix.clone()]);
+    for region in &regions {
+        fold_region_into_reindex(map, region, plen, ncols, &new_order, &mut reindex);
     }
     (reindex, new_cols, new_order)
 }
