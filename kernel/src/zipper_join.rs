@@ -892,42 +892,6 @@ fn is_wildcard_term(k: &[u8]) -> bool {
     k.len() == 1 && matches!(byte_item(k[0]), Tag::NewVar | Tag::VarRef(_))
 }
 
-/// The children of a factor's current column when the join variable is still free. This is the
-/// lead, which enumerates the whole column (structured children and wildcards alike).
-fn free_candidates<Z: Zipper + ZipperMoving>(cur: &mut SubtermCursor<Z>) -> Vec<Vec<u8>> {
-    let mut out = Vec::new();
-    cur.first();
-    while let Some(k) = cur.key() {
-        out.push(k.to_vec());
-        cur.next();
-    }
-    out
-}
-
-/// The candidates at a ground column: the exact ground subterm if the trie holds it, plus every
-/// stored wildcard at that position. Wildcards are one tag byte in the contiguous range
-/// `VarRef(0)..=NewVar`, so one seek to `VarRef(0)` and a scan while-wildcard covers them all.
-fn ground_candidates<Z: Zipper + ZipperMoving>(
-    cur: &mut SubtermCursor<Z>,
-    g: &[u8],
-) -> Vec<Vec<u8>> {
-    let mut out = Vec::new();
-    cur.seek(g);
-    if cur.key() == Some(g) {
-        out.push(g.to_vec());
-    }
-    cur.seek(&[item_byte(Tag::VarRef(0))]);
-    while let Some(k) = cur.key() {
-        if is_wildcard_term(k) {
-            out.push(k.to_vec());
-            cur.next();
-        } else {
-            break;
-        }
-    }
-    out
-}
-
 /// A factor is inverted when its columns are not in `var_order` order, so the join cannot seek it
 /// forward (a later column's variable is bound before an earlier one). The triangle's third factor
 /// `(e $z $x)` under order `$x,$y,$z` is the case: its `$x` column comes second but binds first.
@@ -1196,6 +1160,7 @@ fn join_state<'a>(
         data_intro: vec![0; nf],
         bindings: BTreeMap::new(),
         arena: Vec::new(),
+        free_bufs: Vec::new(),
         out: BTreeSet::new(),
         want_coordinated,
         coordinated: BTreeSet::new(),
@@ -1964,6 +1929,30 @@ fn hypergraph_is_cyclic(mut edges: Vec<std::collections::BTreeSet<usize>>, nvars
     edges.len() > 1
 }
 
+/// A reusable candidate list for one recursion depth of the lead enumeration. `entries[..len]`
+/// are the live candidates; entries past `len` are retained allocations whose capacity the next
+/// fill reuses, so a node's enumeration allocates only when a candidate outgrows a recycled
+/// buffer. Pure storage reuse: the candidates and their order are exactly what a fresh
+/// `Vec<Vec<u8>>` collection produced.
+#[derive(Default)]
+struct CandidateBuf {
+    entries: Vec<Vec<u8>>,
+    len: usize,
+}
+
+impl CandidateBuf {
+    fn push_from(&mut self, bytes: &[u8]) {
+        if self.len < self.entries.len() {
+            let entry = &mut self.entries[self.len];
+            entry.clear();
+            entry.extend_from_slice(bytes);
+        } else {
+            self.entries.push(bytes.to_vec());
+        }
+        self.len += 1;
+    }
+}
+
 struct UnifyJoin<'a> {
     map: &'a PathMap<()>,
     /// Per factor, `Some((original_prefix, new_order))` when re-indexed: the original relation
@@ -1987,6 +1976,9 @@ struct UnifyJoin<'a> {
     data_intro: Vec<u8>,
     bindings: Bindings,
     arena: Vec<Box<[u8]>>,
+    /// Pool of [`CandidateBuf`]s for the lead enumeration, one in flight per active recursion
+    /// depth; released buffers return here with their allocations intact.
+    free_bufs: Vec<CandidateBuf>,
     /// Answer rows, one `Option` per query variable: `Some(bytes)` for a resolved term, `None` for
     /// a still-free variable. The all-ground entry filters to fully-ground rows.
     out: BTreeSet<Vec<Option<Vec<u8>>>>,
@@ -2145,39 +2137,35 @@ impl UnifyJoin<'_> {
         self.cursors[f].has_value()
     }
 
-    /// The candidates at factor `f`'s current column when a query variable is still free.
-    /// Enumerates on the held cursor; exhaustion leaves it back at the column floor.
-    fn open_free_candidates(&mut self, f: usize) -> Vec<Vec<u8>> {
+    /// Fill `buf` with the children of factor `f`'s current column, for the lead whose join
+    /// variable is still free (structured children and wildcards alike), in the cursor's
+    /// ascending subterm order. Enumerates on the held cursor and restores it to the column
+    /// floor.
+    fn fill_free_candidates(&mut self, f: usize, buf: &mut CandidateBuf) {
         let cur = &mut self.cursors[f];
-        let out = free_candidates(cur);
+        cur.first();
+        while let Some(k) = cur.key() {
+            buf.push_from(k);
+            cur.next();
+        }
         cur.reset_to_floor();
-        out
     }
 
-    /// The candidates at factor `f`'s current ground column that can unify with the fixed query
-    /// value. A data-side wildcard captures that ground value and keeps its stored slot for later
-    /// VarRef columns in the same fact. The held cursor is restored to the column floor (the
-    /// wildcard scan can stop mid-subterm).
-    fn open_ground_candidates(&mut self, f: usize, ground: &[u8]) -> Vec<Vec<u8>> {
+    /// Probe factor `f`'s current ground column: whether the trie holds the exact ground subterm,
+    /// plus the column's child mask. The stored wildcards at this position are exactly the
+    /// wildcard tag bytes set in that mask: a wildcard is a complete single-byte subterm, so its
+    /// presence as a child byte at the column start is its presence as a stored subterm (the
+    /// compound path in [`Self::match_compound_at_current`] relies on the same fact). The mask
+    /// iterates in ascending byte order, the order the former seek-to-`VarRef(0)`-and-scan
+    /// produced. Probes on the held cursor (mask read at the floor, then one exact seek) and
+    /// restores it to the column floor.
+    fn ground_probe(&mut self, f: usize, ground: &[u8]) -> (bool, ByteMask) {
         let cur = &mut self.cursors[f];
-        let out = ground_candidates(cur, ground);
+        let mask = cur.floor_child_mask();
+        cur.seek(ground);
+        let exact = cur.key() == Some(ground);
         cur.reset_to_floor();
-        out
-    }
-
-    fn child_bytes_at_current(&self, f: usize) -> Vec<u8> {
-        self.cursors[f].floor_child_mask().iter().collect()
-    }
-
-    fn wildcard_children_at_current(&self, f: usize) -> Vec<u8> {
-        self.child_bytes_at_current(f)
-            .into_iter()
-            .filter(|&b| is_wildcard_term(&[b]))
-            .collect()
-    }
-
-    fn child_exists_at_current(&self, f: usize, b: u8) -> bool {
-        self.cursors[f].floor_child_mask().test_bit(b)
+        (exact, mask)
     }
 
     fn factor_namespace(&self, f: usize) -> u8 {
@@ -2367,17 +2355,23 @@ impl UnifyJoin<'_> {
             return;
         }
         let f = parts[pi];
-        self.consume_col(f, FactorColumn::Var(v), &mut |this| {
+        self.consume_col(f, v, &mut |this| {
             this.consume_var_parts(parts, pi + 1, v, i);
         });
     }
 
-    fn consume_col(&mut self, f: usize, col: FactorColumn, cont: &mut dyn FnMut(&mut Self)) {
-        self.match_col_at_current(f, col, &mut |this| {
+    /// Match `env` against factor `f`'s current column and recurse with the column consumed
+    /// (`next_col` advanced), stack-disciplined.
+    fn consume_env(&mut self, f: usize, env: ExprEnv, cont: &mut dyn FnMut(&mut Self)) {
+        self.match_expr_at_current(f, env, &mut |this| {
             this.next_col[f] += 1;
             cont(this);
             this.next_col[f] -= 1;
         });
+    }
+
+    fn consume_col(&mut self, f: usize, v: usize, cont: &mut dyn FnMut(&mut Self)) {
+        self.consume_env(f, self.query_var_env(v), cont);
     }
 
     fn with_bound_path_bytes(
@@ -2411,19 +2405,6 @@ impl UnifyJoin<'_> {
         self.with_bound_path_bytes(f, bytes, intro_delta, cont);
     }
 
-    fn match_col_at_current(
-        &mut self,
-        f: usize,
-        col: FactorColumn,
-        cont: &mut dyn FnMut(&mut Self),
-    ) {
-        let env = match col {
-            FactorColumn::Var(v) => self.query_var_env(v),
-            FactorColumn::Term(term) => self.arena_env(QUERY_NS, term.intro, &term.bytes),
-        };
-        self.match_expr_at_current(f, env, cont);
-    }
-
     fn match_candidate(
         &mut self,
         f: usize,
@@ -2452,10 +2433,43 @@ impl UnifyJoin<'_> {
         cont: &mut dyn FnMut(&mut Self),
     ) {
         let resolved = self.deref_env(pattern);
-        if resolved.var_opt().is_some() {
-            for bytes in self.open_free_candidates(f) {
-                self.match_candidate(f, pattern, &bytes, cont);
+        if let Some(free_key) = resolved.var_opt() {
+            // The lead enumeration: refill a pooled buffer instead of collecting a fresh
+            // `Vec<Vec<u8>>` at every node; candidates and their order are unchanged.
+            let mut buf = self.free_bufs.pop().unwrap_or_default();
+            self.fill_free_candidates(f, &mut buf);
+            for ci in 0..buf.len {
+                if self.stopped {
+                    break;
+                }
+                if first_subterm_is_ground(&buf.entries[ci]) {
+                    // Free variable against a GROUND candidate: unification degenerates to one
+                    // binding, so skip the full re-unify. Precondition: `pattern` derefs (through
+                    // `self.bindings`) to the free var `free_key` (so `free_key` is absent from
+                    // the map) and the candidate is ground (no vars, so no occurs check and no
+                    // constraint on any other binding). `mork_expr::unify` on the same equations
+                    // would bind the pattern's own var key to the data env first (its `derefBound`
+                    // walks the map it is building, which starts empty) and then, re-solving the
+                    // existing bindings' equations, bind `free_key` to the same ground env while
+                    // path-compressing entries that deref through the chain. Inserting only
+                    // `free_key -> data_env` yields the same deref closure — every chain still
+                    // resolves to the same ground bytes — so accept/reject decisions and emitted
+                    // bytes are unchanged; like the ground-symbol direct bind below, we keep the
+                    // uncompressed (deref-equivalent) map shape. Non-ground candidates (stored
+                    // wildcards, schematic compounds) keep the general path.
+                    let arena_mark = self.arena.len();
+                    let data_env = self.data_env_for(f, &buf.entries[ci]);
+                    let previous = self.bindings.insert(free_key, data_env);
+                    debug_assert!(previous.is_none(), "deref ended at a bound var");
+                    self.with_bound_term(f, &buf.entries[ci], cont);
+                    self.bindings.remove(&free_key);
+                    self.arena.truncate(arena_mark);
+                } else {
+                    self.match_candidate(f, pattern, &buf.entries[ci], cont);
+                }
             }
+            buf.len = 0;
+            self.free_bufs.push(buf);
             return;
         }
         match byte_item(unsafe { *resolved.subsexpr().ptr }) {
@@ -2465,16 +2479,18 @@ impl UnifyJoin<'_> {
                 // A symbol holds no variables, so the resolved value needs no substitution: its
                 // bytes are the subexpression span itself. `apply` stays for compound values.
                 let bytes = unsafe { resolved.subsexpr().span().as_ref().unwrap() }.to_vec();
-                for candidate in self.open_ground_candidates(f, &bytes) {
+                let (exact, mask) = self.ground_probe(f, &bytes);
+                if exact {
                     // Ground against ground: the seek established byte equality, and on ground
                     // terms byte equality is unifiability (RoutingSafe.thy,
                     // `ground_unifiable_iff_eq`), so `unify` would return the bindings unchanged.
                     // Bind the column directly; a wildcard candidate still unifies through
                     // `mork_expr::unify` below.
-                    if candidate == bytes {
-                        self.with_bound_path_bytes(f, &candidate, 0, cont);
-                    } else {
-                        self.match_candidate(f, pattern, &candidate, cont);
+                    self.with_bound_path_bytes(f, &bytes, 0, cont);
+                }
+                for w in mask.iter() {
+                    if is_wildcard_term(&[w]) {
+                        self.match_candidate(f, pattern, &[w], cont);
                     }
                 }
             }
@@ -2488,14 +2504,20 @@ impl UnifyJoin<'_> {
         resolved: ExprEnv,
         cont: &mut dyn FnMut(&mut Self),
     ) {
-        for w in self.wildcard_children_at_current(f) {
-            self.match_candidate(f, pattern, &[w], cont);
+        // One mask read serves both the wildcard candidates and the arity-byte test: the zipper
+        // position is the same before and after the wildcard branches (each `match_candidate`
+        // restores `bound[f]`), so the mask is unchanged between them.
+        let mask = self.cursors[f].floor_child_mask();
+        for w in mask.iter() {
+            if is_wildcard_term(&[w]) {
+                self.match_candidate(f, pattern, &[w], cont);
+            }
         }
         let Some(arity) = resolved.subsexpr().arity() else {
             return;
         };
         let arity_byte = item_byte(Tag::Arity(arity));
-        if self.child_exists_at_current(f, arity_byte) {
+        if mask.test_bit(arity_byte) {
             let mut children = Vec::new();
             resolved.args(&mut children);
             self.with_bound_path_bytes(f, &[arity_byte], 0, &mut |this| {
@@ -2533,21 +2555,33 @@ impl UnifyJoin<'_> {
             self.recurse_after_catch_up(i);
             return;
         }
-        let Some(col) = self.factors[f].cols.get(self.next_col[f]).cloned() else {
-            self.catch_up(i, f + 1);
-            return;
-        };
-        match col {
-            FactorColumn::Var(vp) if self.var_pos[vp] < i => {
-                self.consume_col(f, FactorColumn::Var(vp), &mut |this| this.catch_up(i, f));
-            }
-            FactorColumn::Var(_) => {
+        // Read the column in place: cloning it here deep-copied a Term column's bytes at every
+        // node. A Var column needs only its id. A Term column's bytes are owned by the plan's
+        // factors (`self.factors: &'a [Factor]`, never mutated after construction), so an
+        // `ExprEnv` view over them (a raw `Expr` pointer, like the arena's) stays valid for the
+        // whole recursion — same namespace, intro, and bytes the former arena copy carried.
+        let term_env = match self.factors[f].cols.get(self.next_col[f]) {
+            None => {
                 self.catch_up(i, f + 1);
+                return;
             }
-            other => {
-                self.consume_col(f, other, &mut |this| this.catch_up(i, f));
+            Some(FactorColumn::Var(vp)) => {
+                let vp = *vp;
+                if self.var_pos[vp] < i {
+                    self.consume_col(f, vp, &mut |this| this.catch_up(i, f));
+                } else {
+                    self.catch_up(i, f + 1);
+                }
+                return;
             }
-        }
+            Some(FactorColumn::Term(term)) => ExprEnv {
+                n: QUERY_NS,
+                v: term.intro,
+                offset: 0,
+                base: term.expr(),
+            },
+        };
+        self.consume_env(f, term_env, &mut |this| this.catch_up(i, f));
     }
 }
 
