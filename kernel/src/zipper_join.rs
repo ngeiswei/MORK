@@ -1323,6 +1323,8 @@ fn join_state<'a>(
         bindings: BTreeMap::new(),
         arena: Vec::new(),
         free_bufs: Vec::new(),
+        fixed: FixedTerms::build(&plan.factors),
+        free_child_bufs: Vec::new(),
         out: BTreeSet::new(),
         want_coordinated,
         coordinated: BTreeSet::new(),
@@ -2115,6 +2117,82 @@ impl CandidateBuf {
     }
 }
 
+/// The argument [`ExprEnv`]s of every query-side column subterm, computed ONCE.
+///
+/// A `FactorColumn::Term`'s bytes are owned by the plan's factors, which are never mutated for the
+/// life of the join, and `catch_up` hands out an `ExprEnv` pointing directly at those bytes. So for
+/// a query-side compound column the argument envs are a pure function of immutable data: what
+/// `ExprEnv::args` would return is the same tuple of `(n, v, offset, base)` on every candidate.
+/// This table holds one node per subterm of every `Term` column, each node's `env` being literally
+/// what `args` produced at build time, so `match_compound_at_current` can walk children by node id
+/// instead of re-walking the term and allocating a `Vec<ExprEnv>` per column-match attempt.
+///
+/// Pointer identity is preserved exactly: a node's env has the same `base.ptr` (the column's own
+/// bytes), `offset`, `v` and `n` the per-call temporary carried, and `ExprEnv`'s `Eq`/`Hash` are
+/// over those fields, so `unify`'s `encountered` set sees the very same identity classes it saw
+/// before. Only patterns that are NOT bound variables use this table: a compound reached by
+/// dereferencing a bound variable lives in the arena, varies per candidate, and keeps the dynamic
+/// path.
+#[derive(Default)]
+struct FixedTerms {
+    /// One entry per subterm node, in pre-order.
+    envs: Vec<ExprEnv>,
+    /// `child_ids[child_start[node] .. + child_len[node]]` = the node's argument nodes, in
+    /// argument order.
+    child_start: Vec<u32>,
+    child_len: Vec<u32>,
+    child_ids: Vec<u32>,
+    /// `col_node[f][c]` = the root node of factor `f`'s column `c`, or `None` for a `Var` column.
+    col_node: Vec<Vec<Option<u32>>>,
+}
+
+impl FixedTerms {
+    fn build(factors: &[Factor]) -> Self {
+        let mut this = FixedTerms::default();
+        for factor in factors {
+            let mut cols = Vec::with_capacity(factor.cols.len());
+            for col in &factor.cols {
+                cols.push(match col {
+                    FactorColumn::Var(_) => None,
+                    // The same env `catch_up` builds for this column, so the precomputed subtree
+                    // below is rooted at exactly the env the join will match against.
+                    FactorColumn::Term(term) => Some(this.add(ExprEnv {
+                        n: QUERY_NS,
+                        v: term.intro,
+                        offset: 0,
+                        base: term.expr(),
+                    })),
+                });
+            }
+            this.col_node.push(cols);
+        }
+        this
+    }
+
+    /// Add `env` as a node and, recursively, its arguments; returns the new node's id. Leaves
+    /// (symbols and variables) get zero children, since `ExprEnv::args` pushes nothing for them.
+    fn add(&mut self, env: ExprEnv) -> u32 {
+        let node = self.envs.len();
+        self.envs.push(env);
+        self.child_start.push(0);
+        self.child_len.push(0);
+        let mut args = Vec::new();
+        env.args(&mut args);
+        let mut ids = Vec::with_capacity(args.len());
+        for arg in args {
+            ids.push(self.add(arg));
+        }
+        self.child_start[node] = self.child_ids.len() as u32;
+        self.child_len[node] = ids.len() as u32;
+        self.child_ids.extend_from_slice(&ids);
+        node as u32
+    }
+
+    fn child(&self, node: u32, idx: u32) -> u32 {
+        self.child_ids[(self.child_start[node as usize] + idx) as usize]
+    }
+}
+
 struct UnifyJoin<'a> {
     map: &'a PathMap<()>,
     /// Per factor, `Some((original_prefix, new_order))` when re-indexed: the original relation
@@ -2141,6 +2219,15 @@ struct UnifyJoin<'a> {
     /// Pool of [`CandidateBuf`]s for the lead enumeration, one in flight per active recursion
     /// depth; released buffers return here with their allocations intact.
     free_bufs: Vec<CandidateBuf>,
+    /// Precomputed argument envs for the query-side columns, whose structure is fixed for the whole
+    /// join (see [`FixedTerms`]).
+    fixed: FixedTerms,
+    /// Pool of child-env buffers for compounds that must still be walked per candidate (a compound
+    /// reached by dereferencing a bound variable). `match_compound_children` recurses while holding
+    /// its slice, so one buffer is in flight per active depth; released buffers return here with
+    /// their allocations intact. Pure storage reuse: the children and their order are exactly what
+    /// a fresh `Vec<ExprEnv>` collection produced.
+    free_child_bufs: Vec<Vec<ExprEnv>>,
     /// Answer rows, one `Option` per query variable: `Some(bytes)` for a resolved term, `None` for
     /// a still-free variable. The all-ground entry filters to fully-ground rows.
     out: BTreeSet<Vec<Option<Vec<u8>>>>,
@@ -2524,8 +2611,16 @@ impl UnifyJoin<'_> {
 
     /// Match `env` against factor `f`'s current column and recurse with the column consumed
     /// (`next_col` advanced), stack-disciplined.
-    fn consume_env(&mut self, f: usize, env: ExprEnv, cont: &mut dyn FnMut(&mut Self)) {
-        self.match_expr_at_current(f, env, &mut |this| {
+    /// `node` is the [`FixedTerms`] node for `env` when `env` is one of the plan's fixed column
+    /// subterms, and `None` for an env built from live bindings.
+    fn consume_env(
+        &mut self,
+        f: usize,
+        env: ExprEnv,
+        node: Option<u32>,
+        cont: &mut dyn FnMut(&mut Self),
+    ) {
+        self.match_expr_at_current(f, env, node, &mut |this| {
             this.next_col[f] += 1;
             cont(this);
             this.next_col[f] -= 1;
@@ -2533,7 +2628,7 @@ impl UnifyJoin<'_> {
     }
 
     fn consume_col(&mut self, f: usize, v: usize, cont: &mut dyn FnMut(&mut Self)) {
-        self.consume_env(f, self.query_var_env(v), cont);
+        self.consume_env(f, self.query_var_env(v), None, cont);
     }
 
     fn with_bound_path_bytes(
@@ -2592,8 +2687,14 @@ impl UnifyJoin<'_> {
         &mut self,
         f: usize,
         pattern: ExprEnv,
+        node: Option<u32>,
         cont: &mut dyn FnMut(&mut Self),
     ) {
+        // `deref_env` returns `pattern` unchanged unless `pattern` is a BOUND variable, so a
+        // non-variable pattern keeps its precomputed node (`resolved == pattern` exactly). A
+        // compound reached by dereferencing a bound variable points at arena bytes that change per
+        // candidate, so it drops the node and keeps the dynamic path.
+        let node = node.filter(|_| pattern.var_opt().is_none());
         let resolved = self.deref_env(pattern);
         if let Some(free_key) = resolved.var_opt() {
             // The lead enumeration: refill a pooled buffer instead of collecting a fresh
@@ -2635,7 +2736,7 @@ impl UnifyJoin<'_> {
             return;
         }
         match byte_item(unsafe { *resolved.subsexpr().ptr }) {
-            Tag::Arity(_) => self.match_compound_at_current(f, pattern, resolved, cont),
+            Tag::Arity(_) => self.match_compound_at_current(f, pattern, resolved, node, cont),
             Tag::NewVar | Tag::VarRef(_) => unreachable!(),
             Tag::SymbolSize(_) => {
                 // A symbol holds no variables, so the resolved value needs no substitution: its
@@ -2664,6 +2765,7 @@ impl UnifyJoin<'_> {
         f: usize,
         pattern: ExprEnv,
         resolved: ExprEnv,
+        node: Option<u32>,
         cont: &mut dyn FnMut(&mut Self),
     ) {
         // One mask read serves both the wildcard candidates and the arity-byte test: the zipper
@@ -2680,11 +2782,24 @@ impl UnifyJoin<'_> {
         };
         let arity_byte = item_byte(Tag::Arity(arity));
         if mask.test_bit(arity_byte) {
-            let mut children = Vec::new();
+            // The children are the same tuple of envs on every visit whenever the compound is one
+            // of the plan's fixed column subterms, so walk the precomputed node instead of
+            // re-walking the term and allocating. Otherwise derive them, into a pooled buffer.
+            if let Some(node) = node {
+                debug_assert_eq!(self.fixed.child_len[node as usize], arity as u32);
+                self.with_bound_path_bytes(f, &[arity_byte], 0, &mut |this| {
+                    this.match_fixed_children(f, node, 0, cont);
+                });
+                return;
+            }
+            let mut children = self.free_child_bufs.pop().unwrap_or_default();
+            children.clear();
             resolved.args(&mut children);
             self.with_bound_path_bytes(f, &[arity_byte], 0, &mut |this| {
                 this.match_compound_children(f, &children, 0, cont);
             });
+            children.clear();
+            self.free_child_bufs.push(children);
         }
     }
 
@@ -2700,8 +2815,28 @@ impl UnifyJoin<'_> {
             return;
         }
         let child = children[idx];
-        self.match_expr_at_current(f, child, &mut |this| {
+        self.match_expr_at_current(f, child, None, &mut |this| {
             this.match_compound_children(f, children, idx + 1, cont);
+        });
+    }
+
+    /// [`Self::match_compound_children`] over a precomputed [`FixedTerms`] node: same order, same
+    /// envs, read by node id so nothing is borrowed across the recursion and nothing is allocated.
+    fn match_fixed_children(
+        &mut self,
+        f: usize,
+        node: u32,
+        idx: u32,
+        cont: &mut dyn FnMut(&mut Self),
+    ) {
+        if idx == self.fixed.child_len[node as usize] {
+            cont(self);
+            return;
+        }
+        let child = self.fixed.child(node, idx);
+        let child_env = self.fixed.envs[child as usize];
+        self.match_expr_at_current(f, child_env, Some(child), &mut |this| {
+            this.match_fixed_children(f, node, idx + 1, cont);
         });
     }
 
@@ -2722,7 +2857,8 @@ impl UnifyJoin<'_> {
         // factors (`self.factors: &'a [Factor]`, never mutated after construction), so an
         // `ExprEnv` view over them (a raw `Expr` pointer, like the arena's) stays valid for the
         // whole recursion — same namespace, intro, and bytes the former arena copy carried.
-        let term_env = match self.factors[f].cols.get(self.next_col[f]) {
+        let col = self.next_col[f];
+        let term_env = match self.factors[f].cols.get(col) {
             None => {
                 self.catch_up(i, f + 1);
                 return;
@@ -2743,7 +2879,10 @@ impl UnifyJoin<'_> {
                 base: term.expr(),
             },
         };
-        self.consume_env(f, term_env, &mut |this| this.catch_up(i, f));
+        // `FixedTerms` mirrors `factors`, so this column's precomputed root is `col_node[f][col]`,
+        // rooted at the very env just built.
+        let node = self.fixed.col_node[f][col];
+        self.consume_env(f, term_env, node, &mut |this| this.catch_up(i, f));
     }
 }
 
