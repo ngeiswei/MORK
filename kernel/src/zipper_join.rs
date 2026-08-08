@@ -96,9 +96,12 @@ fn step_parse(b: u8, subterms: &mut usize, payload: &mut usize) {
     }
 }
 
-/// Whether `bytes` (from the column-start focus) spell exactly one complete subterm. Recomputed
-/// per descent step; subterms are short, so the O(len) replay is cheap and keeps the navigation
-/// free of incremental-state bugs.
+/// Whether `bytes` (from the column-start focus) spell exactly one complete subterm, by replaying
+/// the parse from scratch. [`SubtermCursor`] tracks this incrementally instead — replaying it per
+/// descent step made completing an L-byte subterm O(L^2), which dominated the join on MORK's real
+/// (hundreds-of-bytes) symbolic terms. Kept as the reference the cursor's incremental state is
+/// cross-checked against under `debug_assertions`, and for out-of-cursor callers.
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
 #[inline]
 fn is_complete(bytes: &[u8]) -> bool {
     let (mut subterms, mut payload) = (1usize, 0usize);
@@ -120,13 +123,33 @@ pub struct SubtermCursor<Z> {
     z: Z,
     key: Vec<u8>,
     at_end: bool,
+    /// Running incremental parse of `key`: how many complete subterms and how many raw
+    /// symbol-payload bytes it still owes, i.e. the fold of [`step_parse`] over `key` starting from
+    /// `(1, 0)`. `key` spells exactly one complete subterm iff both are zero, so the boundary test
+    /// is O(1) instead of an O(`key.len()`) replay per descent step.
+    owed_subterms: usize,
+    owed_payload: usize,
+    /// One saved `(owed_subterms, owed_payload)` per byte of `key`: entry `i` is the state as it
+    /// stood BEFORE `key[i]` was consumed. `step_parse` is not invertible from the byte alone, so
+    /// popping a key byte restores the state from here in O(1). Kept in exact lockstep with `key`.
+    parse_stack: Vec<(usize, usize)>,
     /// Values of the columns already descended past, below the zipper's creation
     /// focus. `descend_floor` locks the current subterm as a column value and
     /// lowers the floor into it (so the next enumeration is of the following
     /// column); `ascend_floor` restores it. This lets one cursor walk a factor's
     /// successive columns with the zipper HELD -- descended and ascended in place,
     /// never re-opened from the trie root (which is the join's dominant cost).
-    floor_stack: Vec<Vec<u8>>,
+    floor_stack: Vec<SavedColumn>,
+}
+
+/// A column value parked by `descend_floor`: the key bytes plus the incremental parse state that
+/// belongs to them, so `ascend_floor` restores the cursor exactly (including the per-byte stack the
+/// subsequent `next` pops through) without replaying the parse.
+struct SavedColumn {
+    key: Vec<u8>,
+    parse_stack: Vec<(usize, usize)>,
+    owed_subterms: usize,
+    owed_payload: usize,
 }
 
 impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
@@ -136,8 +159,51 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
             z,
             key: Vec::new(),
             at_end: true,
+            owed_subterms: 1,
+            owed_payload: 0,
+            parse_stack: Vec::new(),
             floor_stack: Vec::new(),
         }
+    }
+
+    /// Whether `key` currently spells exactly one complete subterm, read off the incremental state.
+    /// Cross-checked against the from-scratch replay under `debug_assertions` so the property tests
+    /// catch any divergence.
+    #[inline]
+    fn key_is_complete(&self) -> bool {
+        let complete = self.owed_subterms == 0 && self.owed_payload == 0;
+        debug_assert_eq!(
+            self.parse_stack.len(),
+            self.key.len(),
+            "parse stack out of lockstep with key"
+        );
+        debug_assert_eq!(
+            complete,
+            is_complete(&self.key),
+            "incremental subterm-parse state diverged from the replay"
+        );
+        complete
+    }
+
+    /// Extend `key` by one descended byte, advancing the incremental parse.
+    #[inline]
+    fn push_key_byte(&mut self, b: u8) {
+        self.parse_stack.push((self.owed_subterms, self.owed_payload));
+        self.key.push(b);
+        step_parse(b, &mut self.owed_subterms, &mut self.owed_payload);
+    }
+
+    /// Drop the last byte of `key`, restoring the parse state that preceded it.
+    #[inline]
+    fn pop_key_byte(&mut self) -> Option<u8> {
+        let b = self.key.pop()?;
+        let (subterms, payload) = self
+            .parse_stack
+            .pop()
+            .expect("parse stack out of lockstep with key");
+        self.owed_subterms = subterms;
+        self.owed_payload = payload;
+        Some(b)
     }
 
     /// Ascend back to the floor (column start), clearing the key.
@@ -145,6 +211,9 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
         while self.key.pop().is_some() {
             self.z.ascend_byte();
         }
+        self.parse_stack.clear();
+        self.owed_subterms = 1;
+        self.owed_payload = 0;
         self.at_end = false;
     }
 
@@ -153,7 +222,14 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
     /// column. The zipper stays put (it is already descended into `key`); only the
     /// floor bookkeeping moves. Pairs with `ascend_floor`.
     pub fn descend_floor(&mut self) {
-        self.floor_stack.push(std::mem::take(&mut self.key));
+        self.floor_stack.push(SavedColumn {
+            key: std::mem::take(&mut self.key),
+            parse_stack: std::mem::take(&mut self.parse_stack),
+            owed_subterms: self.owed_subterms,
+            owed_payload: self.owed_payload,
+        });
+        self.owed_subterms = 1;
+        self.owed_payload = 0;
         self.at_end = false;
     }
 
@@ -163,10 +239,14 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
     /// plus that value, which holds because a fully-exhausted deeper column
     /// leaves its cursor at its own floor (== this value's end).
     pub fn ascend_floor(&mut self) {
-        self.key = self
+        let saved = self
             .floor_stack
             .pop()
             .expect("ascend_floor without a matching descend_floor");
+        self.key = saved.key;
+        self.parse_stack = saved.parse_stack;
+        self.owed_subterms = saved.owed_subterms;
+        self.owed_payload = saved.owed_payload;
         self.at_end = false;
     }
 
@@ -189,6 +269,10 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
             self.key.is_empty(),
             "descend_raw must start at the column floor"
         );
+        // The raw fragment is NOT part of `key` (it lowers the floor past itself), so the
+        // incremental parse state is untouched: an empty key still owes exactly one subterm,
+        // now measured from the new, deeper floor.
+        debug_assert!(self.parse_stack.is_empty() && self.owed_subterms == 1 && self.owed_payload == 0);
         self.z.descend_to(bytes);
         self.at_end = false;
     }
@@ -201,6 +285,7 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
             self.key.is_empty(),
             "ascend_raw must start at the column floor"
         );
+        debug_assert!(self.parse_stack.is_empty() && self.owed_subterms == 1 && self.owed_payload == 0);
         self.z.ascend(n);
         self.at_end = false;
     }
@@ -225,12 +310,12 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
     /// Descend the least child at each step until the key forms a complete subterm. Returns false
     /// if a node runs out of children before completion (malformed/empty branch).
     fn complete_leftmost(&mut self) -> bool {
-        while !is_complete(&self.key) {
+        while !self.key_is_complete() {
             let mask = self.z.child_mask();
             match least_ge(&mask, 0) {
                 Some(b) => {
                     self.z.descend_to_byte(b);
-                    self.key.push(b);
+                    self.push_key_byte(b);
                 }
                 None => return false,
             }
@@ -242,14 +327,14 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
     /// level offers a larger sibling, take the least such, then complete leftmost. False = exhausted.
     fn backtrack_then_leftmost(&mut self) -> bool {
         loop {
-            let Some(last) = self.key.pop() else {
+            let Some(last) = self.pop_key_byte() else {
                 return false;
             };
             self.z.ascend_byte();
             let mask = self.z.child_mask();
             if let Some(b) = mask.next_bit(last) {
                 self.z.descend_to_byte(b);
-                self.key.push(b);
+                self.push_key_byte(b);
                 return self.complete_leftmost();
             }
         }
@@ -295,7 +380,7 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
         self.reset_to_floor();
         let mut ti = 0usize;
         loop {
-            if is_complete(&self.key) {
+            if self.key_is_complete() {
                 self.at_end = false;
                 return;
             }
@@ -304,14 +389,14 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
                 let t = target[ti];
                 if mask.test_bit(t) {
                     self.z.descend_to_byte(t);
-                    self.key.push(t);
+                    self.push_key_byte(t);
                     ti += 1;
                     continue;
                 }
                 match mask.next_bit(t) {
                     Some(b) => {
                         self.z.descend_to_byte(b);
-                        self.key.push(b);
+                        self.push_key_byte(b);
                         if !self.complete_leftmost() {
                             self.at_end = true;
                         }
