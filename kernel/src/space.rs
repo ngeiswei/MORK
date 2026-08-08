@@ -1010,18 +1010,16 @@ impl Space {
         pathmap::paths_serialization::deserialize_paths(self.btm.write_zipper(), &mut file, ())
     }
 
-    /// [`Space::query_multi`] behind the leapfrog dispatch: a nonempty relation-prefixed
-    /// conjunction routes to the worst-case-optimal join in [`crate::zipper_join`], which streams
-    /// the same matches through `effect`; any other body, or a disabled toggle
-    /// (`MORK_LEAPFROG=0`), takes the ProductZipper path below. Only the space-to-space transform
-    /// dispatches: interpreted sources and sinks and the pattern-directed dumps keep the stock
-    /// path and its enumeration order.
+    /// [`Space::query_multi`] behind the leapfrog dispatch: with the `leapfrog` feature a nonempty
+    /// relation-prefixed conjunction routes to the worst-case-optimal join in
+    /// [`crate::zipper_join`], which streams the same matches through `effect`; any other body,
+    /// and every build without the feature, takes the ProductZipper path below. Only the
+    /// space-to-space transform dispatches: interpreted sources and sinks and the pattern-directed
+    /// dumps keep the stock path and its enumeration order.
     pub fn query_multi_dispatch<F : FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(btm: &PathMap<()>, pat_expr: Expr, mut effect: F) -> usize {
         #[cfg(feature = "leapfrog")]
-        if crate::zipper_join::leapfrog_dispatch_enabled() {
-            if let Some(touched) = crate::zipper_join::query_multi_leapfrog(btm, pat_expr, &mut effect) {
-                return touched;
-            }
+        if let Some(touched) = crate::zipper_join::query_multi_leapfrog(btm, pat_expr, &mut effect) {
+            return touched;
         }
         Self::query_multi(btm, pat_expr, effect)
     }

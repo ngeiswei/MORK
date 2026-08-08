@@ -419,55 +419,6 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
     }
 }
 
-/// Leapfrog intersection of several subterm cursors: the subterm values present in ALL of them, in
-/// ascending order. The textbook leapfrog step seeks every cursor to the current maximum key; when
-/// they all agree, that key is in the intersection, then one cursor steps past it. Each step either
-/// emits a match and advances, or jumps a cursor forward, so it terminates and is worst-case-optimal
-/// on the cursors' sizes.
-fn intersect<Z: Zipper + ZipperMoving>(cursors: &mut [SubtermCursor<Z>]) -> Vec<Vec<u8>> {
-    let mut out = Vec::new();
-    if cursors.is_empty() {
-        return out;
-    }
-    for c in cursors.iter_mut() {
-        c.first();
-        if c.at_end() {
-            return out;
-        }
-    }
-    // Reusable running-max buffer: the max key is found by slice comparison and copied once per
-    // iteration (seek needs `&mut` cursors, so it cannot borrow a cursor's key directly).
-    let mut max: Vec<u8> = Vec::new();
-    loop {
-        let mut max_i = 0usize;
-        for i in 1..cursors.len() {
-            if cursors[i].key().unwrap() > cursors[max_i].key().unwrap() {
-                max_i = i;
-            }
-        }
-        max.clear();
-        max.extend_from_slice(cursors[max_i].key().unwrap());
-        let mut all_match = true;
-        for c in cursors.iter_mut() {
-            if c.key().unwrap() != max.as_slice() {
-                c.seek(&max);
-                if c.at_end() {
-                    return out;
-                }
-                if c.key().unwrap() != max.as_slice() {
-                    all_match = false;
-                }
-            }
-        }
-        if all_match {
-            out.push(max.clone());
-            cursors[0].next();
-            if cursors[0].at_end() {
-                return out;
-            }
-        }
-    }
-}
 
 /// The `(namespace, variable)` key of `mork_expr::unify`'s bindings map. `mork_expr` keeps its
 /// `ExprVar = (u8, u8)` alias private, so the concrete pair type is named again here.
@@ -647,328 +598,12 @@ fn min_var_pos_in_expr(expr: Expr, intro_start: u8, var_pos: &[usize]) -> Option
     }
 }
 
-/// Ground worst-case-optimal join over PathMap factors, seeking variable-width subterms directly on
-/// the byte-trie with no materialized domain. `var_order` lists the global variables in binding
-/// order; it must be compatible with every factor's column order (each factor's variables, in
-/// `var_order`, occur in column order), which holds for any acyclic query under a suitable order.
-/// Cyclic queries that admit no compatible order are handled by re-indexing in a later layer.
-///
-/// Returns one row per answer: `row[v]` is the bound subterm bytes for global variable `v`.
-///
-/// COMPLETENESS CONTRACT: this is an EXACT-match join. It is complete only when every
-/// joined relation is fully GROUND. It does not unify: a stored fact that carries a
-/// variable (a schematic fact, e.g. `(sol $n ..)`) is not matched against a query
-/// ground value (`(sol Z ..)`), and a nonground compound query column (e.g.
-/// `(: $b (-> $c $d))`) stays unconsumed. On ground data flat-leapfrog equals the
-/// ProductZipper; on schematic data it is a strict subset and will SILENTLY drop
-/// answers. A caller that may join over schematic facts must detect that (any factor
-/// column is a nonground compound, or any joined relation holds a non-ground fact at
-/// the functor prefix) and route to a unifying join instead.
-pub fn ground_join(
-    map: &PathMap<()>,
-    factors: &[Factor],
-    var_order: &[usize],
-    nvars: usize,
-) -> Vec<Vec<Vec<u8>>> {
-    let mut out = Vec::new();
-    GroundJoin::new(map, factors, var_order, nvars, None).run(&mut |b: &[Vec<u8>]| out.push(b.to_vec()));
-    out
-}
 
-/// `ground_join` restricted to the leading variable's values assigned to
-/// worker `worker` of `nworkers` by hash. The union over `worker in 0..nworkers`
-/// equals `ground_join`.
-pub fn ground_join_partition(
-    map: &PathMap<()>,
-    factors: &[Factor],
-    var_order: &[usize],
-    nvars: usize,
-    worker: usize,
-    nworkers: usize,
-) -> Vec<Vec<Vec<u8>>> {
-    let mut out = Vec::new();
-    GroundJoin::new(map, factors, var_order, nvars, Some((worker, nworkers.max(1))))
-        .run(&mut |b: &[Vec<u8>]| out.push(b.to_vec()));
-    out
-}
 
-/// Streams each join answer (the per-variable bound values, indexed by variable)
-/// to `emit`, restricted to worker `worker` of `nworkers` by hashing the leading
-/// variable. No answer vector is materialized -- the caller applies its template
-/// to each binding as it is produced. The held-cursor substrate of the parallel
-/// ground transform.
-pub fn ground_join_for_each<F: FnMut(&[Vec<u8>])>(
-    map: &PathMap<()>,
-    factors: &[Factor],
-    var_order: &[usize],
-    nvars: usize,
-    worker: usize,
-    nworkers: usize,
-    mut emit: F,
-) {
-    GroundJoin::new(map, factors, var_order, nvars, Some((worker, nworkers.max(1)))).run(&mut emit);
-}
 
-/// Data-parallel `ground_join`: partition the leading variable's domain across
-/// `nthreads` workers by hash, each running the join on the shared read-only map
-/// into its own answer buffer, then concatenate. Byte-identical (as a set) to
-/// `ground_join`. Safe: concurrent reads of an immutable `PathMap`, no shared
-/// writes.
-pub fn ground_join_parallel(
-    map: &PathMap<()>,
-    factors: &[Factor],
-    var_order: &[usize],
-    nvars: usize,
-    nthreads: usize,
-) -> Vec<Vec<Vec<u8>>> {
-    let nthreads = nthreads.max(1);
-    let parts: Vec<Vec<Vec<Vec<u8>>>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..nthreads)
-            .map(|w| scope.spawn(move || ground_join_partition(map, factors, var_order, nvars, w, nthreads)))
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    let mut out = Vec::new();
-    for p in parts {
-        out.extend(p);
-    }
-    out
-}
 
-/// Data-parallel `ground_join` that only COUNTS answers (no materialization),
-/// isolating the join's parallel scaling from answer-vector allocation.
-pub fn ground_join_count_parallel(
-    map: &PathMap<()>,
-    factors: &[Factor],
-    var_order: &[usize],
-    nvars: usize,
-    nthreads: usize,
-) -> u64 {
-    let nthreads = nthreads.max(1);
-    let counts: Vec<u64> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..nthreads)
-            .map(|w| {
-                scope.spawn(move || {
-                    let mut n = 0u64;
-                    GroundJoin::new(map, factors, var_order, nvars, Some((w, nthreads)))
-                        .run(&mut |_b: &[Vec<u8>]| n += 1);
-                    n
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    counts.into_iter().sum()
-}
 
-/// Worst-case-optimal leapfrog join over ground MORK facts, HELD-cursor: one
-/// `SubtermCursor` per factor is opened once at the factor's relation prefix and
-/// walked column by column with `descend_floor`/`ascend_floor` as variables bind
-/// and backtrack, so the byte-trie is descended incrementally and never re-opened
-/// from the root (the dominant cost of the naive per-column re-descend, ~25% of
-/// the join). Answers stream to a caller closure -- no domain is materialized.
-struct GroundJoin<'a> {
-    factors: &'a [Factor],
-    var_order: &'a [usize],
-    cursors: Vec<SubtermCursor<ReadZipperUntracked<'a, 'static, ()>>>,
-    next_col: Vec<usize>,
-    binding: Vec<Vec<u8>>,
-    /// Assigns the FIRST scheduled variable's values to workers by
-    /// `hash(value) % nworkers == worker` (`None` = whole domain, sequential).
-    /// Hashing the whole value balances the domain; a byte-range split would give
-    /// one worker everything (every value shares its leading tag byte).
-    lead_partition: Option<(usize, usize)>,
-    /// Reusable scratch holding the leapfrog's running-max key: refilled by
-    /// `clear()+extend_from_slice` each iteration instead of cloning every
-    /// participating cursor's key. Only valid within a single leapfrog iteration
-    /// (recursion below reuses it freely).
-    max_buf: Vec<u8>,
-    /// Per-depth reusable buffers for the participating-factor list computed at
-    /// each variable, avoiding a fresh `Vec` allocation per node.
-    parts_bufs: Vec<Vec<usize>>,
-}
 
-impl<'a> GroundJoin<'a> {
-    fn new(
-        map: &'a PathMap<()>,
-        factors: &'a [Factor],
-        var_order: &'a [usize],
-        nvars: usize,
-        lead_partition: Option<(usize, usize)>,
-    ) -> Self {
-        let cursors = factors
-            .iter()
-            .map(|f| SubtermCursor::new(map.read_zipper_at_path(&f.prefix)))
-            .collect();
-        GroundJoin {
-            factors,
-            var_order,
-            cursors,
-            next_col: vec![0; factors.len()],
-            binding: vec![Vec::new(); nvars],
-            lead_partition,
-            max_buf: Vec::new(),
-            parts_bufs: vec![Vec::new(); var_order.len()],
-        }
-    }
-
-    fn run<F: FnMut(&[Vec<u8>])>(&mut self, emit: &mut F) {
-        self.catch_up(0, 0, emit);
-    }
-
-    fn recurse<F: FnMut(&[Vec<u8>])>(&mut self, i: usize, emit: &mut F) {
-        self.catch_up(i, 0, emit);
-    }
-
-    /// Consume every ground or already-bound column of factor `f` (and beyond) at
-    /// the current variable depth by seeking the held cursor to the exact value,
-    /// then hand off to the free-variable leapfrog. Descends in place -- no re-open.
-    fn catch_up<F: FnMut(&[Vec<u8>])>(&mut self, i: usize, f: usize, emit: &mut F) {
-        if f == self.factors.len() {
-            self.recurse_after_catch_up(i, emit);
-            return;
-        }
-        // `self.factors` is a shared reference to borrowed data: copying it out makes the
-        // column borrow independent of `&mut self`, so no clone of the column (or of a bound
-        // binding value) is needed -- the borrows below end before the recursive call.
-        let factors = self.factors;
-        let Some(col) = factors[f].cols.get(self.next_col[f]) else {
-            self.catch_up(i, f + 1, emit);
-            return;
-        };
-        let target: &[u8] = match col {
-            FactorColumn::Term(term) if term.is_ground() => &term.bytes,
-            FactorColumn::Var(v) if !self.binding[*v].is_empty() => &self.binding[*v],
-            FactorColumn::Var(_) | FactorColumn::Term(_) => {
-                self.catch_up(i, f + 1, emit);
-                return;
-            }
-        };
-        self.cursors[f].seek(target);
-        if self.cursors[f].key() == Some(target) {
-            self.cursors[f].descend_floor();
-            self.next_col[f] += 1;
-            self.catch_up(i, f, emit);
-            self.next_col[f] -= 1;
-            self.cursors[f].ascend_floor();
-        }
-        self.cursors[f].reset_to_floor();
-    }
-
-    fn recurse_after_catch_up<F: FnMut(&[Vec<u8>])>(&mut self, i: usize, emit: &mut F) {
-        if i == self.var_order.len() {
-            if (0..self.factors.len())
-                .all(|f| self.next_col[f] == self.factors[f].cols.len() && self.cursors[f].has_value())
-            {
-                emit(&self.binding);
-            }
-            return;
-        }
-        let v = self.var_order[i];
-        // Reuse this depth's buffer instead of collecting a fresh Vec per node. Taking it out
-        // keeps `leapfrog`'s `&mut self` recursion borrow-clean; deeper nodes use other slots.
-        let mut parts = std::mem::take(&mut self.parts_bufs[i]);
-        parts.clear();
-        parts.extend((0..self.factors.len()).filter(|&f| {
-            matches!(self.factors[f].cols.get(self.next_col[f]), Some(FactorColumn::Var(cv)) if *cv == v)
-        }));
-        self.leapfrog(i, v, &parts, emit);
-        self.parts_bufs[i] = parts;
-    }
-
-    /// Held-cursor streaming leapfrog for free variable `v` over its participating
-    /// factors `parts`: seek each cursor to the running maximum subterm; when they
-    /// all agree, that value is in the intersection, so descend every cursor into
-    /// it, recurse, ascend back, and step the first cursor forward. Every exit
-    /// resets the participating cursors to their column floors so the parent can
-    /// ascend past its own column cleanly.
-    fn leapfrog<F: FnMut(&[Vec<u8>])>(&mut self, i: usize, v: usize, parts: &[usize], emit: &mut F) {
-        if parts.is_empty() {
-            return;
-        }
-        for &f in parts {
-            self.cursors[f].first();
-            if self.cursors[f].at_end() {
-                self.reset_parts(parts);
-                return;
-            }
-        }
-        loop {
-            // Find the running-max key by slice comparison (no per-cursor clone), then copy it
-            // ONCE into the reusable scratch buffer so `seek` can take `&mut` cursors below.
-            let mut max_f = parts[0];
-            for &f in &parts[1..] {
-                if self.cursors[f].key().unwrap() > self.cursors[max_f].key().unwrap() {
-                    max_f = f;
-                }
-            }
-            self.max_buf.clear();
-            let (max_buf, cursors) = (&mut self.max_buf, &self.cursors);
-            max_buf.extend_from_slice(cursors[max_f].key().unwrap());
-            let mut all_match = true;
-            for &f in parts {
-                if self.cursors[f].key().unwrap() != self.max_buf.as_slice() {
-                    let (cursors, max_buf) = (&mut self.cursors, &self.max_buf);
-                    cursors[f].seek(max_buf);
-                    if self.cursors[f].at_end() {
-                        self.reset_parts(parts);
-                        return;
-                    }
-                    if self.cursors[f].key().unwrap() != self.max_buf.as_slice() {
-                        all_match = false;
-                    }
-                }
-            }
-            if all_match {
-                if self.lead_owned(i, &self.max_buf) {
-                    for &f in parts {
-                        self.cursors[f].descend_floor();
-                        self.next_col[f] += 1;
-                    }
-                    self.binding[v].clear();
-                    let (binding, max_buf) = (&mut self.binding, &self.max_buf);
-                    binding[v].extend_from_slice(max_buf);
-                    self.recurse(i + 1, emit);
-                    self.binding[v].clear();
-                    for &f in parts {
-                        self.next_col[f] -= 1;
-                        self.cursors[f].ascend_floor();
-                    }
-                }
-                self.cursors[parts[0]].next();
-                if self.cursors[parts[0]].at_end() {
-                    self.reset_parts(parts);
-                    return;
-                }
-            }
-        }
-    }
-
-    /// The leading-variable work-partition gate (only at the first scheduled
-    /// variable): hash the value and keep it iff it belongs to this worker.
-    fn lead_owned(&self, i: usize, val: &[u8]) -> bool {
-        if i != 0 {
-            return true;
-        }
-        match self.lead_partition {
-            None => true,
-            Some((worker, nworkers)) => {
-                let mut h = 0xcbf29ce484222325u64;
-                for &b in val {
-                    h ^= b as u64;
-                    h = h.wrapping_mul(0x100000001b3);
-                }
-                (h % nworkers as u64) as usize == worker
-            }
-        }
-    }
-
-    fn reset_parts(&mut self, parts: &[usize]) {
-        for &f in parts {
-            self.cursors[f].reset_to_floor();
-        }
-    }
-}
 
 // ---- unification layer: schematic data (stored variables in facts act as wildcards) ----
 
@@ -1476,133 +1111,42 @@ fn parse_pattern_col(term: &EncodedTerm) -> Option<FactorColumn> {
     Some(FactorColumn::Term(term.clone()))
 }
 
-/// Live-route entry: parse the conjunction body into factors and run the join on the live map.
-/// Variables bind in first-occurrence order, the order the emit numbers the answer components in.
-/// None if the body is not a relation-prefix conjunction.
-pub fn unify_join_zipper_body(map: &PathMap<()>, body: &[u8]) -> Option<BTreeSet<Vec<Vec<u8>>>> {
-    let (factors, nvars) = parse_body_factors(body)?;
-    let var_order: Vec<usize> = (0..nvars).collect();
-    Some(unify_join_zipper(map, &factors, &var_order, nvars))
-}
 
-/// Returns true when `body` is a nonempty relation-prefixed conjunction, which is the whole class
-/// the join owns. The decision reads only the encoded body through the same factor parser as the
-/// join; the map argument is kept for signature stability and is not consulted.
-pub fn unify_join_zipper_body_routable(_map: &PathMap<()>, body: &[u8]) -> bool {
-    catch_unwind(AssertUnwindSafe(|| {
-        let Some((factors, _)) = parse_body_factors(body) else {
-            return false;
-        };
-        body_factors_routable_to_zipper_join(&factors)
-    }))
-    .unwrap_or(false)
-}
 
-/// Parse, route-check, and run the zipper join for bodies whose all-variable answer rows can be
-/// represented exactly as ground bytes. Bodies that route but produce any free or schematic
-/// answer component return `None`; callers that can render partial rows should use
-/// [`unify_join_zipper_body_partial_safe`].
-pub fn unify_join_zipper_body_safe(
-    map: &PathMap<()>,
-    body: &[u8],
-) -> Option<BTreeSet<Vec<Vec<u8>>>> {
-    let (_, rows) = unify_join_zipper_body_partial_safe(map, body)?;
-    rows.into_iter()
-        .map(|row| {
-            row.into_iter()
-                .map(|component| component.filter(|bytes| first_subterm_is_ground(bytes)))
-                .collect::<Option<Vec<Vec<u8>>>>()
-        })
-        .collect()
-}
 
-/// Parse, route-check, and run the zipper join, preserving free or schematic answer components for
-/// the live template renderer. `None` only for a body that is not a nonempty relation-prefixed
-/// conjunction (or one whose evaluation panicked), which stays on the ProductZipper path.
-pub fn unify_join_zipper_body_partial_safe(
-    map: &PathMap<()>,
-    body: &[u8],
-) -> Option<(usize, BTreeSet<Vec<Option<Vec<u8>>>>)> {
-    catch_unwind(AssertUnwindSafe(|| {
-        let (factors, nvars) = parse_body_factors(body)?;
-        if !body_factors_routable_to_zipper_join(&factors) {
-            return None;
-        }
-        let var_order: Vec<usize> = (0..nvars).collect();
-        Some((
-            nvars,
-            unify_join_zipper_partial(map, &factors, &var_order, nvars),
-        ))
-    }))
-    .ok()
-    .flatten()
-}
 
-/// Parse, route-check, and run the zipper join, returning each answer as one variable-coordinated
-/// tuple encoding. Unlike [`unify_join_zipper_body_safe`], a free-variable answer is kept: a
-/// variable shared across answer positions emits as one coordinated variable, so the caller can
-/// render and compare free-variable answers up to consistent renaming. `None` only for a body
-/// outside the nonempty relation-prefixed conjunction class, which stays on the ProductZipper
-/// path.
-pub fn unify_join_zipper_body_rows_rendered(
-    map: &PathMap<()>,
-    body: &[u8],
-) -> Option<BTreeSet<Vec<u8>>> {
-    catch_unwind(AssertUnwindSafe(|| {
-        let (factors, nvars) = parse_body_factors(body)?;
-        if !body_factors_routable_to_zipper_join(&factors) {
-            return None;
-        }
-        let var_order: Vec<usize> = (0..nvars).collect();
-        Some(unify_join_zipper_coordinated(
-            map, &factors, &var_order, nvars,
-        ))
-    }))
-    .ok()
-    .flatten()
-}
 
-/// The engine dispatch mode: off, the default intersecting-bodies policy, or every routable body
-/// (`MORK_LEAPFROG=all`, an experiment knob for workloads whose enumeration-shaped bodies happen
-/// to profit anyway).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum DispatchMode {
-    Off,
-    Intersecting,
-    All,
-}
 
+/// Whether the space-to-space transform routes a conjunctive body here. In a normal build this
+/// is a compile-time constant: with the `leapfrog` feature the join owns every routable body, and
+/// without it this module is not compiled at all. The in-crate differentials need to run the SAME
+/// process down both paths to compare them, so under `cfg(test)` only, it becomes a per-thread
+/// switch.
+#[cfg(test)]
 thread_local! {
-    /// Per-thread engine dispatch mode, default the intersecting policy; `MORK_LEAPFROG=0` turns
-    /// dispatch off at thread start, `MORK_LEAPFROG=all` dispatches every routable body.
-    /// Thread-local rather than process-global so a differential can hold one run on the
-    /// ProductZipper while another thread runs dispatched, without racing parallel tests.
-    static LEAPFROG_DISPATCH: std::cell::Cell<DispatchMode> = std::cell::Cell::new(
-        match std::env::var("MORK_LEAPFROG").as_deref() {
-            Ok("0") => DispatchMode::Off,
-            Ok("all") => DispatchMode::All,
-            _ => DispatchMode::Intersecting,
-        },
-    );
+    static LEAPFROG_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 
-/// Whether the space-to-space transform routes conjunctive bodies to the leapfrog join on this
-/// thread.
-pub fn leapfrog_dispatch_enabled() -> bool {
-    LEAPFROG_DISPATCH.with(|c| c.get()) != DispatchMode::Off
+#[cfg(test)]
+#[inline]
+fn leapfrog_enabled() -> bool {
+    LEAPFROG_ENABLED.with(|c| c.get())
 }
 
-/// Turn the leapfrog dispatch on (the default intersecting-bodies policy) or off for this thread.
-/// The differentials use this to pin a reference run to the ProductZipper path.
+#[cfg(not(test))]
+#[inline(always)]
+fn leapfrog_enabled() -> bool {
+    true
+}
+
+/// Pin this thread to the ProductZipper (`false`) or to the join (`true`). Test-only: the shipped
+/// build has no runtime switch.
+#[cfg(test)]
 pub fn set_leapfrog_dispatch(on: bool) {
-    LEAPFROG_DISPATCH.with(|c| {
-        c.set(if on {
-            DispatchMode::Intersecting
-        } else {
-            DispatchMode::Off
-        })
-    })
+    LEAPFROG_ENABLED.with(|c| c.set(on))
 }
+
+
 
 /// The engine-facing dispatch entry: stream every product tuple the leapfrog accepts through the
 /// stock `query_multi` callback contract. Each accepted assignment hands `effect` the join's OWN
@@ -1619,15 +1163,13 @@ pub fn query_multi_leapfrog<F: FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>
     pat_expr: Expr,
     mut effect: F,
 ) -> Option<usize> {
+    if !leapfrog_enabled() {
+        return None;
+    }
     catch_unwind(AssertUnwindSafe(|| {
         let body = unsafe { pat_expr.span().as_ref().unwrap() };
         let (factors, nvars) = parse_body_factors(body)?;
         if !body_factors_routable_to_zipper_join(&factors) {
-            return None;
-        }
-        if LEAPFROG_DISPATCH.with(|c| c.get()) != DispatchMode::All
-            && !body_factors_profit_from_leapfrog(map, &factors, nvars)
-        {
             return None;
         }
         let var_order: Vec<usize> = (0..nvars).collect();
@@ -1665,475 +1207,22 @@ fn body_factors_routable_to_zipper_join(factors: &[Factor]) -> bool {
     !factors.is_empty()
 }
 
-/// Collect the query variables of one factor into `out`: the top-level `Var` columns and every
-/// variable nested in a `Term` column. A NewVar takes the next id after the ones introduced before
-/// this term (`term.intro`), a VarRef names its id, matching the body's global numbering.
-fn collect_factor_vars(factor: &Factor, out: &mut std::collections::BTreeSet<usize>) {
-    for col in &factor.cols {
-        match col {
-            FactorColumn::Var(v) => {
-                out.insert(*v);
-            }
-            FactorColumn::Term(term) => {
-                let mut ez = ExprZipper::new(term.expr());
-                let mut intro = term.intro as usize;
-                loop {
-                    match ez.tag() {
-                        Tag::NewVar => {
-                            out.insert(intro);
-                            intro += 1;
-                        }
-                        Tag::VarRef(i) => {
-                            out.insert(i as usize);
-                        }
-                        Tag::SymbolSize(_) | Tag::Arity(_) => {}
-                    }
-                    if !ez.next() {
-                        break;
-                    }
-                }
-            }
-        }
-    }
-}
 
-/// Row cap for the functional-dependency probe. Below it a relation is walked in full and its
-/// trailing FD decided exactly; a body whose relations all fit is cheap to probe. Above it the
-/// probe is skipped and the structurally cyclic body dispatches, which is correct: at that scale a
-/// genuine cyclic graph pattern is the worst-case-optimal join's win, and reading the whole
-/// relation to decide would cost more than it saves (following the fork's 200k threshold).
-const FD_PROBE_ROW_CAP: usize = 200_000;
 
-/// The engine dispatch's performance policy, distinct from routability: dispatch a body only when
-/// it has a cycle the leapfrog can seek and win on. Three conjuncts, each with a measured
-/// counterexample behind it, cheapest first.
-///
-/// The cycle must be seekable: cyclic over the variables that occur as whole columns, because a
-/// whole column is what the leapfrog intersects on the trie. A body whose cycle is carried only
-/// inside compound arguments (the counter machine's `(IC $i)`, `(JZ $r $j)`) gives the seek
-/// nothing, and its small hot queries pay only the join's per-candidate machinery (measured 1.6x
-/// slower dispatched).
-///
-/// The cycle must be genuine: cyclic over the full variable sets, nested occurrences included,
-/// because alpha-acyclic queries are where a relation-at-a-time plan already meets the optimal
-/// bound, O(input + output), and the seek beats the product asymptotically only where every such
-/// plan builds a super-linear intermediate the AGM bound forbids the answer from having (Ngo et
-/// al. 2012). This declines paths, semijoins, enumeration-and-filter, and pure products without
-/// reading data (a 10^6-tuple product measured 1.8x slower dispatched).
-///
-/// And the cycle must not be functionally degenerate: `(a /\ b = c)(a \/ b = d)(c - d = e)` is a
-/// real hyperedge diamond, but each relation is a function, so its AGM bound collapses to O(N)
-/// (Gottlob-Lee-Valiant-Valiant; Abo Khamis-Ngo-Suciu) and the leapfrog wins nothing
-/// (finite_domain measured 3.8x slower dispatched). Only for bodies the first two conjuncts pass
-/// does the probe read bounded data: it detects each relation's trailing functional dependency
-/// (the `(lhs.. = result)` convention) by comparing the distinct determinant projection against
-/// the full rows, folds every dependent into the atoms holding its determinant, and re-runs GYO.
-/// A graph's `edge` disproves its FD at the first repeated source, so a genuine cyclic pattern
-/// stops paying for the scan within a few facts and dispatches.
-///
-/// Correctness never depends on any of this, since both paths return the same matches.
-///
-/// Within the cyclic non-functional class, the instance still decides who wins, and the full
-/// bench suite measured the boundary. Every relation tiny: the whole query is fast either way
-/// and the ProductZipper's constants win (the tile puzzle's inequality tables), so it declines.
-/// Four or more join factors: a relation-at-a-time product deepens multiplicatively while the
-/// join stays output-bounded (the clique bench's 6- and 10-factor queries ran 50x faster
-/// dispatched), so it dispatches. Three factors: only skew pays, so a bounded probe samples
-/// first-argument values for a heavy hitter, the hub through which a product blows up
-/// quadratically (the 240x triangle); a uniform instance has none and declines (the transitive
-/// bench's triangle detect over a million random edges measured 15% slower dispatched, and
-/// declines). A hub outside the sample window is missed, and the body then merely stays on the
-/// stock path; telling those apart exactly is the cost-based dispatch this policy approximates
-/// with bounded reads.
-fn body_factors_profit_from_leapfrog(map: &PathMap<()>, factors: &[Factor], nvars: usize) -> bool {
-    if !(hypergraph_is_cyclic(column_var_edges(factors), nvars) && body_is_cyclic(factors, nvars)) {
-        return false;
-    }
-    let counts: Vec<usize> = factors
-        .iter()
-        .map(|f| bounded_fact_count(map, f, DISPATCH_MIN_FACTS))
-        .collect();
-    if counts.iter().all(|c| *c < DISPATCH_MIN_FACTS) {
-        return false;
-    }
-    if factors.len() < DISPATCH_MANY_FACTORS {
-        let heavy = factors
-            .iter()
-            .zip(&counts)
-            .any(|(f, c)| *c >= DISPATCH_MIN_FACTS && factor_has_sampled_heavy_hitter(map, f));
-        if !heavy {
-            return false;
-        }
-    }
-    !body_is_acyclic_modulo_fds(map, factors, nvars)
-}
 
-/// Below this many facts in every factor's relation the query is small either way and the
-/// ProductZipper's straight-line constants win; the tile puzzle's 56-fact inequality tables
-/// measured a mild loss dispatched, while the demonstration's smallest hub instance (265 facts)
-/// must still dispatch.
-const DISPATCH_MIN_FACTS: usize = 128;
 
-/// From this many join factors on, the relation-at-a-time product deepens multiplicatively while
-/// the join stays output-bounded, skewed instance or not: the clique bench's 6- and 10-factor
-/// queries measured 50x faster dispatched on a graph whose 3-factor triangle declines.
-const DISPATCH_MANY_FACTORS: usize = 4;
 
-/// A first-argument value with this many continuations is a heavy hitter: the product through it
-/// blows up quadratically. Uniform random graphs (the transitive bench's degrees average ~20)
-/// stay below it and decline.
-const DISPATCH_HEAVY_DEGREE: usize = 64;
 
-/// How many first-argument values the heavy-hitter probe samples, in trie order.
-const DISPATCH_HEAVY_SAMPLES: usize = 64;
 
-/// The factor's relation region: its prefix, extended by the head column when the head is a
-/// ground symbol, so the counts and samples read this relation rather than every same-arity fact.
-fn factor_scan_path(factor: &Factor) -> Vec<u8> {
-    let mut p = factor.prefix.clone();
-    if let Some(FactorColumn::Term(head)) = factor.cols.first() {
-        if head.is_ground() {
-            p.extend_from_slice(&head.bytes);
-        }
-    }
-    p
-}
 
-/// Count the facts under the factor's relation region, stopping at `cap`: a bounded walk, so the
-/// gate's cost stays independent of the space size.
-fn bounded_fact_count(map: &PathMap<()>, factor: &Factor, cap: usize) -> usize {
-    let mut rz = map.read_zipper_at_path(&factor_scan_path(factor));
-    let mut n = 0;
-    while n < cap && rz.to_next_val() {
-        n += 1;
-    }
-    n
-}
 
-/// Sample up to [`DISPATCH_HEAVY_SAMPLES`] first-argument values of the factor's relation, in
-/// trie order, and report whether any has [`DISPATCH_HEAVY_DEGREE`] or more continuations. Both
-/// walks are capped, so the probe reads a bounded region regardless of the space size.
-fn factor_has_sampled_heavy_hitter(map: &PathMap<()>, factor: &Factor) -> bool {
-    let base = factor_scan_path(factor);
-    let mut cur = SubtermCursor::new(map.read_zipper_at_path(&base));
-    cur.first();
-    let mut sampled = 0;
-    while sampled < DISPATCH_HEAVY_SAMPLES && !cur.at_end() {
-        let Some(key) = cur.key() else { break };
-        let mut path = base.clone();
-        path.extend_from_slice(key);
-        let mut inner = SubtermCursor::new(map.read_zipper_at_path(&path));
-        inner.first();
-        let mut deg = 0;
-        while !inner.at_end() && deg < DISPATCH_HEAVY_DEGREE {
-            deg += 1;
-            inner.next();
-        }
-        if deg >= DISPATCH_HEAVY_DEGREE {
-            return true;
-        }
-        sampled += 1;
-        cur.next();
-    }
-    false
-}
 
-/// The hyperedges of the variables the leapfrog can seek: per factor, its whole-column variables
-/// only, compound-nested occurrences excluded.
-fn column_var_edges(factors: &[Factor]) -> Vec<std::collections::BTreeSet<usize>> {
-    factors
-        .iter()
-        .map(|f| {
-            f.cols
-                .iter()
-                .filter_map(|col| match col {
-                    FactorColumn::Var(v) => Some(*v),
-                    FactorColumn::Term(_) => None,
-                })
-                .collect::<std::collections::BTreeSet<usize>>()
-        })
-        .filter(|s| !s.is_empty())
-        .collect()
-}
 
-/// The ordered distinct query variables of a factor when every column is simple (a top-level
-/// variable or a ground symbol), else `None`. Only these factors carry a decidable trailing FD in
-/// the `(lhs.. = result)` sense; a compound column has no such reading, so its factor contributes
-/// no FD and stays a plain hyperedge.
-fn factor_simple_var_schema(factor: &Factor) -> Option<Vec<usize>> {
-    let mut schema = Vec::new();
-    for col in &factor.cols {
-        match col {
-            FactorColumn::Var(v) => {
-                if !schema.contains(v) {
-                    schema.push(*v);
-                }
-            }
-            FactorColumn::Term(term)
-                if term.is_ground() && matches!(term.tag(), Tag::SymbolSize(_)) => {}
-            _ => return None,
-        }
-    }
-    Some(schema)
-}
 
-/// Per-factor accumulator for the trailing-FD probe, driven by one shared walk of the facts under
-/// the factor's prefix. The column plan is precomputed so folding a fact needs no allocation until
-/// it passes the factor's ground columns: `ground_cols` are the (index, bytes) a fact must match,
-/// `var_cols` the (index, variable) bindings, and `schema` the variable order (determinant is all
-/// but the last, dependent is the last). `over_cap` trips when the relation exceeds the probe cap.
-struct FactorFd {
-    schema: Vec<usize>,
-    ground_cols: Vec<(usize, Vec<u8>)>,
-    var_cols: Vec<(usize, usize)>,
-    det_rows: std::collections::BTreeSet<Vec<u8>>,
-    full_rows: std::collections::BTreeSet<Vec<u8>>,
-    seen: usize,
-    /// Set when the factor can no longer yield an FD: the relation exceeded the probe cap, or a
-    /// determinant collision already disproved functionality. A genuinely relational factor (a
-    /// graph's `edge`) collides within its first few facts, so it stops paying for the scan
-    /// almost immediately; only a genuinely functional table is read in full, where the read buys
-    /// the decline.
-    dead: bool,
-}
 
-impl FactorFd {
-    fn new(factor: &Factor, schema: Vec<usize>) -> Self {
-        let mut ground_cols = Vec::new();
-        let mut var_cols = Vec::new();
-        for (ci, col) in factor.cols.iter().enumerate() {
-            match col {
-                FactorColumn::Var(v) => var_cols.push((ci, *v)),
-                FactorColumn::Term(term) => ground_cols.push((ci, term.bytes.clone())),
-            }
-        }
-        FactorFd {
-            schema,
-            ground_cols,
-            var_cols,
-            det_rows: std::collections::BTreeSet::new(),
-            full_rows: std::collections::BTreeSet::new(),
-            seen: 0,
-            dead: false,
-        }
-    }
 
-    /// Fold one fact's column spans into the accumulator, if the fact matches the factor's ground
-    /// columns and its repeated variables agree. Rejects on the ground columns before allocating.
-    fn observe(&mut self, cols: &[&[u8]]) {
-        if self.dead {
-            return;
-        }
-        for (ci, bytes) in &self.ground_cols {
-            if cols[*ci] != &bytes[..] {
-                return;
-            }
-        }
-        // Bind each variable to its first column's value; a later column of the same variable must
-        // agree. `vals` stays in schema order, tiny (a factor has a handful of columns).
-        let mut vals: Vec<(usize, &[u8])> = Vec::with_capacity(self.var_cols.len());
-        for (ci, v) in &self.var_cols {
-            match vals.iter().find(|(bv, _)| bv == v) {
-                Some((_, prev)) if *prev != cols[*ci] => return,
-                Some(_) => {}
-                None => vals.push((*v, cols[*ci])),
-            }
-        }
-        self.seen += 1;
-        if self.seen > FD_PROBE_ROW_CAP {
-            self.dead = true;
-            self.det_rows.clear();
-            self.full_rows.clear();
-            return;
-        }
-        let val_of = |var: usize| vals.iter().find(|(v, _)| *v == var).unwrap().1;
-        let (dependent, determinant) = self.schema.split_last().unwrap();
-        let mut det_key = Vec::new();
-        for v in determinant {
-            det_key.extend_from_slice(val_of(*v));
-            det_key.push(0xFF);
-        }
-        let mut full_key = det_key.clone();
-        full_key.extend_from_slice(val_of(*dependent));
-        self.det_rows.insert(det_key);
-        self.full_rows.insert(full_key);
-        // A determinant seen again with a new dependent disproves the FD for good.
-        if self.full_rows.len() > self.det_rows.len() {
-            self.dead = true;
-            self.det_rows.clear();
-            self.full_rows.clear();
-        }
-    }
 
-    /// The trailing FD `(determinant -> dependent)` this factor's data supports, if any.
-    fn resolve(&self) -> Option<(std::collections::BTreeSet<usize>, usize)> {
-        if self.dead || self.seen == 0 {
-            return None;
-        }
-        debug_assert_eq!(self.det_rows.len(), self.full_rows.len());
-        let (dependent, determinant) = self.schema.split_last().unwrap();
-        Some((determinant.iter().copied().collect(), *dependent))
-    }
-}
 
-/// Whether the body is acyclic once functional dependencies are folded in. Detect each factor's
-/// trailing FD from the data, extend every atom that holds a determinant with its dependent to a
-/// fixpoint, and re-run GYO on the extended hyperedges. A body all of whose cycles are carried by
-/// functional relations reduces to acyclic here; a genuine relational cycle does not.
-///
-/// The detection walks each distinct factor prefix once and folds every fact into all factors
-/// sharing that prefix, so a body whose factors are the same arity (a functional pipeline over
-/// one arity, like `finite_domain`) pays a single scan, not one per factor.
-fn body_is_acyclic_modulo_fds(map: &PathMap<()>, factors: &[Factor], nvars: usize) -> bool {
-    use std::collections::BTreeSet;
-
-    // Only simple factors with two or more variables carry a decidable trailing FD; the rest never
-    // contribute one, so they are skipped in the scan and stay plain hyperedges.
-    let mut states: Vec<Option<FactorFd>> = factors
-        .iter()
-        .map(|f| {
-            factor_simple_var_schema(f)
-                .filter(|s| s.len() >= 2)
-                .map(|schema| FactorFd::new(f, schema))
-        })
-        .collect();
-
-    if states.iter().all(|s| s.is_none()) {
-        return false;
-    }
-
-    // Group probeable factors by prefix, walk each prefix's facts once, fold into every factor
-    // that shares it.
-    let mut prefixes: Vec<Vec<u8>> = Vec::new();
-    for (i, st) in states.iter().enumerate() {
-        if st.is_some() && !prefixes.contains(&factors[i].prefix) {
-            prefixes.push(factors[i].prefix.clone());
-        }
-    }
-    for prefix in &prefixes {
-        let members: Vec<usize> = (0..factors.len())
-            .filter(|&i| states[i].is_some() && &factors[i].prefix == prefix)
-            .collect();
-        // One prefix means one arity byte, so every member parses the same column count.
-        let ncols = factors[members[0]].cols.len();
-        debug_assert!(members.iter().all(|&i| factors[i].cols.len() == ncols));
-        let mut rz = map.read_zipper_at_path(prefix);
-        while rz.to_next_val() {
-            let full = rz.origin_path();
-            let cols = split_columns(&full[prefix.len()..], ncols);
-            let mut live = false;
-            for &i in &members {
-                let st = states[i].as_mut().unwrap();
-                st.observe(&cols);
-                live |= !st.dead;
-            }
-            // Every member disproved: a genuinely relational prefix stops paying within its
-            // first collisions instead of walking the whole relation.
-            if !live {
-                break;
-            }
-        }
-    }
-
-    let fds: Vec<(BTreeSet<usize>, usize)> = states
-        .iter()
-        .filter_map(|s| s.as_ref().and_then(FactorFd::resolve))
-        .collect();
-    if fds.is_empty() {
-        return false;
-    }
-
-    let mut edges: Vec<BTreeSet<usize>> = factors
-        .iter()
-        .map(|f| {
-            let mut s = BTreeSet::new();
-            collect_factor_vars(f, &mut s);
-            s
-        })
-        .collect();
-    loop {
-        let mut changed = false;
-        for (determinant, dependent) in &fds {
-            for e in edges.iter_mut() {
-                if determinant.is_subset(e) && e.insert(*dependent) {
-                    changed = true;
-                }
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-
-    let edges: Vec<BTreeSet<usize>> = edges.into_iter().filter(|s| !s.is_empty()).collect();
-    !hypergraph_is_cyclic(edges, nvars)
-}
-
-/// Whether the body's join hypergraph is cyclic, by GYO reduction (Graham; Yu and Ozsoyoglu). The
-/// hyperedges are the factor variable sets. Runs in the query's size, which is tiny, and touches
-/// no data.
-fn body_is_cyclic(factors: &[Factor], nvars: usize) -> bool {
-    let edges: Vec<std::collections::BTreeSet<usize>> = factors
-        .iter()
-        .map(|f| {
-            let mut s = std::collections::BTreeSet::new();
-            collect_factor_vars(f, &mut s);
-            s
-        })
-        .filter(|s| !s.is_empty())
-        .collect();
-    hypergraph_is_cyclic(edges, nvars)
-}
-
-/// GYO reduction on an explicit hyperedge list. Repeatedly drop every vertex that lies in only one
-/// edge (an "ear" attachment), then remove any edge contained in another; a query is alpha-acyclic
-/// exactly when this peels the hypergraph down to a single edge or nothing. Whatever cannot be
-/// peeled is a cycle.
-fn hypergraph_is_cyclic(mut edges: Vec<std::collections::BTreeSet<usize>>, nvars: usize) -> bool {
-    loop {
-        let mut changed = false;
-
-        // Drop vertices that occur in exactly one edge: they can never close a cycle.
-        let mut occ = vec![0usize; nvars];
-        for e in &edges {
-            for &v in e {
-                occ[v] += 1;
-            }
-        }
-        for e in &mut edges {
-            let before = e.len();
-            e.retain(|&v| occ[v] > 1);
-            if e.len() != before {
-                changed = true;
-            }
-        }
-
-        // Remove an edge contained in (or equal to) another edge; an empty edge is contained in any.
-        let mut removed = None;
-        'outer: for i in 0..edges.len() {
-            for j in 0..edges.len() {
-                if i != j && edges[i].is_subset(&edges[j]) {
-                    // On equal sets remove only the later one, so two equal edges collapse to one.
-                    if edges[i] == edges[j] && i > j {
-                        continue;
-                    }
-                    removed = Some(i);
-                    break 'outer;
-                }
-            }
-        }
-        if let Some(i) = removed {
-            edges.remove(i);
-            changed = true;
-        }
-
-        if !changed {
-            break;
-        }
-    }
-
-    edges.len() > 1
-}
 
 /// A reusable candidate list for one recursion depth of the lead enumeration. `entries[..len]`
 /// are the live candidates; entries past `len` are retained allocations whose capacity the next
@@ -3250,6 +2339,45 @@ impl UnifyJoin<'_> {
 mod tests {
     use super::*;
 
+    /// Body-level adapters the router used to expose. They are pure test conveniences now: the
+    /// shipped surface is `parse_body_factors` plus the join entry points, and the engine reaches
+    /// the join only through `query_multi_leapfrog`.
+    fn body_routable(body: &[u8]) -> bool {
+        parse_body_factors(body).is_some_and(|(factors, _)| !factors.is_empty())
+    }
+
+    fn body_partial(
+        map: &PathMap<()>,
+        body: &[u8],
+    ) -> Option<(usize, BTreeSet<Vec<Option<Vec<u8>>>>)> {
+        let (factors, nvars) = parse_body_factors(body)?;
+        if factors.is_empty() {
+            return None;
+        }
+        let var_order: Vec<usize> = (0..nvars).collect();
+        Some((nvars, unify_join_zipper_partial(map, &factors, &var_order, nvars)))
+    }
+
+    fn body_safe(map: &PathMap<()>, body: &[u8]) -> Option<BTreeSet<Vec<Vec<u8>>>> {
+        let (_, rows) = body_partial(map, body)?;
+        rows.into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|component| component.filter(|bytes| first_subterm_is_ground(bytes)))
+                    .collect::<Option<Vec<Vec<u8>>>>()
+            })
+            .collect()
+    }
+
+    fn body_rows_rendered(map: &PathMap<()>, body: &[u8]) -> Option<BTreeSet<Vec<u8>>> {
+        let (factors, nvars) = parse_body_factors(body)?;
+        if factors.is_empty() {
+            return None;
+        }
+        let var_order: Vec<usize> = (0..nvars).collect();
+        Some(unify_join_zipper_coordinated(map, &factors, &var_order, nvars))
+    }
+
     fn mask_of(bytes: &[u8]) -> ByteMask {
         let mut m = [0u64; 4];
         for &b in bytes {
@@ -3303,7 +2431,7 @@ mod tests {
             nest("e", &[var_ref(1), new_var()]),
         ]);
 
-        let rows = unify_join_zipper_body_safe(&map, &body).expect("flat body routes");
+        let rows = body_safe(&map, &body).expect("flat body routes");
         let expected = BTreeSet::from([vec![sym("a"), sym("b"), sym("c")]]);
         assert_eq!(rows, expected);
     }
@@ -3314,7 +2442,7 @@ mod tests {
         map.insert(&nest("p", &[sym("a"), sym("b")]), ());
         let body = conj(&[nest("p", &[sym("a"), new_var()])]);
 
-        let rows = unify_join_zipper_body_safe(&map, &body).expect("flat body routes");
+        let rows = body_safe(&map, &body).expect("flat body routes");
         let expected = BTreeSet::from([vec![sym("b")]]);
         assert_eq!(rows, expected);
     }
@@ -3326,16 +2454,16 @@ mod tests {
         map.insert(&nest("r", &[nest("a", &[sym("v0")])]), ());
         let body = conj(&[nest("r", &[nest("a", &[new_var()])])]);
 
-        assert!(unify_join_zipper_body_routable(&map, &body));
+        assert!(body_routable(&body));
         let (_nvars, rows) =
-            unify_join_zipper_body_partial_safe(&map, &body).expect("partial route is safe");
+            body_partial(&map, &body).expect("partial route is safe");
         assert!(
             rows.iter()
                 .any(|row| row.iter().any(|component| component.is_none())),
             "the live renderer must preserve the free non-ground row"
         );
         assert!(
-            unify_join_zipper_body_safe(&map, &body).is_none(),
+            body_safe(&map, &body).is_none(),
             "the all-ground entry must not silently drop non-ground rows"
         );
     }
@@ -3348,7 +2476,7 @@ mod tests {
         let mut coref = PathMap::<()>::new();
         coref.insert(&nest("e", &[new_var(), var_ref(0)]), ()); // (e $u $u)
         let body = conj(&[nest("e", &[new_var(), new_var()])]); // (e $x $y)
-        let rows = unify_join_zipper_body_rows_rendered(&coref, &body).expect("flat body routes");
+        let rows = body_rows_rendered(&coref, &body).expect("flat body routes");
         assert_eq!(
             rows.len(),
             1,
@@ -3364,7 +2492,7 @@ mod tests {
         let mut indep = PathMap::<()>::new();
         indep.insert(&nest("e", &[new_var(), new_var()]), ()); // (e $u $w)
         let indep_rows =
-            unify_join_zipper_body_rows_rendered(&indep, &body).expect("flat body routes");
+            body_rows_rendered(&indep, &body).expect("flat body routes");
         assert_eq!(
             indep_rows.iter().next().unwrap(),
             &vec![item_byte(Tag::NewVar), item_byte(Tag::NewVar)],
@@ -3416,11 +2544,11 @@ mod tests {
             ),
         ] {
             assert!(
-                unify_join_zipper_body_routable(map, body),
+                body_routable(body),
                 "{name} must be inside the zipper-owned route"
             );
             assert!(
-                unify_join_zipper_body_partial_safe(map, body).is_some(),
+                body_partial(map, body).is_some(),
                 "{name} must route safely"
             );
         }
@@ -3661,184 +2789,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ground_join_matches_brute_force() {
-        for seed in 0..150u64 {
-            let mut rng = Lcg::new(seed.wrapping_add(7));
-            let nnodes = 3 + rng.below(4);
-            let nodes: Vec<Vec<u8>> = (0..nnodes)
-                .map(|i| sym(&((b'a' + i as u8) as char).to_string()))
-                .collect();
 
-            let mut map = PathMap::<()>::new();
-            let mut e_facts: Vec<Vec<Vec<u8>>> = Vec::new();
-            let mut f_facts: Vec<Vec<Vec<u8>>> = Vec::new();
-            let nedges = 4 + rng.below(8);
-            for _ in 0..nedges {
-                let a = nodes[rng.below(nnodes)].clone();
-                let b = nodes[rng.below(nnodes)].clone();
-                if map
-                    .insert(&nest("e", &[a.clone(), b.clone()]), ())
-                    .is_none()
-                {
-                    e_facts.push(vec![a, b]);
-                }
-                let c = nodes[rng.below(nnodes)].clone();
-                let d = nodes[rng.below(nnodes)].clone();
-                if map
-                    .insert(&nest("f", &[c.clone(), d.clone()]), ())
-                    .is_none()
-                {
-                    f_facts.push(vec![c, d]);
-                }
-            }
-            let pe = relation_prefix("e", 3);
-            let pf = relation_prefix("f", 3);
-
-            let queries: Vec<(Vec<Factor>, Vec<usize>, usize)> = vec![
-                // path  (e $0 $1)(e $1 $2)
-                (
-                    vec![
-                        Factor::var_cols(pe.clone(), vec![0, 1]),
-                        Factor::var_cols(pe.clone(), vec![1, 2]),
-                    ],
-                    vec![0, 1, 2],
-                    3,
-                ),
-                // star  (e $0 $1)(e $0 $2)
-                (
-                    vec![
-                        Factor::var_cols(pe.clone(), vec![0, 1]),
-                        Factor::var_cols(pe.clone(), vec![0, 2]),
-                    ],
-                    vec![0, 1, 2],
-                    3,
-                ),
-                // two-relation path  (e $0 $1)(f $1 $2)
-                (
-                    vec![
-                        Factor::var_cols(pe.clone(), vec![0, 1]),
-                        Factor::var_cols(pf.clone(), vec![1, 2]),
-                    ],
-                    vec![0, 1, 2],
-                    3,
-                ),
-                // three-path  (e $0 $1)(e $1 $2)(e $2 $3)
-                (
-                    vec![
-                        Factor::var_cols(pe.clone(), vec![0, 1]),
-                        Factor::var_cols(pe.clone(), vec![1, 2]),
-                        Factor::var_cols(pe.clone(), vec![2, 3]),
-                    ],
-                    vec![0, 1, 2, 3],
-                    4,
-                ),
-                // triangle  (e $0 $1)(e $1 $2)(e $2 $0) -- cyclic: factor 2's columns invert the
-                // variable order, so it must validate $0 after binding $2 (the catch-up path).
-                (
-                    vec![
-                        Factor::var_cols(pe.clone(), vec![0, 1]),
-                        Factor::var_cols(pe.clone(), vec![1, 2]),
-                        Factor::var_cols(pe.clone(), vec![2, 0]),
-                    ],
-                    vec![0, 1, 2],
-                    3,
-                ),
-                // same triangle under a rotated variable order (different participation pattern).
-                (
-                    vec![
-                        Factor::var_cols(pe.clone(), vec![0, 1]),
-                        Factor::var_cols(pe.clone(), vec![1, 2]),
-                        Factor::var_cols(pe.clone(), vec![2, 0]),
-                    ],
-                    vec![1, 2, 0],
-                    3,
-                ),
-                // four-cycle  (e $0 $1)(e $1 $2)(e $2 $3)(e $3 $0)
-                (
-                    vec![
-                        Factor::var_cols(pe.clone(), vec![0, 1]),
-                        Factor::var_cols(pe.clone(), vec![1, 2]),
-                        Factor::var_cols(pe.clone(), vec![2, 3]),
-                        Factor::var_cols(pe.clone(), vec![3, 0]),
-                    ],
-                    vec![0, 1, 2, 3],
-                    4,
-                ),
-                // intra-factor coreference  (e $0 $0): only the self-loops, via catch-up on col 1.
-                (vec![Factor::var_cols(pe.clone(), vec![0, 0])], vec![0], 1),
-                // triangle with a pendant  (e $0 $1)(e $1 $2)(e $2 $0)(f $0 $3)
-                (
-                    vec![
-                        Factor::var_cols(pe.clone(), vec![0, 1]),
-                        Factor::var_cols(pe.clone(), vec![1, 2]),
-                        Factor::var_cols(pe.clone(), vec![2, 0]),
-                        Factor::var_cols(pf.clone(), vec![0, 3]),
-                    ],
-                    vec![0, 1, 2, 3],
-                    4,
-                ),
-            ];
-
-            for (factors, order, nvars) in &queries {
-                let factor_rows: Vec<Vec<Vec<Vec<u8>>>> = factors
-                    .iter()
-                    .map(|fac| {
-                        if fac.prefix == pe {
-                            e_facts.clone()
-                        } else {
-                            f_facts.clone()
-                        }
-                    })
-                    .collect();
-
-                let mut got = ground_join(&map, factors, order, *nvars);
-                let mut want = {
-                    let mut binding = vec![None; *nvars];
-                    let mut out = Vec::new();
-                    brute_rec(0, factors, &factor_rows, &mut binding, &mut out);
-                    out
-                };
-                got.sort();
-                got.dedup();
-                want.sort();
-                want.dedup();
-                assert_eq!(
-                    got, want,
-                    "seed {seed}: join answers must match the nested loop"
-                );
-            }
-        }
-    }
-
-    // The data-parallel ground_join must return byte-identically (as a set) what
-    // the sequential ground_join returns: the leading variable's hash partition is
-    // a disjoint cover, so the workers' answer sets union to the whole. Checked on
-    // a moderate edge relation via the 2-hop join.
-    #[test]
-    fn ground_join_parallel_matches_sequential() {
-        let mut s = crate::space::Space::new();
-        let mut prog = String::new();
-        for a in 0..48u32 {
-            for b in 0..48u32 {
-                if (a.wrapping_mul(31).wrapping_add(b.wrapping_mul(17))) % 5 == 0 {
-                    prog.push_str(&format!("(edge {} {})\n", a % 13, b % 13));
-                }
-            }
-        }
-        s.add_all_sexpr(prog.as_bytes()).unwrap();
-        let body = crate::expr!(s, "[3] , [3] edge $ $ [3] edge _2 $");
-        let span = unsafe { body.span().as_ref().unwrap() };
-        let (factors, nvars) = parse_body_factors(span).expect("parses");
-        let var_order: Vec<usize> = (0..nvars).collect();
-
-        let mut seq = ground_join(&s.btm, &factors, &var_order, nvars);
-        let mut par = ground_join_parallel(&s.btm, &factors, &var_order, nvars, 32);
-        assert!(!seq.is_empty(), "the join must produce answers");
-        seq.sort();
-        par.sort();
-        assert_eq!(seq, par, "parallel join answer set must equal sequential");
-    }
 
     #[test]
     fn least_ge_matches_brute_force() {
@@ -4541,7 +3492,7 @@ mod tests {
             v.push(item_byte(Tag::NewVar));
             v
         }]);
-        let rows1 = unify_join_zipper_body_safe(&m1, &body1).expect("variable head routes");
+        let rows1 = body_safe(&m1, &body1).expect("variable head routes");
         let expected1 = BTreeSet::from([vec![sym("e"), sym("b")], vec![sym("f"), sym("c")]]);
         assert_eq!(
             rows1, expected1,
@@ -4556,7 +3507,7 @@ mod tests {
         m2.insert(&wild, ());
         m2.insert(&nest("e", &[sym("a"), sym("c")]), ());
         let body2 = conj(&[nest("e", &[sym("a"), new_var()])]);
-        let rows2 = unify_join_zipper_body_safe(&m2, &body2).expect("ground head routes");
+        let rows2 = body_safe(&m2, &body2).expect("ground head routes");
         let expected2 = BTreeSet::from([vec![sym("b")], vec![sym("c")]]);
         assert_eq!(rows2, expected2, "wildcard stored head must be captured");
     }
@@ -4795,73 +3746,6 @@ mod tests {
         }
     }
 
-    /// The dispatch policy is cyclicity modulo functional dependencies, refined by the instance:
-    /// tiny queries decline, deep cyclic bodies dispatch, shallow ones dispatch only on a sampled
-    /// heavy hitter, and functionally determined bodies decline after the data probe. Correctness
-    /// never depends on this routing, but the boundary is the performance contract, so pin every
-    /// clause.
-    #[test]
-    fn dispatch_policy_follows_cyclicity_modulo_fds() {
-        // A hub graph (the skewed instance), a branching uniform graph (non-functional, low
-        // degree), and four functional 12x12 tables for the FD diamond.
-        let mut text = String::new();
-        for k in 0..64 {
-            text.push_str(&format!("(hub h o{k})\n(hub i{k} h)\n"));
-        }
-        for k in 0..128 {
-            text.push_str(&format!("(uni n{k} n{})\n(uni n{k} m{k})\n", (k + 1) % 128));
-        }
-        for x in 0..12 {
-            for y in 0..12 {
-                text.push_str(&format!(
-                    "(fa {x} {y} = r{})\n(fb {x} {y} = r{})\n",
-                    (x + y) % 12,
-                    (x * y) % 12
-                ));
-                text.push_str(&format!(
-                    "(fc r{x} r{y} = s{})\n(fd r{x} r{y} = s{})\n",
-                    (x + y) % 12,
-                    (x + 2 * y) % 12
-                ));
-            }
-        }
-        text.push_str("(e a b)\n(e a c)\n(e b c)\n");
-        let mut s = crate::space::Space::new();
-        s.add_all_sexpr(text.as_bytes()).unwrap();
-        let case = |body: &str| -> bool {
-            let b = enc(body);
-            let (factors, nvars) = parse_body_factors(&b).unwrap();
-            body_factors_profit_from_leapfrog(&s.btm, &factors, nvars)
-        };
-        assert!(
-            case("(, (hub $x $y) (hub $y $z) (hub $x $z))"),
-            "a triangle through a sampled heavy hitter must dispatch"
-        );
-        assert!(
-            !case("(, (uni $x $y) (uni $y $z) (uni $x $z))"),
-            "a uniform triangle has no heavy hitter and must decline"
-        );
-        assert!(
-            case("(, (uni $a $b) (uni $b $c) (uni $c $d) (uni $d $a))"),
-            "a deep cyclic body dispatches on product depth alone"
-        );
-        assert!(
-            !case("(, (fa $x $y = $u) (fb $x $y = $v) (fc $u $v = $w) (fd $u $v = $z))"),
-            "a functional diamond is FD-acyclic and must decline"
-        );
-        assert!(
-            !case("(, (e $x $y) (e $y $z) (e $x $z))"),
-            "a tiny query declines whatever its shape"
-        );
-        assert!(
-            !case("(, (uni $x $y) (uni $y $z))"),
-            "an acyclic path must decline on GYO alone"
-        );
-        assert!(
-            !case("(, (p $x (q $y)) (r $y (s $z)) (t $z (u $x)))"),
-            "a cycle carried only inside compounds has nothing the leapfrog can seek"
-        );
-    }
 
     /// Bodies the router does not own (a bare-variable factor, the empty conjunction) must fall
     /// back to the stock path and agree with it exactly; the bare variable also matches the exec

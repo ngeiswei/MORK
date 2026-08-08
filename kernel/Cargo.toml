@@ -38,6 +38,3 @@ no_search = []
 grounding = []
 specialize_io = []
 periodic_merkleize = []
-[[example]]
-name = "wco_leapfrog"
-required-features = ["leapfrog"]
