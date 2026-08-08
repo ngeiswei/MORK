@@ -350,13 +350,18 @@ fn intersect<Z: Zipper + ZipperMoving>(cursors: &mut [SubtermCursor<Z>]) -> Vec<
             return out;
         }
     }
+    // Reusable running-max buffer: the max key is found by slice comparison and copied once per
+    // iteration (seek needs `&mut` cursors, so it cannot borrow a cursor's key directly).
+    let mut max: Vec<u8> = Vec::new();
     loop {
-        let max = cursors
-            .iter()
-            .map(|c| c.key().unwrap())
-            .max()
-            .unwrap()
-            .to_vec();
+        let mut max_i = 0usize;
+        for i in 1..cursors.len() {
+            if cursors[i].key().unwrap() > cursors[max_i].key().unwrap() {
+                max_i = i;
+            }
+        }
+        max.clear();
+        max.extend_from_slice(cursors[max_i].key().unwrap());
         let mut all_match = true;
         for c in cursors.iter_mut() {
             if c.key().unwrap() != max.as_slice() {
@@ -370,7 +375,7 @@ fn intersect<Z: Zipper + ZipperMoving>(cursors: &mut [SubtermCursor<Z>]) -> Vec<
             }
         }
         if all_match {
-            out.push(max);
+            out.push(max.clone());
             cursors[0].next();
             if cursors[0].at_end() {
                 return out;
@@ -688,6 +693,14 @@ struct GroundJoin<'a> {
     /// Hashing the whole value balances the domain; a byte-range split would give
     /// one worker everything (every value shares its leading tag byte).
     lead_partition: Option<(usize, usize)>,
+    /// Reusable scratch holding the leapfrog's running-max key: refilled by
+    /// `clear()+extend_from_slice` each iteration instead of cloning every
+    /// participating cursor's key. Only valid within a single leapfrog iteration
+    /// (recursion below reuses it freely).
+    max_buf: Vec<u8>,
+    /// Per-depth reusable buffers for the participating-factor list computed at
+    /// each variable, avoiding a fresh `Vec` allocation per node.
+    parts_bufs: Vec<Vec<usize>>,
 }
 
 impl<'a> GroundJoin<'a> {
@@ -709,6 +722,8 @@ impl<'a> GroundJoin<'a> {
             next_col: vec![0; factors.len()],
             binding: vec![Vec::new(); nvars],
             lead_partition,
+            max_buf: Vec::new(),
+            parts_bufs: vec![Vec::new(); var_order.len()],
         }
     }
 
@@ -728,21 +743,24 @@ impl<'a> GroundJoin<'a> {
             self.recurse_after_catch_up(i, emit);
             return;
         }
-        let Some(col) = self.factors[f].cols.get(self.next_col[f]).cloned() else {
+        // `self.factors` is a shared reference to borrowed data: copying it out makes the
+        // column borrow independent of `&mut self`, so no clone of the column (or of a bound
+        // binding value) is needed -- the borrows below end before the recursive call.
+        let factors = self.factors;
+        let Some(col) = factors[f].cols.get(self.next_col[f]) else {
             self.catch_up(i, f + 1, emit);
             return;
         };
-        let target = match col {
-            FactorColumn::Term(term) if term.is_ground() => Some(term.bytes),
-            FactorColumn::Var(v) if !self.binding[v].is_empty() => Some(self.binding[v].clone()),
-            FactorColumn::Var(_) | FactorColumn::Term(_) => None,
+        let target: &[u8] = match col {
+            FactorColumn::Term(term) if term.is_ground() => &term.bytes,
+            FactorColumn::Var(v) if !self.binding[*v].is_empty() => &self.binding[*v],
+            FactorColumn::Var(_) | FactorColumn::Term(_) => {
+                self.catch_up(i, f + 1, emit);
+                return;
+            }
         };
-        let Some(target) = target else {
-            self.catch_up(i, f + 1, emit);
-            return;
-        };
-        self.cursors[f].seek(&target);
-        if self.cursors[f].key() == Some(target.as_slice()) {
+        self.cursors[f].seek(target);
+        if self.cursors[f].key() == Some(target) {
             self.cursors[f].descend_floor();
             self.next_col[f] += 1;
             self.catch_up(i, f, emit);
@@ -762,12 +780,15 @@ impl<'a> GroundJoin<'a> {
             return;
         }
         let v = self.var_order[i];
-        let parts: Vec<usize> = (0..self.factors.len())
-            .filter(|&f| {
-                matches!(self.factors[f].cols.get(self.next_col[f]), Some(FactorColumn::Var(cv)) if *cv == v)
-            })
-            .collect();
+        // Reuse this depth's buffer instead of collecting a fresh Vec per node. Taking it out
+        // keeps `leapfrog`'s `&mut self` recursion borrow-clean; deeper nodes use other slots.
+        let mut parts = std::mem::take(&mut self.parts_bufs[i]);
+        parts.clear();
+        parts.extend((0..self.factors.len()).filter(|&f| {
+            matches!(self.factors[f].cols.get(self.next_col[f]), Some(FactorColumn::Var(cv)) if *cv == v)
+        }));
         self.leapfrog(i, v, &parts, emit);
+        self.parts_bufs[i] = parts;
     }
 
     /// Held-cursor streaming leapfrog for free variable `v` over its participating
@@ -788,32 +809,40 @@ impl<'a> GroundJoin<'a> {
             }
         }
         loop {
-            let max: Vec<u8> = parts
-                .iter()
-                .map(|&f| self.cursors[f].key().unwrap().to_vec())
-                .max()
-                .unwrap();
+            // Find the running-max key by slice comparison (no per-cursor clone), then copy it
+            // ONCE into the reusable scratch buffer so `seek` can take `&mut` cursors below.
+            let mut max_f = parts[0];
+            for &f in &parts[1..] {
+                if self.cursors[f].key().unwrap() > self.cursors[max_f].key().unwrap() {
+                    max_f = f;
+                }
+            }
+            self.max_buf.clear();
+            let (max_buf, cursors) = (&mut self.max_buf, &self.cursors);
+            max_buf.extend_from_slice(cursors[max_f].key().unwrap());
             let mut all_match = true;
             for &f in parts {
-                if self.cursors[f].key().unwrap() != max.as_slice() {
-                    self.cursors[f].seek(&max);
+                if self.cursors[f].key().unwrap() != self.max_buf.as_slice() {
+                    let (cursors, max_buf) = (&mut self.cursors, &self.max_buf);
+                    cursors[f].seek(max_buf);
                     if self.cursors[f].at_end() {
                         self.reset_parts(parts);
                         return;
                     }
-                    if self.cursors[f].key().unwrap() != max.as_slice() {
+                    if self.cursors[f].key().unwrap() != self.max_buf.as_slice() {
                         all_match = false;
                     }
                 }
             }
             if all_match {
-                if self.lead_owned(i, &max) {
+                if self.lead_owned(i, &self.max_buf) {
                     for &f in parts {
                         self.cursors[f].descend_floor();
                         self.next_col[f] += 1;
                     }
                     self.binding[v].clear();
-                    self.binding[v].extend_from_slice(&max);
+                    let (binding, max_buf) = (&mut self.binding, &self.max_buf);
+                    binding[v].extend_from_slice(max_buf);
                     self.recurse(i + 1, emit);
                     self.binding[v].clear();
                     for &f in parts {
