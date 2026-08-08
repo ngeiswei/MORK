@@ -1358,6 +1358,9 @@ fn join_state<'a>(
         out: BTreeSet::new(),
         want_coordinated,
         coordinated: BTreeSet::new(),
+        on_match: None,
+        loc_buf: Vec::new(),
+        #[cfg(test)]
         on_tuple: None,
         stopped: false,
     }
@@ -1377,8 +1380,27 @@ fn run_unify_join(
     (state.out, state.coordinated)
 }
 
-/// Run the join streaming each accepted assignment's per-factor original fact bytes to `on_tuple`
-/// instead of collecting rows; a `false` return stops the search early.
+/// Run the join streaming each accepted assignment's own solved bindings (and factor 0's stored
+/// fact, the `loc` the stock callback contract carries) to `on_match` instead of collecting rows;
+/// a `false` return stops the search early.
+fn run_unify_join_stream_bindings(
+    map: &PathMap<()>,
+    factors: &[Factor],
+    var_order: &[usize],
+    nvars: usize,
+    on_match: &mut dyn FnMut(&Bindings, Expr) -> bool,
+) {
+    let plan = join_plan(map, factors, var_order, nvars);
+    let mut state = join_state(map, &plan, var_order, nvars, false);
+    state.on_match = Some(on_match);
+    state.recurse(0);
+}
+
+/// Run the join streaming each accepted assignment's per-factor original fact bytes to `on_tuple`.
+/// Only [`tests::streamed_tuples_reconstruct_reindexed_facts`] uses this: it pins
+/// [`UnifyJoin::original_fact_bytes`] on a re-indexed factor, which the dispatch itself only ever
+/// reconstructs for factor 0 (never re-indexed under the identity variable order).
+#[cfg(test)]
 fn run_unify_join_stream(
     map: &PathMap<()>,
     factors: &[Factor],
@@ -1583,13 +1605,15 @@ pub fn set_leapfrog_dispatch(on: bool) {
 }
 
 /// The engine-facing dispatch entry: stream every product tuple the leapfrog accepts through the
-/// stock `query_multi` callback contract. Each accepted assignment reconstructs its per-factor
-/// stored facts, pairs them with the pattern factors exactly as `Space::query_multi_raw` does, and
-/// hands them to `mork_expr::unify`, so `effect` sees the bindings the ProductZipper path
-/// produces and the template emit downstream stays stock; occurs failures are skipped where stock
-/// skips them. Returns the successful-match count, or `None` for a body outside the nonempty
-/// relation-prefixed conjunction class (or if evaluation panicked), which the caller sends down
-/// the ProductZipper path. A `false` from `effect` stops the search, as it stops the stock scan.
+/// stock `query_multi` callback contract. Each accepted assignment hands `effect` the join's OWN
+/// solved bindings -- the join already carries the ProductZipper's namespace convention (query
+/// variables in `QUERY_NS` = 0, factor `f`'s data in `1 + f`), and `apply` observes a binding only
+/// by dereference, so this map drives the stock template emit exactly as a re-unification of the
+/// same tuple would (see the leaf in [`UnifyJoin::recurse_after_catch_up`]). `loc` is factor 0's
+/// stored fact, as stock passes. Returns the successful-match count, or `None` for a body outside
+/// the nonempty relation-prefixed conjunction class (or if evaluation panicked), which the caller
+/// sends down the ProductZipper path. A `false` from `effect` stops the search, as it stops the
+/// stock scan.
 pub fn query_multi_leapfrog<F: FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(
     map: &PathMap<()>,
     pat_expr: Expr,
@@ -1607,37 +1631,25 @@ pub fn query_multi_leapfrog<F: FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>
             return None;
         }
         let var_order: Vec<usize> = (0..nvars).collect();
-        let mut pat_args = Vec::new();
-        ExprEnv::new(0, pat_expr).args(&mut pat_args);
-        let sources = &pat_args[1..];
-        debug_assert_eq!(sources.len(), factors.len());
+        #[cfg(debug_assertions)]
+        {
+            // The factor count the stock path would pair up (`pat_args[1..]`, the conjunction's
+            // arguments) is the parsed factor count; the per-factor data namespaces `1 + f` line
+            // up with it positionally.
+            let mut pat_args = Vec::new();
+            ExprEnv::new(0, pat_expr).args(&mut pat_args);
+            debug_assert_eq!(pat_args.len() - 1, factors.len());
+        }
         let mut candidate = 0usize;
-        let mut on_tuple = |tuple: &[Vec<u8>]| -> bool {
+        let mut on_match = |bindings: &Bindings, loc: Expr| -> bool {
             unsafe { crate::space::unifications += 1 };
-            let e = Expr {
-                ptr: tuple[0].as_ptr().cast_mut(),
-            };
-            let mut pairs = vec![(sources[0], ExprEnv::new(1, e))];
-            for (j, fact) in tuple.iter().enumerate().skip(1) {
-                pairs.push((
-                    sources[j],
-                    ExprEnv::new(
-                        (j + 1) as u8,
-                        Expr {
-                            ptr: fact.as_ptr().cast_mut(),
-                        },
-                    ),
-                ));
-            }
-            match unify(&mut pairs) {
-                Ok(bs) => {
-                    candidate += 1;
-                    effect(Err(bs), e)
-                }
-                Err(_) => true,
-            }
+            candidate += 1;
+            // `effect` owns its map, so hand it a copy of the join's; the join keeps solving from
+            // the original as the recursion unwinds. A handful of entries per answer, against the
+            // whole-tuple re-unification (plus a fact rebuild per factor) this replaces.
+            effect(Err(bindings.clone()), loc)
         };
-        run_unify_join_stream(map, &factors, &var_order, nvars, &mut on_tuple);
+        run_unify_join_stream_bindings(map, &factors, &var_order, nvars, &mut on_match);
         Some(candidate)
     }))
     .ok()
@@ -2270,11 +2282,18 @@ struct UnifyJoin<'a> {
     /// Answer tuples encoded through one shared intro map, so free-variable coreference across answer
     /// positions survives for the live renderer. Empty unless `want_coordinated`.
     coordinated: BTreeSet<Vec<u8>>,
-    /// When set, each accepted assignment streams its per-factor original fact bytes here instead
-    /// of collecting rows, and a `false` return stops the search. The engine dispatch uses this to
-    /// re-derive each match's bindings with `mork_expr::unify` on the stock path's terms.
+    /// When set, each accepted assignment streams the join's OWN bindings (plus factor 0's stored
+    /// fact as the stock contract's `loc`) here instead of collecting rows, and a `false` return
+    /// stops the search. The engine dispatch uses this.
+    on_match: Option<&'a mut dyn FnMut(&Bindings, Expr) -> bool>,
+    /// Scratch for the streamed `loc`: factor 0's stored fact bytes, refilled per accepted
+    /// assignment so the stream costs no allocation per answer.
+    loc_buf: Vec<u8>,
+    /// Test-only tuple stream (see [`run_unify_join_stream`]).
+    #[cfg(test)]
     on_tuple: Option<&'a mut dyn FnMut(&[Vec<u8>]) -> bool>,
-    /// Set when `on_tuple` asked to stop; the recursion unwinds without visiting more candidates.
+    /// Set when a stream callback asked to stop; the recursion unwinds without visiting more
+    /// candidates.
     stopped: bool,
 }
 
@@ -2291,17 +2310,66 @@ impl UnifyJoin<'_> {
             if !(0..self.factors.len()).all(|f| self.factor_has_value(f)) {
                 return;
             }
+            #[cfg(test)]
             if self.on_tuple.is_some() {
-                // The engine dispatch consumes tuples, not rows: reconstruct each factor's stored
-                // fact and let the caller re-derive the match's bindings with `mork_expr::unify`
-                // on the stock path's own terms, per product tuple, exactly as the ProductZipper
-                // path does. Occurs rejection then happens where stock does it, so none of the
-                // row or cycled bookkeeping below runs.
+                // Test-only tuple stream: reconstruct every factor's stored fact (see
+                // `run_unify_join_stream`). Never set by the dispatch.
                 let tuple: Vec<Vec<u8>> = (0..self.factors.len())
                     .map(|f| self.original_fact_bytes(f))
                     .collect();
                 let cb = self.on_tuple.as_mut().unwrap();
                 if !cb(&tuple) {
+                    self.stopped = true;
+                }
+                return;
+            }
+            if self.on_match.is_some() {
+                // The engine dispatch consumes the join's OWN solved bindings. The namespaces
+                // already agree with the map the stock path builds: query variables live in
+                // `QUERY_NS` = 0 under the body's global first-occurrence numbering (the same
+                // numbering `apply` assigns walking `(, p1 .. pk)` from intro 0), and factor `f`'s
+                // data lives in `factor_namespace(f)` = `1 + f`, which is what
+                // `query_multi_raw` gives the f-th fact (`ExprEnv::new(1, e)`, then `j + 1`). So
+                // there is nothing to re-derive: rebuilding every fact and re-running a full
+                // `mork_expr::unify` over the pattern factors would recompute, per accepted
+                // tuple, the substitution this join just built incrementally.
+                //
+                // Byte identity is by DEREFERENCE, not by map shape: two solved forms of the same
+                // constraint set are the same most-general unifier up to a renaming of the
+                // still-free variables, and `apply` (through
+                // `apply_e_clears_stacks_and_cycles_check!`) only ever observes a binding by
+                // dereferencing it -- a var-var chain is walked transparently, and a free
+                // variable is emitted by its first-occurrence position in `assignments`, which is
+                // fixed by the pattern's own traversal order, not by which end of a var-var
+                // equation the map happened to keep. Path compression and the direction of
+                // var-var links are therefore invisible downstream. The row path already relies
+                // on exactly this: it emits answers with the same `apply` over these same
+                // bindings, and matches MORK's emitted bytes across the corpus and the random
+                // differential.
+                //
+                // A cyclic assignment is still handed over, exactly as the ProductZipper path
+                // hands one over: `mork_expr::unify` checks occurs only per equation, so it
+                // accepts the join-propagated capture, counts it, and lets the engine's
+                // post-apply `cycled` check drop it before any write. Cycles are a property of
+                // the deref closure, so the engine sees this map's cycle where it saw the
+                // re-unified map's, and the counts (`touched`) stay identical -- see
+                // `dispatch_touched_parity_on_transform`.
+                //
+                // `loc` is factor 0's stored fact, as stock passes; refill the scratch buffer
+                // rather than allocating one per answer.
+                let mut buf = std::mem::take(&mut self.loc_buf);
+                buf.clear();
+                self.original_fact_bytes_into(0, &mut buf);
+                let loc = Expr {
+                    ptr: buf.as_ptr().cast_mut(),
+                };
+                let keep = {
+                    let bindings = &self.bindings;
+                    let cb = self.on_match.as_mut().unwrap();
+                    cb(bindings, loc)
+                };
+                self.loc_buf = buf;
+                if !keep {
                     self.stopped = true;
                 }
                 return;
@@ -2443,21 +2511,27 @@ impl UnifyJoin<'_> {
         nr
     }
 
-    fn factor_path(&self, f: usize) -> Vec<u8> {
-        let mut path = self.factors[f].prefix.clone();
-        path.extend_from_slice(&self.bound[f]);
-        path
-    }
-
     /// The stored fact factor `f` sits on at a leaf, in its original encoding. A factor read from
     /// the live map is its prefix plus the bound column bytes. A re-indexed factor's bound bytes
     /// are its permuted, canonically renumbered columns; putting the columns back in original
     /// order and renumbering again (first reference NewVar, later ones VarRef of the new index) is
     /// exactly the stored encoding, because a stored fact is itself numbered canonically in column
     /// order.
+    #[cfg(test)]
     fn original_fact_bytes(&self, f: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.original_fact_bytes_into(f, &mut out);
+        out
+    }
+
+    /// [`Self::original_fact_bytes`] appending into a caller-owned buffer, so the streaming
+    /// dispatch reuses one allocation for every answer's `loc`.
+    fn original_fact_bytes_into(&self, f: usize, out: &mut Vec<u8>) {
         match &self.originals[f] {
-            None => self.factor_path(f),
+            None => {
+                out.extend_from_slice(&self.factors[f].prefix);
+                out.extend_from_slice(&self.bound[f]);
+            }
             Some((orig_prefix, new_order)) => {
                 let ncols = self.factors[f].cols.len();
                 let spans = split_columns(&self.bound[f], ncols);
@@ -2468,13 +2542,13 @@ impl UnifyJoin<'_> {
                 for (j, &c) in new_order.iter().enumerate() {
                     orig_positions[c] = j;
                 }
-                let mut out = orig_prefix.clone();
+                let mark = out.len();
+                out.extend_from_slice(orig_prefix);
                 out.extend_from_slice(&emit_reordered(&items, &orig_positions));
                 debug_assert!(
-                    self.map.read_zipper_at_path(&out).val().is_some(),
+                    self.map.read_zipper_at_path(&out[mark..]).val().is_some(),
                     "re-indexed leaf must reconstruct a fact stored in the source map"
                 );
-                out
             }
         }
     }
