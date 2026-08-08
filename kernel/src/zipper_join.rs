@@ -179,6 +179,49 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
         self.z.value().is_some()
     }
 
+    /// Descend the zipper by raw `bytes` — NOT necessarily a complete subterm (the unification
+    /// join pushes a lone arity byte when it walks into a compound column) — lowering the floor
+    /// past them. This mirrors one `bound[f]` fragment of the unification join so the zipper is
+    /// held across the join instead of re-opened from the trie root per probe. Requires the
+    /// cursor to be at its floor (empty key); pairs with `ascend_raw`.
+    fn descend_raw(&mut self, bytes: &[u8]) {
+        debug_assert!(
+            self.key.is_empty(),
+            "descend_raw must start at the column floor"
+        );
+        self.z.descend_to(bytes);
+        self.at_end = false;
+    }
+
+    /// Undo the most recent `descend_raw` of `n` bytes: raise the floor back past them. Requires
+    /// the cursor to be back at its (lowered) floor, which holds because every enumeration and
+    /// deeper descend/ascend pair restores it.
+    fn ascend_raw(&mut self, n: usize) {
+        debug_assert!(
+            self.key.is_empty(),
+            "ascend_raw must start at the column floor"
+        );
+        self.z.ascend(n);
+        self.at_end = false;
+    }
+
+    /// The trie children at the floor (the current column start). Requires the cursor to be at
+    /// its floor.
+    fn floor_child_mask(&self) -> ByteMask {
+        debug_assert!(
+            self.key.is_empty(),
+            "floor_child_mask read off-floor"
+        );
+        self.z.child_mask()
+    }
+
+    /// Bytes from the zipper's creation root down to the floor, for drift checks: it must always
+    /// equal the join's `bound[f]` length (the zipper is created at the factor's prefix).
+    #[cfg(debug_assertions)]
+    fn floor_len(&self) -> usize {
+        self.z.path().len() - self.key.len()
+    }
+
     /// Descend the least child at each step until the key forms a complete subterm. Returns false
     /// if a node runs out of children before completion (malformed/empty branch).
     fn complete_leftmost(&mut self) -> bool {
@@ -1015,7 +1058,7 @@ pub fn unify_join_zipper_partial(
     var_order: &[usize],
     nvars: usize,
 ) -> BTreeSet<Vec<Option<Vec<u8>>>> {
-    run_unify_join(map, factors, var_order, nvars, false).out
+    run_unify_join(map, factors, var_order, nvars, false).0
 }
 
 /// As [`unify_join_zipper_partial`], but returns each answer as one variable-coordinated tuple
@@ -1027,26 +1070,38 @@ fn unify_join_zipper_coordinated(
     var_order: &[usize],
     nvars: usize,
 ) -> BTreeSet<Vec<u8>> {
-    run_unify_join(map, factors, var_order, nvars, true).coordinated
+    run_unify_join(map, factors, var_order, nvars, true).1
 }
 
-/// Build the join state without running it. When `want_coordinated`, a run also collects each
-/// answer as one variable-coordinated tuple encoding (see [`unify_join_zipper_coordinated`]).
-fn join_state<'a>(
-    map: &'a PathMap<()>,
-    factors: &[Factor],
-    var_order: &'a [usize],
-    nvars: usize,
-    want_coordinated: bool,
-) -> UnifyJoin<'a> {
+/// The per-run inputs the join state borrows: the re-indexed copies of inverted factors and the
+/// per-factor plumbing derived from them. Built BEFORE [`UnifyJoin`] so the held per-factor
+/// zippers can borrow the re-indexed maps — a zipper into a map owned by the state itself would
+/// be a self-reference.
+struct JoinPlan {
+    /// Re-indexed copies of inverted factors; `factor_src[f] = Some(i)` reads `reindexes[i]`.
+    reindexes: Vec<PathMap<()>>,
+    factor_src: Vec<Option<usize>>,
+    /// Per factor, `Some((original_prefix, new_order))` when re-indexed: the original relation
+    /// prefix and the column permutation `build_reindex` applied (`new_order[j]` = original column
+    /// at re-indexed position `j`), enough to reconstruct the stored fact's original bytes at a
+    /// leaf.
+    originals: Vec<Option<(Vec<u8>, Vec<usize>)>>,
+    /// Owned because a re-indexed factor's prefix and columns differ from the input factor's.
+    factors: Vec<Factor>,
+    /// `var_pos[v]` = position of global variable `v` in `var_order`, for the catch-up test.
+    var_pos: Vec<usize>,
+}
+
+/// Build the join's borrowed inputs: re-index inverted factors so the join can seek them in
+/// var_order; a compatible factor keeps its live-map prefix and pays nothing. `factor_src[f]`
+/// selects which map factor `f` reads from.
+fn join_plan(map: &PathMap<()>, factors: &[Factor], var_order: &[usize], nvars: usize) -> JoinPlan {
     let nf = factors.len();
     let mut var_pos = vec![0usize; nvars];
     for (pos, &v) in var_order.iter().enumerate() {
         var_pos[v] = pos;
     }
 
-    // Re-index inverted factors so the join can seek them in var_order; a compatible factor keeps its
-    // live-map prefix and pays nothing. `factor_src[f]` selects which map factor `f` reads from.
     let mut owned: Vec<Factor> = Vec::with_capacity(nf);
     let mut reindexes: Vec<PathMap<()>> = Vec::new();
     let mut factor_src: Vec<Option<usize>> = Vec::with_capacity(nf);
@@ -1068,14 +1123,44 @@ fn join_state<'a>(
         }
     }
 
-    UnifyJoin {
-        map,
+    JoinPlan {
         reindexes,
         factor_src,
         originals,
         factors: owned,
-        var_order,
         var_pos,
+    }
+}
+
+/// Build the join state over a prepared plan without running it. One zipper per factor is opened
+/// HERE, at the factor's relation prefix, and then only descended/ascended in place for the whole
+/// join. When `want_coordinated`, a run also collects each answer as one variable-coordinated
+/// tuple encoding (see [`unify_join_zipper_coordinated`]).
+fn join_state<'a>(
+    map: &'a PathMap<()>,
+    plan: &'a JoinPlan,
+    var_order: &'a [usize],
+    nvars: usize,
+    want_coordinated: bool,
+) -> UnifyJoin<'a> {
+    let nf = plan.factors.len();
+    let cursors = (0..nf)
+        .map(|f| {
+            let src: &'a PathMap<()> = match plan.factor_src[f] {
+                Some(ri) => &plan.reindexes[ri],
+                None => map,
+            };
+            SubtermCursor::new(src.read_zipper_at_path(&plan.factors[f].prefix))
+        })
+        .collect();
+
+    UnifyJoin {
+        map,
+        originals: &plan.originals,
+        factors: &plan.factors,
+        var_order,
+        var_pos: &plan.var_pos,
+        cursors,
         nvars,
         bound: vec![Vec::new(); nf],
         next_col: vec![0; nf],
@@ -1091,16 +1176,17 @@ fn join_state<'a>(
 }
 
 /// Build the join state and run it, collecting answer rows (and coordinated tuples when asked).
-fn run_unify_join<'a>(
-    map: &'a PathMap<()>,
+fn run_unify_join(
+    map: &PathMap<()>,
     factors: &[Factor],
-    var_order: &'a [usize],
+    var_order: &[usize],
     nvars: usize,
     want_coordinated: bool,
-) -> UnifyJoin<'a> {
-    let mut state = join_state(map, factors, var_order, nvars, want_coordinated);
+) -> (BTreeSet<Vec<Option<Vec<u8>>>>, BTreeSet<Vec<u8>>) {
+    let plan = join_plan(map, factors, var_order, nvars);
+    let mut state = join_state(map, &plan, var_order, nvars, want_coordinated);
     state.recurse(0);
-    state
+    (state.out, state.coordinated)
 }
 
 /// Run the join streaming each accepted assignment's per-factor original fact bytes to `on_tuple`
@@ -1112,7 +1198,8 @@ fn run_unify_join_stream(
     nvars: usize,
     on_tuple: &mut dyn FnMut(&[Vec<u8>]) -> bool,
 ) {
-    let mut state = join_state(map, factors, var_order, nvars, false);
+    let plan = join_plan(map, factors, var_order, nvars);
+    let mut state = join_state(map, &plan, var_order, nvars, false);
     state.on_tuple = Some(on_tuple);
     state.recurse(0);
 }
@@ -1850,19 +1937,21 @@ fn hypergraph_is_cyclic(mut edges: Vec<std::collections::BTreeSet<usize>>, nvars
 
 struct UnifyJoin<'a> {
     map: &'a PathMap<()>,
-    /// Re-indexed copies of inverted factors; `factor_src[f] = Some(i)` reads `reindexes[i]`.
-    reindexes: Vec<PathMap<()>>,
-    factor_src: Vec<Option<usize>>,
     /// Per factor, `Some((original_prefix, new_order))` when re-indexed: the original relation
     /// prefix and the column permutation `build_reindex` applied (`new_order[j]` = original column
     /// at re-indexed position `j`), enough to reconstruct the stored fact's original bytes at a
     /// leaf.
-    originals: Vec<Option<(Vec<u8>, Vec<usize>)>>,
-    /// Owned because a re-indexed factor's prefix and columns differ from the input factor's.
-    factors: Vec<Factor>,
+    originals: &'a [Option<(Vec<u8>, Vec<usize>)>],
+    factors: &'a [Factor],
     var_order: &'a [usize],
     /// `var_pos[v]` = position of global variable `v` in `var_order`, for the catch-up test.
-    var_pos: Vec<usize>,
+    var_pos: &'a [usize],
+    /// One HELD cursor per factor, opened once (in `join_state`) at the factor's relation prefix
+    /// on its source map (the live map, or its re-indexed copy borrowed from the plan). Every
+    /// probe reads it in place, and `with_bound_path_bytes` descends/ascends it in lockstep with
+    /// `bound[f]`, so the cursor's floor always sits at prefix+bound and no probe pays an
+    /// O(path) re-descent from the trie root.
+    cursors: Vec<SubtermCursor<ReadZipperUntracked<'a, 'static, ()>>>,
     nvars: usize,
     bound: Vec<Vec<u8>>,
     next_col: Vec<usize>,
@@ -1953,17 +2042,16 @@ impl UnifyJoin<'_> {
         // The leapfrog principle: lead with the smallest domain so the leading factor enumerates
         // few candidates and the rest seek. A bounded subterm count under each factor's current
         // position is the estimate. This is what makes a selective factor, say (e a $y) with a few
-        // edges, drive the join instead of the whole relation.
-        parts.sort_by_key(|&f| self.domain_estimate(f));
+        // edges, drive the join instead of the whole relation. Estimates are precomputed (the held
+        // cursors make `domain_estimate` `&mut self`); the stable sort on them keys exactly as
+        // `sort_by_key(domain_estimate)` did, so the lead choice and visit order are unchanged.
+        let mut keyed: Vec<(usize, usize)> = parts
+            .iter()
+            .map(|&f| (self.domain_estimate(f), f))
+            .collect();
+        keyed.sort_by_key(|&(estimate, _)| estimate);
+        parts = keyed.into_iter().map(|(_, f)| f).collect();
         self.consume_var_parts(&parts, 0, v, i);
-    }
-
-    /// The map factor `f` reads from: its re-indexed copy if it was inverted, else the live map.
-    fn src_map(&self, f: usize) -> &PathMap<()> {
-        match self.factor_src[f] {
-            Some(ri) => &self.reindexes[ri],
-            None => self.map,
-        }
     }
 
     /// Domain-size estimate for lead selection, bounded so it is independent of the space size.
@@ -1971,17 +2059,17 @@ impl UnifyJoin<'_> {
     /// cap. The leapfrog only needs to know which factor has the fewest candidates, not the exact
     /// count, so a bounded count suffices and stays O(cap). A full `val_count` is O(subtree), which
     /// would make a selective join's cost climb with the whole relation rather than the answer.
-    fn domain_estimate(&self, f: usize) -> usize {
+    /// Enumerates on the held cursor (already at prefix+bound) and restores it to the floor.
+    fn domain_estimate(&mut self, f: usize) -> usize {
         const CAP: usize = 32;
-        let mut path = self.factors[f].prefix.clone();
-        path.extend_from_slice(&self.bound[f]);
-        let mut cur = SubtermCursor::new(self.src_map(f).read_zipper_at_path(&path));
+        let cur = &mut self.cursors[f];
         cur.first();
         let mut n = 0;
         while !cur.at_end() && n < CAP {
             n += 1;
             cur.next();
         }
+        cur.reset_to_floor();
         n
     }
 
@@ -2025,33 +2113,31 @@ impl UnifyJoin<'_> {
         if self.next_col[f] != self.factors[f].cols.len() {
             return false;
         }
-        let path = self.factor_path(f);
-        self.src_map(f).read_zipper_at_path(&path).val().is_some()
+        self.cursors[f].has_value()
     }
 
     /// The candidates at factor `f`'s current column when a query variable is still free.
-    fn open_free_candidates(&self, f: usize) -> Vec<Vec<u8>> {
-        let path = self.factor_path(f);
-        let mut cur = SubtermCursor::new(self.src_map(f).read_zipper_at_path(&path));
-        free_candidates(&mut cur)
+    /// Enumerates on the held cursor; exhaustion leaves it back at the column floor.
+    fn open_free_candidates(&mut self, f: usize) -> Vec<Vec<u8>> {
+        let cur = &mut self.cursors[f];
+        let out = free_candidates(cur);
+        cur.reset_to_floor();
+        out
     }
 
     /// The candidates at factor `f`'s current ground column that can unify with the fixed query
     /// value. A data-side wildcard captures that ground value and keeps its stored slot for later
-    /// VarRef columns in the same fact.
-    fn open_ground_candidates(&self, f: usize, ground: &[u8]) -> Vec<Vec<u8>> {
-        let path = self.factor_path(f);
-        let mut cur = SubtermCursor::new(self.src_map(f).read_zipper_at_path(&path));
-        ground_candidates(&mut cur, ground)
+    /// VarRef columns in the same fact. The held cursor is restored to the column floor (the
+    /// wildcard scan can stop mid-subterm).
+    fn open_ground_candidates(&mut self, f: usize, ground: &[u8]) -> Vec<Vec<u8>> {
+        let cur = &mut self.cursors[f];
+        let out = ground_candidates(cur, ground);
+        cur.reset_to_floor();
+        out
     }
 
     fn child_bytes_at_current(&self, f: usize) -> Vec<u8> {
-        let path = self.factor_path(f);
-        self.src_map(f)
-            .read_zipper_at_path(&path)
-            .child_mask()
-            .iter()
-            .collect()
+        self.cursors[f].floor_child_mask().iter().collect()
     }
 
     fn wildcard_children_at_current(&self, f: usize) -> Vec<u8> {
@@ -2062,11 +2148,7 @@ impl UnifyJoin<'_> {
     }
 
     fn child_exists_at_current(&self, f: usize, b: u8) -> bool {
-        let path = self.factor_path(f);
-        self.src_map(f)
-            .read_zipper_at_path(&path)
-            .child_mask()
-            .test_bit(b)
+        self.cursors[f].floor_child_mask().test_bit(b)
     }
 
     fn factor_namespace(&self, f: usize) -> u8 {
@@ -2280,7 +2362,17 @@ impl UnifyJoin<'_> {
         let intro = self.data_intro[f];
         self.bound[f].extend_from_slice(bytes);
         self.data_intro[f] += intro_delta;
+        // The held cursor mirrors `bound[f]` byte for byte: descend the fragment in place on
+        // entry, ascend it on exit, so its floor is always at prefix+bound with no root re-open.
+        self.cursors[f].descend_raw(bytes);
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            self.cursors[f].floor_len(),
+            self.bound[f].len(),
+            "held cursor drifted from prefix+bound"
+        );
         cont(self);
+        self.cursors[f].ascend_raw(bytes.len());
         self.data_intro[f] = intro;
         self.bound[f].truncate(len);
     }
