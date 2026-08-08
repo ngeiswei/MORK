@@ -1849,11 +1849,20 @@ impl ExprEnv {
 pub enum UnificationFailure {
     Occurs(ExprVar, ExprEnv),
     Difference(ExprEnv, ExprEnv),
+    /// No longer produced: the iteration budget that raised this is now the
+    /// [`max_unify_iterations`] statistic. Kept so existing matches stay exhaustive.
     MaxIter(u32)
 }
 
 const APPLY_DEPTH: u32 = 64;
-const MAX_UNIFY_ITER: u32 = 1000;
+
+/// The deepest per-call iteration count [`unify`] has reached in this process, in the style of the
+/// kernel's `transitions`/`unifications` counters. This replaces the former `MAX_UNIFY_ITER = 1000`
+/// abort, which was a debugging guard that had become an answer-dropping cutoff: a conjunctive body
+/// whose total structure exceeded it (roughly one iteration per pattern node -- reachable at ~55
+/// conjuncts of depth 16, or one conjunct nested ~1200 deep) lost real matches with no diagnostic.
+/// Reported by the CLI so the figure that used to be a silent limit is now visible.
+pub static mut max_unify_iterations: u32 = 0;
 const PRINT_DEBUG: bool = false;
 #[deprecated]
 #[inline(never)]
@@ -1970,7 +1979,22 @@ pub fn apply(n: u8, mut original_intros: u8, mut new_intros: u8, ez: &mut ExprZi
 #[inline(never)]
 pub fn unify(mut stack: &mut Vec<(ExprEnv, ExprEnv)>) -> Result<BTreeMap<ExprVar, ExprEnv>, UnificationFailure> {
     let mut bindings: BTreeMap<ExprVar, ExprEnv> = BTreeMap::new();
-    let mut iterations = 0;
+    // Counts this call's iterations locally and folds the result into
+    // [`max_unify_iterations`] exactly once, on the way out. A `Drop` guard rather than an
+    // update at each `return`, so every exit path (Occurs, Difference, Ok) is covered and
+    // the loop itself stays a plain increment.
+    struct IterationHighWater(u32);
+    impl Drop for IterationHighWater {
+        fn drop(&mut self) {
+            unsafe {
+                if self.0 > max_unify_iterations {
+                    max_unify_iterations = self.0;
+                }
+            }
+        }
+    }
+    let mut iter_stat = IterationHighWater(0);
+    let iterations = &mut iter_stat.0;
     let mut encountered: gxhash::HashSet<(ExprEnv, ExprEnv)> = gxhash::HashSet::new();
 
     macro_rules! step {
@@ -2053,10 +2077,13 @@ pub fn unify(mut stack: &mut Vec<(ExprEnv, ExprEnv)>) -> Result<BTreeMap<ExprVar
             println!();
         }
 
-        if iterations > MAX_UNIFY_ITER { 
-            return Err(UnificationFailure::MaxIter(iterations))
-        }
-        iterations += 1;
+        // No budget check here any more: the former `MAX_UNIFY_ITER` abort silently dropped
+        // genuine matches, since unification is only reached on a candidate the search has
+        // already accepted, so a pattern whose total structure exceeded it lost real answers
+        // size-dependently and without any diagnostic. Termination never rested on it -- the
+        // occurs check and the `encountered` set bound the search -- so the budget only hid
+        // how far unification had to go. The guard above records that instead.
+        *iterations += 1;
         if PRINT_DEBUG {
             println!("popping");
             // println!("x: {}, sx : {:?}", xpop.show(), sx.len());
