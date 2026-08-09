@@ -849,6 +849,44 @@ f
     assert!(res.contains("OK\n"));
 }
 
+/// A conjunct that is a bare top-level SYMBOL, the ground counterpart of `top_level_match`'s bare
+/// variable. `query_multi` matches each conjunct against a whole fact, so a symbol conjunct is an
+/// existence check on that atom: the body fires once per match of its other conjuncts when the
+/// symbol is present, and never when it is absent.
+///
+/// It is also the shape the leapfrog join declines. A join factor is a relation of known arity
+/// decomposed into columns it can seek; a bare symbol is an `Arity`-less atom with no columns, so
+/// there is no factor to build and the body stays on the ProductZipper. This test therefore pins
+/// the semantics and covers that fallback, and must hold with or without the `leapfrog` feature.
+fn top_level_symbol() {
+    let mut s = Space::new();
+
+    const SPACE_EXPRS: &str = r#"
+(e a b)
+(e b c)
+present
+(exec 0 (, (e $x $y) present) (, (yes $x $y)))
+(exec 1 (, (e $x $y) absent) (, (no $x $y)))
+    "#;
+
+    s.add_all_sexpr(SPACE_EXPRS.as_bytes()).unwrap();
+
+    let t0 = Instant::now();
+    let steps = s.metta_calculus(1000000000000000);
+    println!("elapsed {} steps {} size {}", t0.elapsed().as_millis(), steps, s.btm.val_count());
+
+    let mut v = vec![];
+    s.dump_all_sexpr(&mut v).unwrap();
+    let res = String::from_utf8_lossy_owned(v);
+
+    println!("result: {res}");
+    // `present` is in the space, so the conjunct holds and every edge fires.
+    assert!(res.contains("(yes a b)\n"), "present symbol must let the body fire");
+    assert!(res.contains("(yes b c)\n"), "present symbol must let the body fire");
+    // `absent` is not, so that body never fires despite its other conjunct matching.
+    assert!(!res.contains("(no "), "absent symbol must block the body");
+}
+
 fn bench_lr() {
     let mut s = Space::new();
 
@@ -6209,6 +6247,7 @@ fn main() {
             coref_absorbed_by_data_varref();
             data_varref_absorbs_query_compound_newvars();
             top_level_match();
+            top_level_symbol();
             large_statement();
 
             process_calculus_reverse();
