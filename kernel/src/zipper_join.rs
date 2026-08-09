@@ -1252,46 +1252,37 @@ pub fn query_multi_leapfrog<F: FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>
     if !leapfrog_enabled() {
         return None;
     }
-    catch_unwind(AssertUnwindSafe(|| {
-        let body = unsafe { pat_expr.span().as_ref().unwrap() };
-        let (factors, nvars) = parse_body_factors(body)?;
-        if !body_factors_routable_to_zipper_join(&factors) {
-            return None;
-        }
-        let var_order: Vec<usize> = (0..nvars).collect();
-        #[cfg(debug_assertions)]
-        {
-            // The factor count the stock path would pair up (`pat_args[1..]`, the conjunction's
-            // arguments) is the parsed factor count; the per-factor data namespaces `1 + f` line
-            // up with it positionally.
-            let mut pat_args = Vec::new();
-            ExprEnv::new(0, pat_expr).args(&mut pat_args);
-            debug_assert_eq!(pat_args.len() - 1, factors.len());
-        }
-        let mut candidate = 0usize;
-        let mut on_match = |bindings: &Bindings, loc: Expr| -> bool {
-            unsafe { crate::space::unifications += 1 };
-            candidate += 1;
-            // `effect` owns its map, so hand it a copy of the join's; the join keeps solving from
-            // the original as the recursion unwinds. A handful of entries per answer, against the
-            // whole-tuple re-unification (plus a fact rebuild per factor) this replaces.
-            effect(Err(bindings.clone()), loc)
-        };
-        run_unify_join_stream_bindings(map, &factors, &var_order, nvars, &mut on_match);
-        Some(candidate)
-    }))
-    .ok()
-    .flatten()
+    let body = unsafe { pat_expr.span().as_ref().unwrap() };
+    // PRECONDITION: the caller has already settled the degenerate arities, so a body that parses
+    // at all yields at least one factor. `None` here means only that the body is not a
+    // well-formed conjunction of relation-prefixed conjuncts -- a malformed or truncated term, a
+    // conjunct that is not a compound, a `VarRef` naming a variable that was never introduced --
+    // which the ProductZipper handles instead.
+    let (factors, nvars) = parse_body_factors(body)?;
+    debug_assert!(!factors.is_empty(), "caller must settle bodies with no conjunct");
+    let var_order: Vec<usize> = (0..nvars).collect();
+    #[cfg(debug_assertions)]
+    {
+        // The factor count the stock path would pair up (`pat_args[1..]`, the conjunction's
+        // arguments) is the parsed factor count; the per-factor data namespaces `1 + f` line
+        // up with it positionally.
+        let mut pat_args = Vec::new();
+        ExprEnv::new(0, pat_expr).args(&mut pat_args);
+        debug_assert_eq!(pat_args.len() - 1, factors.len());
+    }
+    let mut candidate = 0usize;
+    let mut on_match = |bindings: &Bindings, loc: Expr| -> bool {
+        unsafe { crate::space::unifications += 1 };
+        candidate += 1;
+        // `effect` owns its map, so hand it a copy of the join's; the join keeps solving from
+        // the original as the recursion unwinds. A handful of entries per answer, against the
+        // whole-tuple re-unification (plus a fact rebuild per factor) this replaces.
+        effect(Err(bindings.clone()), loc)
+    };
+    run_unify_join_stream_bindings(map, &factors, &var_order, nvars, &mut on_match);
+    Some(candidate)
 }
 
-/// The join owns every nonempty relation-prefixed conjunction: each column carries full
-/// `mork_expr::unify` with data-side capture, and an assignment that closes a cycle is rejected at
-/// emit, so no query or fact shape needs a decline. The check is parse-level and reads nothing
-/// from the map. The per-column byte-level union-find this gate once scanned facts for is gone;
-/// its boundary (`nonflat_uf_unsound`) constrained that mechanism, not this one.
-fn body_factors_routable_to_zipper_join(factors: &[Factor]) -> bool {
-    !factors.is_empty()
-}
 
 
 

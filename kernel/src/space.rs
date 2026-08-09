@@ -1017,9 +1017,16 @@ impl Space {
     /// space-to-space transform dispatches: interpreted sources and sinks and the pattern-directed
     /// dumps keep the stock path and its enumeration order.
     pub fn query_multi_dispatch<F : FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(btm: &PathMap<()>, pat_expr: Expr, mut effect: F) -> usize {
+        // A body is `(, p1 .. pk)`, so its arity is `k + 1`. The degenerate arities -- a
+        // non-compound body, and the bare `(,)` with no conjunct -- are settled here rather than
+        // inside the join, which makes "at least one conjunct" the join's precondition instead of
+        // something it has to re-check. Both currently take the ProductZipper; nothing stops them
+        // moving to the join later.
         #[cfg(feature = "leapfrog")]
-        if let Some(touched) = crate::zipper_join::query_multi_leapfrog(btm, pat_expr, &mut effect) {
-            return touched;
+        if pat_expr.arity().is_some_and(|arity| arity >= 2) {
+            if let Some(touched) = crate::zipper_join::query_multi_leapfrog(btm, pat_expr, &mut effect) {
+                return touched;
+            }
         }
         Self::query_multi(btm, pat_expr, effect)
     }
