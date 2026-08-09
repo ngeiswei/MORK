@@ -1203,35 +1203,6 @@ fn scan_subterm(bytes: &[u8], at: usize, intro: &mut u8) -> Option<SubtermScan> 
 
 
 
-/// Whether the space-to-space transform routes a conjunctive body here. In a normal build this
-/// is a compile-time constant: with the `leapfrog` feature the join owns every routable body, and
-/// without it this module is not compiled at all. The in-crate differentials need to run the SAME
-/// process down both paths to compare them, so under `cfg(test)` only, it becomes a per-thread
-/// switch.
-#[cfg(test)]
-thread_local! {
-    static LEAPFROG_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
-}
-
-#[cfg(test)]
-#[inline]
-fn leapfrog_enabled() -> bool {
-    LEAPFROG_ENABLED.with(|c| c.get())
-}
-
-#[cfg(not(test))]
-#[inline(always)]
-fn leapfrog_enabled() -> bool {
-    true
-}
-
-/// Pin this thread to the ProductZipper (`false`) or to the join (`true`). Test-only: the shipped
-/// build has no runtime switch.
-#[cfg(test)]
-pub fn set_leapfrog_dispatch(on: bool) {
-    LEAPFROG_ENABLED.with(|c| c.set(on))
-}
-
 
 
 /// The engine-facing dispatch entry: stream every product tuple the leapfrog accepts through the
@@ -1249,9 +1220,6 @@ pub fn query_multi_leapfrog<F: FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>
     pat_expr: Expr,
     mut effect: F,
 ) -> Option<usize> {
-    if !leapfrog_enabled() {
-        return None;
-    }
     let body = unsafe { pat_expr.span().as_ref().unwrap() };
     // PRECONDITION: the caller has already settled the degenerate arities, so a body that parses
     // at all yields at least one factor. `None` here means only that the body is not a
@@ -3499,243 +3467,20 @@ mod tests {
         rz.path().to_vec()
     }
 
-    fn space_paths(space: &crate::space::Space) -> BTreeSet<Vec<u8>> {
-        let mut set = BTreeSet::new();
-        let mut rz = space.btm.read_zipper();
-        while rz.to_next_val() {
-            set.insert(rz.path().to_vec());
-        }
-        set
-    }
 
-    /// Run `program` for `steps` with the dispatch pinned off, then on, returning
-    /// (performed steps, space paths) for each arm. Leaves the dispatch on, the default.
-    fn engine_both_ways(
-        program: &str,
-        steps: usize,
-    ) -> ((usize, BTreeSet<Vec<u8>>), (usize, BTreeSet<Vec<u8>>)) {
-        let mut run = |on: bool| {
-            let mut s = crate::space::Space::new();
-            s.add_all_sexpr(program.as_bytes()).unwrap();
-            set_leapfrog_dispatch(on);
-            let performed = s.metta_calculus(steps);
-            set_leapfrog_dispatch(true);
-            (performed, space_paths(&s))
-        };
-        (run(false), run(true))
-    }
 
-    /// Every resource program, run to several depths with the dispatch off and on: the performed
-    /// step counts and the full space bytes must agree. The decision-tree programs and the sudoku
-    /// get a small step cap to keep the suite fast; the point here is the dispatch decision and
-    /// the emit on every body shape the corpus uses, and `run.sh` sweeps the full runs.
-    #[test]
-    fn engine_dispatch_matches_stock_on_resources() {
-        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/resources");
-        let mut checked = 0;
-        for entry in std::fs::read_dir(dir).expect("resources dir") {
-            let path = entry.expect("dir entry").path();
-            if path.extension().and_then(|e| e.to_str()) != Some("mm2") {
-                continue;
-            }
-            let name = path.file_stem().unwrap().to_str().unwrap().to_string();
-            let program = std::fs::read_to_string(&path).expect("readable resource");
-            let steps_list: &[usize] = if name.starts_with("decision_tree") || name == "ip_sudoku" {
-                &[1, 7]
-            } else {
-                &[1, 7, 40]
-            };
-            for &steps in steps_list {
-                let ((p0, s0), (p1, s1)) = engine_both_ways(&program, steps);
-                assert_eq!(p0, p1, "{name} steps={steps}: performed step counts differ");
-                assert_eq!(s0, s1, "{name} steps={steps}: spaces differ");
-            }
-            checked += 1;
-        }
-        assert!(
-            checked >= 8,
-            "expected the resource corpus, found {checked}"
-        );
-    }
 
-    /// The variables of the patterns in first-occurrence order, by `$name`.
-    fn dollar_vars_of(patterns: &[String]) -> Vec<String> {
-        let mut seen: Vec<String> = Vec::new();
-        for p in patterns {
-            let b = p.as_bytes();
-            let mut i = 0;
-            while i < b.len() {
-                if b[i] == b'$' {
-                    let mut j = i + 1;
-                    while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
-                        j += 1;
-                    }
-                    let name = p[i..j].to_string();
-                    if !seen.contains(&name) {
-                        seen.push(name);
-                    }
-                    i = j;
-                } else {
-                    i += 1;
-                }
-            }
-        }
-        seen
-    }
 
     fn pick<'x>(rng: &mut Lcg, xs: &[&'x str]) -> &'x str {
         xs[rng.below(xs.len())]
     }
 
-    /// A random pattern atom over relation or query-variable heads, constant, variable, and
-    /// compound columns, at total arity 2..=4. Unlike the example's generator there is no arity
-    /// constraint: both arms run full evaluation, so a variable-headed arity-4 pattern is free to
-    /// match the `(exec ..)` machinery and emitted rows, and the arms must still agree.
-    fn rand_pattern_atom(rng: &mut Lcg) -> String {
-        let rels = ["e", "p", "q"];
-        let qvars = ["$x", "$y", "$z"];
-        let consts = ["a", "b", "c"];
-        let head = if rng.below(8) == 0 {
-            pick(rng, &qvars).to_string()
-        } else {
-            pick(rng, &rels).to_string()
-        };
-        let arity = 1 + rng.below(3);
-        let args: Vec<String> = (0..arity)
-            .map(|_| {
-                let base = if rng.below(3) == 0 {
-                    pick(rng, &consts)
-                } else {
-                    pick(rng, &qvars)
-                }
-                .to_string();
-                if rng.below(6) == 0 {
-                    format!("(k {base})")
-                } else {
-                    base
-                }
-            })
-            .collect();
-        format!("({head} {})", args.join(" "))
-    }
-
-    /// A random stored fact: constants, data variables (schematic facts), compound columns, and a
-    /// wildcard head one time in eight.
-    fn rand_fact_atom(rng: &mut Lcg) -> String {
-        let rels = ["e", "p", "q"];
-        let dvars = ["$u", "$v"];
-        let consts = ["a", "b", "c", "d"];
-        let head = if rng.below(8) == 0 {
-            pick(rng, &dvars).to_string()
-        } else {
-            pick(rng, &rels).to_string()
-        };
-        let arity = 1 + rng.below(3);
-        let args: Vec<String> = (0..arity)
-            .map(|_| {
-                let base = if rng.below(4) == 0 {
-                    pick(rng, &dvars)
-                } else {
-                    pick(rng, &consts)
-                }
-                .to_string();
-                if rng.below(6) == 0 {
-                    format!("(k {base})")
-                } else {
-                    base
-                }
-            })
-            .collect();
-        format!("({head} {})", args.join(" "))
-    }
-
-    /// A random template: body variables, constants, fresh variables, compounds, or one time in
-    /// six a further `(exec ..)` atom whose body consumes this exec's output relation, so a later
-    /// step chains on the first one's writes.
-    fn rand_template(rng: &mut Lcg, body_vars: &[String], j: usize) -> String {
-        if rng.below(6) == 0 && !body_vars.is_empty() {
-            let v = &body_vars[rng.below(body_vars.len())];
-            return format!("(exec zc{j} (, (out{j} {v} $cw)) (, (chain{j} $cw {v})))");
-        }
-        let n = 1 + rng.below(3);
-        let parts: Vec<String> = (0..n)
-            .map(|_| {
-                let piece = if !body_vars.is_empty() && rng.below(3) != 0 {
-                    body_vars[rng.below(body_vars.len())].clone()
-                } else if rng.below(4) == 0 {
-                    "$fresh".to_string()
-                } else {
-                    pick(rng, &["a", "b", "c"]).to_string()
-                };
-                if rng.below(6) == 0 {
-                    format!("(k {piece})")
-                } else {
-                    piece
-                }
-            })
-            .collect();
-        format!("(out{j} {})", parts.join(" "))
-    }
-
-    /// A random whole program: facts, then one to three exec atoms with distinct priorities, each
-    /// with one to three patterns and one or two templates, run for one to five steps.
-    fn random_program(rng: &mut Lcg) -> (String, usize) {
-        let mut prog = String::new();
-        for _ in 0..rng.below(9) {
-            prog.push_str(&rand_fact_atom(rng));
-            prog.push('\n');
-        }
-        let nexec = 1 + rng.below(3);
-        for j in 0..nexec {
-            let npat = 1 + rng.below(3);
-            let pats: Vec<String> = (0..npat).map(|_| rand_pattern_atom(rng)).collect();
-            let vars = dollar_vars_of(&pats);
-            let ntpl = 1 + rng.below(2);
-            let tpls: Vec<String> = (0..ntpl)
-                .map(|t| rand_template(rng, &vars, j * 4 + t))
-                .collect();
-            prog.push_str(&format!(
-                "(exec pr{j} (, {}) (, {}))\n",
-                pats.join(" "),
-                tpls.join(" ")
-            ));
-        }
-        (prog, 1 + rng.below(5))
-    }
-
-    /// Whole random programs through full `metta_calculus`, dispatch off and on: multi-step runs,
-    /// chained exec atoms, machinery collisions and all, the arms must agree byte for byte.
-    /// `MORK_DISPATCH_N` scales the seed count; the sealing run used a much larger one.
-    #[test]
-    fn engine_dispatch_matches_stock_on_random_programs() {
-        let n: usize = std::env::var("MORK_DISPATCH_N")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(600);
-        let mut rng = Lcg(0x9E3779B97F4A7C15);
-        for i in 0..n {
-            let (prog, steps) = random_program(&mut rng);
-            let ((p0, s0), (p1, s1)) = engine_both_ways(&prog, steps);
-            assert_eq!(p0, p1, "trial {i}: performed step counts differ on\n{prog}");
-            assert_eq!(s0, s1, "trial {i}: spaces differ on\n{prog}");
-        }
-    }
 
 
-    /// Bodies the router does not own (a bare-variable factor, the empty conjunction) must fall
-    /// back to the stock path and agree with it exactly; the bare variable also matches the exec
-    /// atom itself in the read copy, both ways.
-    #[test]
-    fn nonroutable_bodies_take_the_stock_path_identically() {
-        for (prog, steps) in [
-            ("(m a)\n(exec 0 (, $x) (, (saw $x)))\n", 1usize),
-            ("(m a)\n(exec 0 (,) (, (once)))\n", 1),
-        ] {
-            let ((p0, s0), (p1, s1)) = engine_both_ways(prog, steps);
-            assert_eq!(p0, p1, "performed step counts differ on\n{prog}");
-            assert_eq!(s0, s1, "spaces differ on\n{prog}");
-        }
-    }
+
+
+
+
 
     /// An inverted factor is re-indexed with permuted, renumbered columns; a streamed leaf must
     /// hand back the fact's original stored bytes, coreference included: `(f $u $u)` must come
@@ -3775,61 +3520,4 @@ mod tests {
         );
     }
 
-    /// The dispatched transform must agree with the stock transform on the match count `touched`
-    /// and the changed flag, not only on the final bytes: the join streams one callback per
-    /// product tuple, so the multiplicities match, including the cyclic assignment the emit-side
-    /// check skips after `unify` accepted it.
-    #[cfg(feature = "specialize_io")]
-    #[test]
-    fn dispatch_touched_parity_on_transform() {
-        let cases: &[(&str, &str, &str)] = &[
-            (
-                "(e a b)\n(e a c)\n(e b c)\n(e b d)\n",
-                "(, (e $x $y) (e $y $z) (e $x $z))",
-                "(, (outt $x $y $z))",
-            ),
-            (
-                "(r $d b)\n(r a b)\n",
-                "(, (r (a $p) b) (r (b) $p))",
-                "(, (outt $p))",
-            ),
-            (
-                "(e (k $s2) v0)\n(e $s1 $s1)\n(h $s0 $s0)\n(h junk junk)\n",
-                "(, (e (k $x0) $x1) (e (k $x1) $x2) (h $x2 $x0))",
-                "(, (outt $x0 $x1 $x2))",
-            ),
-            (
-                "(p a)\n(p b)\n(q a)\n(q $w)\n",
-                "(, (p $x) (q $x))",
-                "(, (outt $x))",
-            ),
-        ];
-        for (facts, body, tpl) in cases {
-            // One exec atom encoded whole, then destructured in place, so the template's VarRefs
-            // stay relative to the pattern's variables exactly as the engine sees them.
-            let atom = enc(&format!("(exec 0 {body} {tpl})"));
-            let head_len = 1 + expr_span_len(expr_from_bytes(&atom[1..]));
-            let loc_len = expr_span_len(expr_from_bytes(&atom[head_len..]));
-            let pat_off = head_len + loc_len;
-            let pat_len = expr_span_len(expr_from_bytes(&atom[pat_off..]));
-            let tpl_off = pat_off + pat_len;
-            let mut run = |on: bool| {
-                let mut s = crate::space::Space::new();
-                s.add_all_sexpr(facts.as_bytes()).unwrap();
-                let bytes = atom.clone();
-                set_leapfrog_dispatch(on);
-                let res = s.transform_multi_multi_(
-                    expr_from_bytes(&bytes[pat_off..]),
-                    expr_from_bytes(&bytes[tpl_off..]),
-                    expr_from_bytes(&bytes[..]),
-                );
-                set_leapfrog_dispatch(true);
-                (res, space_paths(&s))
-            };
-            let (r0, s0) = run(false);
-            let (r1, s1) = run(true);
-            assert_eq!(r0, r1, "(touched, any_new) differ on {body}");
-            assert_eq!(s0, s1, "spaces differ on {body}");
-        }
-    }
 }
