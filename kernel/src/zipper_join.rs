@@ -429,18 +429,23 @@ type Bindings = BTreeMap<BindingKey, ExprEnv>;
 /// The bytes stay in MORK's native encoding; unification and substitution operate through
 /// [`ExprEnv`] views over them.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EncodedTerm {
-    pub bytes: Vec<u8>,
+pub struct EncodedTerm<'a> {
+    /// Borrowed straight out of the body being evaluated. The body outlives the join, so a plan
+    /// never copies term bytes.
+    pub bytes: &'a [u8],
     pub intro: u8,
+    /// Bitmask of the query variables this term mentions, filled in by the single parse scan so
+    /// groundness and variable-position queries need no further traversal.
+    vars: u64,
+    /// Set when a variable id >= 64 occurs, which the mask cannot represent; the affected queries
+    /// then fall back to a walk. MORK's parser caps an expression at 63 variables, so in practice
+    /// this never trips.
+    wide: bool,
 }
 
-impl EncodedTerm {
-    fn new(bytes: Vec<u8>, intro: u8) -> Self {
-        EncodedTerm { bytes, intro }
-    }
-
+impl<'a> EncodedTerm<'a> {
     fn expr(&self) -> Expr {
-        expr_from_bytes(&self.bytes)
+        expr_from_bytes(self.bytes)
     }
 
     fn tag(&self) -> Tag {
@@ -448,7 +453,7 @@ impl EncodedTerm {
     }
 
     fn is_ground(&self) -> bool {
-        expr_is_ground(self.expr())
+        self.vars == 0 && !self.wide
     }
 
     fn is_nonground_compound(&self) -> bool {
@@ -456,19 +461,30 @@ impl EncodedTerm {
     }
 
     fn min_var_pos(&self, var_pos: &[usize]) -> Option<usize> {
-        min_var_pos_in_expr(self.expr(), self.intro, var_pos)
+        if self.wide {
+            return min_var_pos_in_expr(self.expr(), self.intro, var_pos);
+        }
+        let mut best: Option<usize> = None;
+        let mut m = self.vars;
+        while m != 0 {
+            let v = m.trailing_zeros() as usize;
+            m &= m - 1;
+            let pos = var_pos[v];
+            best = Some(best.map_or(pos, |b: usize| b.min(pos)));
+        }
+        best
     }
 }
 
 /// One query argument column in a factor. Top-level variables are exposed so the leapfrog order can
 /// seek them directly; every structured or ground column stays as native encoded bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum FactorColumn {
+pub enum FactorColumn<'a> {
     Var(usize),
-    Term(EncodedTerm),
+    Term(EncodedTerm<'a>),
 }
 
-impl FactorColumn {
+impl<'a> FactorColumn<'a> {
     fn min_var_pos(&self, var_pos: &[usize]) -> Option<usize> {
         match self {
             FactorColumn::Var(v) => Some(var_pos[*v]),
@@ -489,18 +505,11 @@ impl FactorColumn {
 /// wildcard stored head). Ground columns stay columns so they can unify with stored data variables
 /// at their trie position.
 #[derive(Clone, Debug)]
-pub struct Factor {
-    pub prefix: Vec<u8>,
-    pub cols: Vec<FactorColumn>,
-}
-
-impl Factor {
-    pub fn var_cols(prefix: Vec<u8>, cols: Vec<usize>) -> Self {
-        Factor {
-            prefix,
-            cols: cols.into_iter().map(FactorColumn::Var).collect(),
-        }
-    }
+pub struct Factor<'a> {
+    /// The relation's seek prefix: the conjunct's arity byte, borrowed from the body (empty for a
+    /// re-indexed factor, whose columns were permuted into a private map).
+    pub prefix: &'a [u8],
+    pub cols: Vec<FactorColumn<'a>>,
 }
 
 fn expr_from_bytes(bytes: &[u8]) -> Expr {
@@ -526,7 +535,7 @@ fn expr_is_ground(expr: Expr) -> bool {
     }
 }
 
-fn expr_children(term: &EncodedTerm) -> Option<Vec<EncodedTerm>> {
+fn expr_children<'a>(term: &EncodedTerm<'a>) -> Option<Vec<EncodedTerm<'a>>> {
     let Tag::Arity(arity) = term.tag() else {
         return None;
     };
@@ -534,22 +543,18 @@ fn expr_children(term: &EncodedTerm) -> Option<Vec<EncodedTerm>> {
     if arity == 0 {
         return Some(children);
     }
-    let mut ez = ExprZipper::new(term.expr());
     let mut intro = term.intro;
+    let mut pos = 1usize;
     for _ in 0..arity {
-        if !ez.next_child() {
-            return None;
-        }
-        let child_expr = ez.subexpr();
-        let len = expr_span_len(child_expr);
-        let start = ez.loc;
-        let child_bytes = term.bytes.get(start..start + len)?.to_vec();
-        children.push(EncodedTerm::new(child_bytes, intro));
-        let next_intro = intro as usize + child_expr.newvars();
-        if next_intro > u8::MAX as usize {
-            return None;
-        }
-        intro = next_intro as u8;
+        let child_intro = intro;
+        let scan = scan_subterm(term.bytes, pos, &mut intro)?;
+        children.push(EncodedTerm {
+            bytes: term.bytes.get(pos..pos + scan.len)?,
+            intro: child_intro,
+            vars: scan.vars,
+            wide: scan.wide,
+        });
+        pos += scan.len;
     }
     Some(children)
 }
@@ -766,13 +771,13 @@ fn reindex_regions(map: &PathMap<()>, factor: &Factor) -> Option<Vec<Vec<u8>>> {
     // Only the head's first subterm is what the join matches; ignore any trailing bytes.
     let hlen = try_parse_first_subterm(&head.bytes)?.0;
     let mut regions = Vec::new();
-    let mut ground = factor.prefix.clone();
+    let mut ground = factor.prefix.to_vec();
     ground.extend_from_slice(&head.bytes[..hlen]);
     regions.push(ground);
-    let mask = map.read_zipper_at_path(&factor.prefix).child_mask();
+    let mask = map.read_zipper_at_path(factor.prefix).child_mask();
     for w in mask.iter() {
         if is_wildcard_term(&[w]) {
-            let mut wild = factor.prefix.clone();
+            let mut wild = factor.prefix.to_vec();
             wild.push(w);
             regions.push(wild);
         }
@@ -819,11 +824,11 @@ fn fold_region_into_reindex(
 ///
 /// The walk is scoped to the factor's OWN relation whenever [`reindex_regions`] can prove that
 /// sound, instead of re-materializing every same-arity fact in the space.
-fn build_reindex(
+fn build_reindex<'a>(
     map: &PathMap<()>,
-    factor: &Factor,
+    factor: &Factor<'a>,
     var_pos: &[usize],
-) -> (PathMap<()>, Vec<FactorColumn>, Vec<usize>) {
+) -> (PathMap<()>, Vec<FactorColumn<'a>>, Vec<usize>) {
     let ncols = factor.cols.len();
     let mut new_order: Vec<usize> = (0..ncols).collect();
     new_order.sort_by_key(|&c| match &factor.cols[c] {
@@ -838,7 +843,7 @@ fn build_reindex(
 
     let mut reindex = PathMap::<()>::new();
     let plen = factor.prefix.len();
-    let regions = reindex_regions(map, factor).unwrap_or_else(|| vec![factor.prefix.clone()]);
+    let regions = reindex_regions(map, factor).unwrap_or_else(|| vec![factor.prefix.to_vec()]);
     for region in &regions {
         fold_region_into_reindex(map, region, plen, ncols, &new_order, &mut reindex);
     }
@@ -896,7 +901,7 @@ fn unify_join_zipper_coordinated(
 /// per-factor plumbing derived from them. Built BEFORE [`UnifyJoin`] so the held per-factor
 /// zippers can borrow the re-indexed maps — a zipper into a map owned by the state itself would
 /// be a self-reference.
-struct JoinPlan {
+struct JoinPlan<'a> {
     /// Re-indexed copies of inverted factors; `factor_src[f] = Some(i)` reads `reindexes[i]`.
     reindexes: Vec<PathMap<()>>,
     factor_src: Vec<Option<usize>>,
@@ -905,8 +910,9 @@ struct JoinPlan {
     /// at re-indexed position `j`), enough to reconstruct the stored fact's original bytes at a
     /// leaf.
     originals: Vec<Option<(Vec<u8>, Vec<usize>)>>,
-    /// Owned because a re-indexed factor's prefix and columns differ from the input factor's.
-    factors: Vec<Factor>,
+    /// Owned because a re-indexed factor's prefix and columns differ from the input factor's;
+    /// the column bytes are still borrowed from the body.
+    factors: Vec<Factor<'a>>,
     /// `var_pos[v]` = position of global variable `v` in `var_order`, for the catch-up test.
     var_pos: Vec<usize>,
 }
@@ -914,14 +920,19 @@ struct JoinPlan {
 /// Build the join's borrowed inputs: re-index inverted factors so the join can seek them in
 /// var_order; a compatible factor keeps its live-map prefix and pays nothing. `factor_src[f]`
 /// selects which map factor `f` reads from.
-fn join_plan(map: &PathMap<()>, factors: &[Factor], var_order: &[usize], nvars: usize) -> JoinPlan {
+fn join_plan<'a>(
+    map: &PathMap<()>,
+    factors: &[Factor<'a>],
+    var_order: &[usize],
+    nvars: usize,
+) -> JoinPlan<'a> {
     let nf = factors.len();
     let mut var_pos = vec![0usize; nvars];
     for (pos, &v) in var_order.iter().enumerate() {
         var_pos[v] = pos;
     }
 
-    let mut owned: Vec<Factor> = Vec::with_capacity(nf);
+    let mut owned: Vec<Factor<'a>> = Vec::with_capacity(nf);
     let mut reindexes: Vec<PathMap<()>> = Vec::new();
     let mut factor_src: Vec<Option<usize>> = Vec::with_capacity(nf);
     let mut originals: Vec<Option<(Vec<u8>, Vec<usize>)>> = Vec::with_capacity(nf);
@@ -929,10 +940,10 @@ fn join_plan(map: &PathMap<()>, factors: &[Factor], var_order: &[usize], nvars: 
         if is_inverted(factor, &var_pos) {
             let (ri, new_cols, new_order) = build_reindex(map, factor, &var_pos);
             factor_src.push(Some(reindexes.len()));
-            originals.push(Some((factor.prefix.clone(), new_order)));
+            originals.push(Some((factor.prefix.to_vec(), new_order)));
             reindexes.push(ri);
             owned.push(Factor {
-                prefix: Vec::new(),
+                prefix: &[],
                 cols: new_cols,
             });
         } else {
@@ -987,7 +998,6 @@ fn join_state<'a>(
         bindings: BTreeMap::new(),
         arena: Vec::new(),
         free_bufs: Vec::new(),
-        fixed: FixedTerms::build(&plan.factors),
         free_child_bufs: Vec::new(),
         lead_max: Vec::new(),
         out: BTreeSet::new(),
@@ -1052,63 +1062,139 @@ fn run_unify_join_stream(
 /// Parse an encoded conjunction body `(, p1 .. pk)` into factors, threading the body's variable
 /// numbering (a NewVar takes the next id in first-occurrence order, a VarRef back-references one).
 /// Returns the factors and the variable count.
-pub fn parse_body_factors(body: &[u8]) -> Option<(Vec<Factor>, usize)> {
-    let (body_len, _) = try_parse_first_subterm(body)?;
-    if body_len != body.len() {
-        return None;
-    }
-    let body_term = EncodedTerm::new(body.to_vec(), 0);
-    let body_expr = body_term.expr();
-    let nvars = validate_vars_and_count(body_expr)?;
-    let Tag::Arity(nconj) = body_term.tag() else {
+/// Parse an encoded conjunction body `(, p1 .. pk)` into factors in ONE pass.
+///
+/// Every column is a slice of `body`, never a copy: the body outlives the join, so the plan can
+/// borrow it. The same scan that finds each column's span also validates the variable numbering
+/// (a `VarRef` must name an already-introduced variable), counts the body's variables, and records
+/// each column's variable mask -- work that used to cost a separate traversal apiece
+/// (`validate_vars_and_count`, `expr_is_ground`, `min_var_pos_in_expr`) on top of three rounds of
+/// copying. Every byte of the body is visited exactly once.
+///
+/// Returns the factors and the variable count, or `None` if the body is not a well-formed nonempty
+/// relation-prefixed conjunction.
+pub fn parse_body_factors<'a>(body: &'a [u8]) -> Option<(Vec<Factor<'a>>, usize)> {
+    let Tag::Arity(nconj) = byte_item(*body.first()?) else {
         return None;
     };
     if nconj == 0 {
         return None;
     }
-    let children = expr_children(&body_term)?;
-    if children.len() != nconj as usize {
-        return None;
-    }
+    let mut intro: u8 = 0;
+    let mut pos = 1usize;
     let mut factors = Vec::with_capacity(nconj.saturating_sub(1) as usize);
-    for factor in children.iter().skip(1) {
-        factors.push(parse_pattern_factor(factor)?);
+    for ci in 0..nconj {
+        let conj_start = pos;
+        if ci == 0 {
+            // The `,` head itself carries no factor.
+            let scan = scan_subterm(body, pos, &mut intro)?;
+            pos += scan.len;
+            continue;
+        }
+        // A conjunct is `(rel arg..)`; the relation head stays column 0 so a variable query head
+        // unifies with every stored head, and a wildcard stored head is captured under a ground
+        // query head.
+        let Tag::Arity(arity) = byte_item(*body.get(pos)?) else {
+            return None;
+        };
+        if arity == 0 {
+            return None;
+        }
+        pos += 1;
+        let mut cols = Vec::with_capacity(arity as usize);
+        for _ in 0..arity {
+            let col_intro = intro;
+            let col_start = pos;
+            let scan = scan_subterm(body, pos, &mut intro)?;
+            let bytes = body.get(col_start..col_start + scan.len)?;
+            cols.push(if bytes.len() == 1 {
+                match byte_item(bytes[0]) {
+                    Tag::NewVar => FactorColumn::Var(col_intro as usize),
+                    Tag::VarRef(id) => FactorColumn::Var(id as usize),
+                    Tag::SymbolSize(_) | Tag::Arity(_) => FactorColumn::Term(EncodedTerm {
+                        bytes,
+                        intro: col_intro,
+                        vars: scan.vars,
+                        wide: scan.wide,
+                    }),
+                }
+            } else {
+                FactorColumn::Term(EncodedTerm {
+                    bytes,
+                    intro: col_intro,
+                    vars: scan.vars,
+                    wide: scan.wide,
+                })
+            });
+            pos += scan.len;
+        }
+        factors.push(Factor {
+            prefix: body.get(conj_start..conj_start + 1)?,
+            cols,
+        });
     }
-    Some((factors, nvars))
+    // The body must be exactly one complete subterm.
+    if pos != body.len() {
+        return None;
+    }
+    Some((factors, intro as usize))
 }
 
-/// One conjunct `(rel arg..)` to a factor. The prefix is the arity byte alone, and the relation
-/// head is column 0 like any argument: a variable query head then unifies with every stored head,
-/// and a wildcard stored head is captured under a ground query head, neither of which a head baked
-/// into the literal seek prefix can reach.
-fn parse_pattern_factor(pat: &EncodedTerm) -> Option<Factor> {
-    let Tag::Arity(total_arity) = pat.tag() else {
-        return None;
-    };
-    if total_arity == 0 {
-        return None;
-    }
-    let children = expr_children(pat)?;
-    if children.len() != total_arity as usize {
-        return None;
-    }
-    let prefix = vec![item_byte(Tag::Arity(total_arity))];
-    let mut cols = Vec::with_capacity(total_arity as usize);
-    for child in &children {
-        cols.push(parse_pattern_col(child)?);
-    }
-    Some(Factor { prefix, cols })
+/// What one pass over a subterm yields.
+struct SubtermScan {
+    len: usize,
+    vars: u64,
+    wide: bool,
 }
 
-fn parse_pattern_col(term: &EncodedTerm) -> Option<FactorColumn> {
-    if term.bytes.len() == 1 {
-        match term.tag() {
-            Tag::NewVar => return Some(FactorColumn::Var(term.intro as usize)),
-            Tag::VarRef(id) => return Some(FactorColumn::Var(id as usize)),
-            Tag::SymbolSize(_) | Tag::Arity(_) => {}
+/// Walk the complete subterm at `bytes[at..]` once, returning its byte length and the mask of
+/// query variables it mentions. `intro` is the running count of variables introduced by the body
+/// so far and is advanced past this subterm's own `NewVar`s, which is what gives each variable its
+/// body-global id. Returns `None` on a truncated term, a `VarRef` naming a variable that has not
+/// been introduced, or more than `u8::MAX` variables.
+fn scan_subterm(bytes: &[u8], at: usize, intro: &mut u8) -> Option<SubtermScan> {
+    let mut i = at;
+    let mut pending = 1usize;
+    let mut vars = 0u64;
+    let mut wide = false;
+    while pending != 0 {
+        let b = *bytes.get(i)?;
+        i += 1;
+        pending -= 1;
+        match byte_item(b) {
+            Tag::Arity(arity) => pending += arity as usize,
+            Tag::SymbolSize(size) => {
+                i = i.checked_add(size as usize)?;
+                if i > bytes.len() {
+                    return None;
+                }
+            }
+            Tag::NewVar => {
+                let id = *intro;
+                *intro = intro.checked_add(1)?;
+                if (id as usize) < 64 {
+                    vars |= 1u64 << id;
+                } else {
+                    wide = true;
+                }
+            }
+            Tag::VarRef(id) => {
+                if id >= *intro {
+                    return None;
+                }
+                if (id as usize) < 64 {
+                    vars |= 1u64 << id;
+                } else {
+                    wide = true;
+                }
+            }
         }
     }
-    Some(FactorColumn::Term(term.clone()))
+    Some(SubtermScan {
+        len: i - at,
+        vars,
+        wide,
+    })
 }
 
 
@@ -1248,81 +1334,7 @@ impl CandidateBuf {
     }
 }
 
-/// The argument [`ExprEnv`]s of every query-side column subterm, computed ONCE.
-///
-/// A `FactorColumn::Term`'s bytes are owned by the plan's factors, which are never mutated for the
-/// life of the join, and `catch_up` hands out an `ExprEnv` pointing directly at those bytes. So for
-/// a query-side compound column the argument envs are a pure function of immutable data: what
-/// `ExprEnv::args` would return is the same tuple of `(n, v, offset, base)` on every candidate.
-/// This table holds one node per subterm of every `Term` column, each node's `env` being literally
-/// what `args` produced at build time, so `match_compound_at_current` can walk children by node id
-/// instead of re-walking the term and allocating a `Vec<ExprEnv>` per column-match attempt.
-///
-/// Pointer identity is preserved exactly: a node's env has the same `base.ptr` (the column's own
-/// bytes), `offset`, `v` and `n` the per-call temporary carried, and `ExprEnv`'s `Eq`/`Hash` are
-/// over those fields, so `unify`'s `encountered` set sees the very same identity classes it saw
-/// before. Only patterns that are NOT bound variables use this table: a compound reached by
-/// dereferencing a bound variable lives in the arena, varies per candidate, and keeps the dynamic
-/// path.
-#[derive(Default)]
-struct FixedTerms {
-    /// One entry per subterm node, in pre-order.
-    envs: Vec<ExprEnv>,
-    /// `child_ids[child_start[node] .. + child_len[node]]` = the node's argument nodes, in
-    /// argument order.
-    child_start: Vec<u32>,
-    child_len: Vec<u32>,
-    child_ids: Vec<u32>,
-    /// `col_node[f][c]` = the root node of factor `f`'s column `c`, or `None` for a `Var` column.
-    col_node: Vec<Vec<Option<u32>>>,
-}
 
-impl FixedTerms {
-    fn build(factors: &[Factor]) -> Self {
-        let mut this = FixedTerms::default();
-        for factor in factors {
-            let mut cols = Vec::with_capacity(factor.cols.len());
-            for col in &factor.cols {
-                cols.push(match col {
-                    FactorColumn::Var(_) => None,
-                    // The same env `catch_up` builds for this column, so the precomputed subtree
-                    // below is rooted at exactly the env the join will match against.
-                    FactorColumn::Term(term) => Some(this.add(ExprEnv {
-                        n: QUERY_NS,
-                        v: term.intro,
-                        offset: 0,
-                        base: term.expr(),
-                    })),
-                });
-            }
-            this.col_node.push(cols);
-        }
-        this
-    }
-
-    /// Add `env` as a node and, recursively, its arguments; returns the new node's id. Leaves
-    /// (symbols and variables) get zero children, since `ExprEnv::args` pushes nothing for them.
-    fn add(&mut self, env: ExprEnv) -> u32 {
-        let node = self.envs.len();
-        self.envs.push(env);
-        self.child_start.push(0);
-        self.child_len.push(0);
-        let mut args = Vec::new();
-        env.args(&mut args);
-        let mut ids = Vec::with_capacity(args.len());
-        for arg in args {
-            ids.push(self.add(arg));
-        }
-        self.child_start[node] = self.child_ids.len() as u32;
-        self.child_len[node] = ids.len() as u32;
-        self.child_ids.extend_from_slice(&ids);
-        node as u32
-    }
-
-    fn child(&self, node: u32, idx: u32) -> u32 {
-        self.child_ids[(self.child_start[node as usize] + idx) as usize]
-    }
-}
 
 struct UnifyJoin<'a> {
     map: &'a PathMap<()>,
@@ -1331,7 +1343,7 @@ struct UnifyJoin<'a> {
     /// at re-indexed position `j`), enough to reconstruct the stored fact's original bytes at a
     /// leaf.
     originals: &'a [Option<(Vec<u8>, Vec<usize>)>],
-    factors: &'a [Factor],
+    factors: &'a [Factor<'a>],
     var_order: &'a [usize],
     /// `var_pos[v]` = position of global variable `v` in `var_order`, for the catch-up test.
     var_pos: &'a [usize],
@@ -1351,8 +1363,6 @@ struct UnifyJoin<'a> {
     /// depth; released buffers return here with their allocations intact.
     free_bufs: Vec<CandidateBuf>,
     /// Precomputed argument envs for the query-side columns, whose structure is fixed for the whole
-    /// join (see [`FixedTerms`]).
-    fixed: FixedTerms,
     /// Pool of child-env buffers for compounds that must still be walked per candidate (a compound
     /// reached by dereferencing a bound variable). `match_compound_children` recurses while holding
     /// its slice, so one buffer is in flight per active depth; released buffers return here with
@@ -2066,10 +2076,9 @@ impl UnifyJoin<'_> {
         &mut self,
         f: usize,
         env: ExprEnv,
-        node: Option<u32>,
         cont: &mut dyn FnMut(&mut Self),
     ) {
-        self.match_expr_at_current(f, env, node, &mut |this| {
+        self.match_expr_at_current(f, env, &mut |this| {
             this.next_col[f] += 1;
             cont(this);
             this.next_col[f] -= 1;
@@ -2077,7 +2086,7 @@ impl UnifyJoin<'_> {
     }
 
     fn consume_col(&mut self, f: usize, v: usize, cont: &mut dyn FnMut(&mut Self)) {
-        self.consume_env(f, self.query_var_env(v), None, cont);
+        self.consume_env(f, self.query_var_env(v), cont);
     }
 
     fn with_bound_path_bytes(
@@ -2136,14 +2145,8 @@ impl UnifyJoin<'_> {
         &mut self,
         f: usize,
         pattern: ExprEnv,
-        node: Option<u32>,
         cont: &mut dyn FnMut(&mut Self),
     ) {
-        // `deref_env` returns `pattern` unchanged unless `pattern` is a BOUND variable, so a
-        // non-variable pattern keeps its precomputed node (`resolved == pattern` exactly). A
-        // compound reached by dereferencing a bound variable points at arena bytes that change per
-        // candidate, so it drops the node and keeps the dynamic path.
-        let node = node.filter(|_| pattern.var_opt().is_none());
         let resolved = self.deref_env(pattern);
         if let Some(free_key) = resolved.var_opt() {
             // The lead enumeration: refill a pooled buffer instead of collecting a fresh
@@ -2185,7 +2188,7 @@ impl UnifyJoin<'_> {
             return;
         }
         match byte_item(unsafe { *resolved.subsexpr().ptr }) {
-            Tag::Arity(_) => self.match_compound_at_current(f, pattern, resolved, node, cont),
+            Tag::Arity(_) => self.match_compound_at_current(f, pattern, resolved, cont),
             Tag::NewVar | Tag::VarRef(_) => unreachable!(),
             Tag::SymbolSize(_) => {
                 // A symbol holds no variables, so the resolved value needs no substitution: its
@@ -2214,7 +2217,6 @@ impl UnifyJoin<'_> {
         f: usize,
         pattern: ExprEnv,
         resolved: ExprEnv,
-        node: Option<u32>,
         cont: &mut dyn FnMut(&mut Self),
     ) {
         // One mask read serves both the wildcard candidates and the arity-byte test: the zipper
@@ -2231,16 +2233,10 @@ impl UnifyJoin<'_> {
         };
         let arity_byte = item_byte(Tag::Arity(arity));
         if mask.test_bit(arity_byte) {
-            // The children are the same tuple of envs on every visit whenever the compound is one
-            // of the plan's fixed column subterms, so walk the precomputed node instead of
-            // re-walking the term and allocating. Otherwise derive them, into a pooled buffer.
-            if let Some(node) = node {
-                debug_assert_eq!(self.fixed.child_len[node as usize], arity as u32);
-                self.with_bound_path_bytes(f, &[arity_byte], 0, &mut |this| {
-                    this.match_fixed_children(f, node, 0, cont);
-                });
-                return;
-            }
+            // Derive the children per visit, into a pooled buffer. Precomputing the whole column
+            // subtree at plan time was measurably worse once `ExprEnv::args` stopped being
+            // quadratic: the walk it saves per candidate is now cheaper than walking every node of
+            // the column once per evaluation, even on the compound-heavy counter machine.
             let mut children = self.free_child_bufs.pop().unwrap_or_default();
             children.clear();
             resolved.args(&mut children);
@@ -2264,30 +2260,11 @@ impl UnifyJoin<'_> {
             return;
         }
         let child = children[idx];
-        self.match_expr_at_current(f, child, None, &mut |this| {
+        self.match_expr_at_current(f, child, &mut |this| {
             this.match_compound_children(f, children, idx + 1, cont);
         });
     }
 
-    /// [`Self::match_compound_children`] over a precomputed [`FixedTerms`] node: same order, same
-    /// envs, read by node id so nothing is borrowed across the recursion and nothing is allocated.
-    fn match_fixed_children(
-        &mut self,
-        f: usize,
-        node: u32,
-        idx: u32,
-        cont: &mut dyn FnMut(&mut Self),
-    ) {
-        if idx == self.fixed.child_len[node as usize] {
-            cont(self);
-            return;
-        }
-        let child = self.fixed.child(node, idx);
-        let child_env = self.fixed.envs[child as usize];
-        self.match_expr_at_current(f, child_env, Some(child), &mut |this| {
-            this.match_fixed_children(f, node, idx + 1, cont);
-        });
-    }
 
     /// Before each scheduled variable, consume every column whose value is already known: ground
     /// query arguments, compound arguments, and repeated or inverted variables already bound by
@@ -2328,10 +2305,7 @@ impl UnifyJoin<'_> {
                 base: term.expr(),
             },
         };
-        // `FixedTerms` mirrors `factors`, so this column's precomputed root is `col_node[f][col]`,
-        // rooted at the very env just built.
-        let node = self.fixed.col_node[f][col];
-        self.consume_env(f, term_env, node, &mut |this| this.catch_up(i, f));
+        self.consume_env(f, term_env, &mut |this| this.catch_up(i, f));
     }
 }
 
@@ -2342,6 +2316,16 @@ mod tests {
     /// Body-level adapters the router used to expose. They are pure test conveniences now: the
     /// shipped surface is `parse_body_factors` plus the join entry points, and the engine reaches
     /// the join only through `query_multi_leapfrog`.
+    /// Build a factor whose columns are all plain variables, over a borrowed prefix. Only the
+    /// tests construct factors by hand; the engine gets them from `parse_body_factors`, which
+    /// borrows the body.
+    fn var_cols<'a>(prefix: &'a [u8], cols: Vec<usize>) -> Factor<'a> {
+        Factor {
+            prefix,
+            cols: cols.into_iter().map(FactorColumn::Var).collect(),
+        }
+    }
+
     fn body_routable(body: &[u8]) -> bool {
         parse_body_factors(body).is_some_and(|(factors, _)| !factors.is_empty())
     }
@@ -2930,7 +2914,7 @@ mod tests {
     /// reads a VarRef id as absolute within its namespace, so all factors share their variables
     /// through namespace `QUERY_NS` with no per-factor renumbering.
     fn naive_query_expr(factor: &Factor) -> Vec<u8> {
-        let mut v = factor.prefix.clone();
+        let mut v = factor.prefix.to_vec();
         for col in &factor.cols {
             match col {
                 FactorColumn::Var(id) => v.push(item_byte(Tag::VarRef(*id as u8))),
@@ -3028,15 +3012,15 @@ mod tests {
             let queries: Vec<(Vec<Factor>, Vec<usize>, usize)> = vec![
                 // single factor  (e $0 $1)
                 (
-                    vec![Factor::var_cols(pe.clone(), vec![0, 1])],
+                    vec![var_cols(&pe, vec![0, 1])],
                     vec![0, 1],
                     2,
                 ),
                 // path  (e $0 $1)(e $1 $2)
                 (
                     vec![
-                        Factor::var_cols(pe.clone(), vec![0, 1]),
-                        Factor::var_cols(pe.clone(), vec![1, 2]),
+                        var_cols(&pe, vec![0, 1]),
+                        var_cols(&pe, vec![1, 2]),
                     ],
                     vec![0, 1, 2],
                     3,
@@ -3044,8 +3028,8 @@ mod tests {
                 // star  (e $0 $1)(e $0 $2)
                 (
                     vec![
-                        Factor::var_cols(pe.clone(), vec![0, 1]),
-                        Factor::var_cols(pe.clone(), vec![0, 2]),
+                        var_cols(&pe, vec![0, 1]),
+                        var_cols(&pe, vec![0, 2]),
                     ],
                     vec![0, 1, 2],
                     3,
@@ -3053,8 +3037,8 @@ mod tests {
                 // two-relation path  (e $0 $1)(f $1 $2)
                 (
                     vec![
-                        Factor::var_cols(pe.clone(), vec![0, 1]),
-                        Factor::var_cols(pf.clone(), vec![1, 2]),
+                        var_cols(&pe, vec![0, 1]),
+                        var_cols(&pf, vec![1, 2]),
                     ],
                     vec![0, 1, 2],
                     3,
@@ -3062,9 +3046,9 @@ mod tests {
                 // cyclic triangle over schematic edges (the re-index + catch-up path).
                 (
                     vec![
-                        Factor::var_cols(pe.clone(), vec![0, 1]),
-                        Factor::var_cols(pe.clone(), vec![1, 2]),
-                        Factor::var_cols(pe.clone(), vec![2, 0]),
+                        var_cols(&pe, vec![0, 1]),
+                        var_cols(&pe, vec![1, 2]),
+                        var_cols(&pe, vec![2, 0]),
                     ],
                     vec![0, 1, 2],
                     3,
@@ -3072,10 +3056,10 @@ mod tests {
                 // cyclic four-cycle over schematic edges.
                 (
                     vec![
-                        Factor::var_cols(pe.clone(), vec![0, 1]),
-                        Factor::var_cols(pe.clone(), vec![1, 2]),
-                        Factor::var_cols(pe.clone(), vec![2, 3]),
-                        Factor::var_cols(pe.clone(), vec![3, 0]),
+                        var_cols(&pe, vec![0, 1]),
+                        var_cols(&pe, vec![1, 2]),
+                        var_cols(&pe, vec![2, 3]),
+                        var_cols(&pe, vec![3, 0]),
                     ],
                     vec![0, 1, 2, 3],
                     4,
@@ -3083,14 +3067,14 @@ mod tests {
                 // swap pair  (e $0 $1)(e $1 $0)
                 (
                     vec![
-                        Factor::var_cols(pe.clone(), vec![0, 1]),
-                        Factor::var_cols(pe.clone(), vec![1, 0]),
+                        var_cols(&pe, vec![0, 1]),
+                        var_cols(&pe, vec![1, 0]),
                     ],
                     vec![0, 1],
                     2,
                 ),
                 // intra-factor coreference  (e $0 $0) against schematic facts.
-                (vec![Factor::var_cols(pe.clone(), vec![0, 0])], vec![0], 1),
+                (vec![var_cols(&pe, vec![0, 0])], vec![0], 1),
             ];
 
             for (qi, (factors, order, nvars)) in queries.iter().enumerate() {
@@ -3206,7 +3190,7 @@ mod tests {
     }
 
     fn naive_query_expr_globalized(factor: &Factor) -> Vec<u8> {
-        let mut v = factor.prefix.clone();
+        let mut v = factor.prefix.to_vec();
         for col in &factor.cols {
             match col {
                 FactorColumn::Var(id) => v.push(item_byte(Tag::VarRef(*id as u8))),
