@@ -499,15 +499,18 @@ impl<'a> FactorColumn<'a> {
     }
 }
 
-/// A query factor: its seek prefix in the PathMap, and every column in syntactic order. The body
-/// parser emits the arity byte alone as the prefix, with the relation head as column 0 (a direct
-/// construction may bake a ground head into the prefix instead, at the cost of never matching a
-/// wildcard stored head). Ground columns stay columns so they can unify with stored data variables
-/// at their trie position.
+/// A query factor: its seek prefix in the PathMap, and every column in syntactic order. For a
+/// compound conjunct the body parser emits the arity byte alone as the prefix, with the relation
+/// head as column 0 (a direct construction may bake a ground head into the prefix instead, at the
+/// cost of never matching a wildcard stored head). For a conjunct that is not a compound the
+/// prefix is EMPTY and the conjunct itself is the single column, so the cursor opens at the trie
+/// root where whole facts live. Ground columns stay columns so they can unify with stored data
+/// variables at their trie position.
 #[derive(Clone, Debug)]
 pub struct Factor<'a> {
     /// The relation's seek prefix: the conjunct's arity byte, borrowed from the body (empty for a
-    /// re-indexed factor, whose columns were permuted into a private map).
+    /// whole-atom factor, whose cursor opens at the root, and for a re-indexed factor, whose
+    /// columns were permuted into a private map).
     pub prefix: &'a [u8],
     pub cols: Vec<FactorColumn<'a>>,
 }
@@ -1071,8 +1074,13 @@ fn run_unify_join_stream(
 /// (`validate_vars_and_count`, `expr_is_ground`, `min_var_pos_in_expr`) on top of three rounds of
 /// copying. Every byte of the body is visited exactly once.
 ///
-/// Returns the factors and the variable count, or `None` if the body is not a well-formed nonempty
-/// relation-prefixed conjunction.
+/// EVERY conjunct shape is a factor; see the per-conjunct comment below for the two encodings.
+/// A body with no conjunct at all (`(,)`, arity 1) parses to zero factors, which the join reads as
+/// "match once, unconditionally" exactly as [`crate::space::Space::query_multi`] does.
+///
+/// Returns the factors and the variable count, or `None` if the body is not a well-formed
+/// conjunction: a non-compound body, the arity-0 body `()`, a truncated term, a `VarRef` naming a
+/// variable the body never introduced, or more than `u8::MAX` variables.
 pub fn parse_body_factors<'a>(body: &'a [u8]) -> Option<(Vec<Factor<'a>>, usize)> {
     let Tag::Arity(nconj) = byte_item(*body.first()?) else {
         return None;
@@ -1091,18 +1099,37 @@ pub fn parse_body_factors<'a>(body: &'a [u8]) -> Option<(Vec<Factor<'a>>, usize)
             pos += scan.len;
             continue;
         }
-        // A conjunct is `(rel arg..)`; the relation head stays column 0 so a variable query head
-        // unifies with every stored head, and a wildcard stored head is captured under a ground
-        // query head.
-        let Tag::Arity(arity) = byte_item(*body.get(pos)?) else {
-            return None;
+        // A conjunct is matched against a WHOLE stored fact, and there are two ways to spread that
+        // fact over seekable columns.
+        //
+        // A COMPOUND conjunct `(rel arg..)` keeps the shape this parser has always emitted: the
+        // arity byte alone is the seek prefix, and every top-level argument is a column, with the
+        // relation head as column 0 so a variable query head unifies with every stored head and a
+        // wildcard stored head is captured under a ground query head.
+        //
+        // A conjunct that is NOT a compound -- a bare symbol, a bare variable, or the empty
+        // compound `()` -- has no arguments to spread, so it becomes a WHOLE-ATOM factor: an EMPTY
+        // prefix, so its cursor opens at the trie root where complete facts live, and one single
+        // column holding the conjunct itself. Nothing downstream needs a special case. A constant
+        // conjunct takes the ground path in `UnifyJoin::match_expr_at_current`, which offers the
+        // exact atom (one seek) PLUS every wildcard byte in the floor's child mask -- at an empty
+        // prefix that floor is the root, so the wildcards are exactly the facts stored as a bare
+        // variable, which do unify with the constant. That is `query_multi`'s existence check on
+        // the atom. A variable conjunct takes the free path, which enumerates every stored atom and
+        // binds the variable to it -- `query_multi`'s match-anything conjunct -- and because the
+        // column is a plain `Var`, the variable is a first-class join variable that can be shared
+        // with (and seeked in) any other conjunct. A single-column factor is never inverted, so
+        // neither shape ever reaches the re-index path.
+        let (prefix, ncols): (&'a [u8], usize) = match byte_item(*body.get(pos)?) {
+            Tag::Arity(arity) if arity != 0 => {
+                let prefix = body.get(conj_start..conj_start + 1)?;
+                pos += 1;
+                (prefix, arity as usize)
+            }
+            _ => (&[], 1),
         };
-        if arity == 0 {
-            return None;
-        }
-        pos += 1;
-        let mut cols = Vec::with_capacity(arity as usize);
-        for _ in 0..arity {
+        let mut cols = Vec::with_capacity(ncols);
+        for _ in 0..ncols {
             let col_intro = intro;
             let col_start = pos;
             let scan = scan_subterm(body, pos, &mut intro)?;
@@ -1128,10 +1155,7 @@ pub fn parse_body_factors<'a>(body: &'a [u8]) -> Option<(Vec<Factor<'a>>, usize)
             });
             pos += scan.len;
         }
-        factors.push(Factor {
-            prefix: body.get(conj_start..conj_start + 1)?,
-            cols,
-        });
+        factors.push(Factor { prefix, cols });
     }
     // The body must be exactly one complete subterm.
     if pos != body.len() {
@@ -1211,23 +1235,29 @@ fn scan_subterm(bytes: &[u8], at: usize, intro: &mut u8) -> Option<SubtermScan> 
 /// variables in `QUERY_NS` = 0, factor `f`'s data in `1 + f`), and `apply` observes a binding only
 /// by dereference, so this map drives the stock template emit exactly as a re-unification of the
 /// same tuple would (see the leaf in [`UnifyJoin::recurse_after_catch_up`]). `loc` is factor 0's
-/// stored fact, as stock passes. Returns the successful-match count, or `None` for a body outside
-/// the nonempty relation-prefixed conjunction class (or if evaluation panicked), which the caller
-/// sends down the ProductZipper path. A `false` from `effect` stops the search, as it stops the
-/// stock scan.
+/// stored fact, as stock passes. Returns the successful-match count, or `None` for a body that is
+/// not a well-formed conjunction at all -- see [`parse_body_factors`] -- which the caller sends
+/// down the ProductZipper path. Every CONJUNCT shape is handled here, including the degenerate
+/// body with no conjunct. A `false` from `effect` stops the search, as it stops the stock scan.
 pub fn query_multi_leapfrog<F: FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(
     map: &PathMap<()>,
     pat_expr: Expr,
     mut effect: F,
 ) -> Option<usize> {
     let body = unsafe { pat_expr.span().as_ref().unwrap() };
-    // PRECONDITION: the caller has already settled the degenerate arities, so a body that parses
-    // at all yields at least one factor. `None` here means only that the body is not a
-    // well-formed conjunction of relation-prefixed conjuncts -- a malformed or truncated term, a
-    // conjunct that is not a compound, a `VarRef` naming a variable that was never introduced --
-    // which the ProductZipper handles instead.
+    // `None` means only that the body is not a well-formed conjunction: a non-compound body, the
+    // arity-0 body `()`, a truncated term, a `VarRef` naming a variable the body never introduced,
+    // or more than `u8::MAX` variables. Every shape a CONJUNCT can take is a factor, so no body
+    // is declined for the shape of its conjuncts any more.
     let (factors, nvars) = parse_body_factors(body)?;
-    debug_assert!(!factors.is_empty(), "caller must settle bodies with no conjunct");
+    if factors.is_empty() {
+        // `(,)`: nothing constrains anything, so the body matches exactly once with empty
+        // bindings. This mirrors `Space::query_multi`'s `n_factors == 1` arm byte for byte,
+        // including that it calls `effect` once, ignores the answer, and returns 1 -- and that it
+        // does NOT bump the `unifications` counter, so the printed statistics stay identical.
+        effect(Err(BTreeMap::new()), pat_expr);
+        return Some(1);
+    }
     let var_order: Vec<usize> = (0..nvars).collect();
     #[cfg(debug_assertions)]
     {
@@ -2751,6 +2781,140 @@ mod tests {
                 assert_eq!(least_ge(&mask, k), want, "set={set:?} k={k}");
             }
         }
+    }
+
+    /// Every conjunct shape is a factor. A compound keeps the arity-byte prefix with one column
+    /// per argument; a bare symbol, a bare variable, and the empty compound become WHOLE-ATOM
+    /// factors -- empty prefix (so the cursor opens at the trie root, where complete facts live)
+    /// and the conjunct itself as the single column, `Term` for a constant and `Var` for a
+    /// variable, including a `VarRef` back to a variable an earlier conjunct introduced.
+    #[test]
+    fn non_compound_conjuncts_parse_as_whole_atom_factors() {
+        let body = conj(&[
+            nest("e", &[new_var(), new_var()]),
+            sym("present"),
+            var_ref(0),
+            new_var(),
+            vec![item_byte(Tag::Arity(0))],
+        ]);
+        let (factors, nvars) = parse_body_factors(&body).expect("every conjunct shape must parse");
+        assert_eq!(nvars, 3, "the trailing NewVar conjunct introduces a variable");
+        assert_eq!(factors.len(), 5);
+
+        assert_eq!(factors[0].prefix, &[item_byte(Tag::Arity(3))]);
+        assert_eq!(factors[0].cols.len(), 3, "head plus two argument columns");
+
+        for (i, f) in factors[1..].iter().enumerate() {
+            assert!(
+                f.prefix.is_empty(),
+                "whole-atom factor {i} must open at the trie root"
+            );
+            assert_eq!(f.cols.len(), 1, "whole-atom factor {i} has one column");
+        }
+        let FactorColumn::Term(present) = &factors[1].cols[0] else {
+            panic!("a bare symbol conjunct is a ground Term column");
+        };
+        assert_eq!(present.bytes, &sym("present")[..]);
+        assert!(present.is_ground());
+        assert_eq!(
+            factors[2].cols[0],
+            FactorColumn::Var(0),
+            "a bare VarRef conjunct is the same join variable its introducer named"
+        );
+        assert_eq!(factors[3].cols[0], FactorColumn::Var(2));
+        let FactorColumn::Term(nil) = &factors[4].cols[0] else {
+            panic!("the empty compound is a ground Term column");
+        };
+        assert_eq!(nil.bytes, &[item_byte(Tag::Arity(0))]);
+    }
+
+    /// `(,)` is a body with no conjunct. It parses to zero factors, which the dispatch reads as
+    /// "match once, unconditionally" -- `Space::query_multi`'s own reading of it.
+    #[test]
+    fn empty_conjunction_parses_to_no_factors() {
+        let empty = conj(&[]);
+        let (factors, nvars) = parse_body_factors(&empty).expect("`(,)` is well formed");
+        assert!(factors.is_empty());
+        assert_eq!(nvars, 0);
+        // A body that is not a conjunction at all is still declined, and is the only thing that is.
+        assert!(parse_body_factors(&sym("nope")).is_none());
+        assert!(parse_body_factors(&[item_byte(Tag::Arity(0))]).is_none());
+    }
+
+    /// A constant conjunct is an existence check on that atom, and a fact stored as a bare
+    /// VARIABLE is a top-level wildcard that unifies with it. The whole-atom factor's empty prefix
+    /// puts the ground path's floor at the ROOT, so its candidates are the exact atom plus every
+    /// wildcard byte in the root's child mask -- which is exactly the set of facts that can unify
+    /// with the constant. Pin all three cases: atom stored, atom absent but a wildcard present,
+    /// and neither.
+    #[test]
+    fn constant_conjunct_takes_the_exact_atom_and_top_level_wildcards() {
+        let edges = |map: &mut PathMap<()>| {
+            map.insert(&nest("e", &[sym("a"), sym("b")]), ());
+            map.insert(&nest("e", &[sym("b"), sym("c")]), ());
+        };
+        let body = conj(&[nest("e", &[new_var(), new_var()]), sym("present")]);
+        let both = BTreeSet::from([
+            vec![sym("a"), sym("b")],
+            vec![sym("b"), sym("c")],
+        ]);
+
+        let mut stored = PathMap::<()>::new();
+        edges(&mut stored);
+        stored.insert(&sym("present"), ());
+        assert_eq!(body_safe(&stored, &body).unwrap(), both);
+
+        let mut wildcard = PathMap::<()>::new();
+        edges(&mut wildcard);
+        wildcard.insert(&new_var(), ());
+        assert_eq!(
+            body_safe(&wildcard, &body).unwrap(),
+            both,
+            "a fact stored as a bare variable unifies with the constant conjunct"
+        );
+
+        let mut absent = PathMap::<()>::new();
+        edges(&mut absent);
+        assert!(
+            body_safe(&absent, &body).unwrap().is_empty(),
+            "an absent atom blocks the body"
+        );
+    }
+
+    /// A bare VARIABLE conjunct matches any atom and binds the variable to it, and the variable is
+    /// a first-class join variable: sharing it with a compound conjunct's column restricts both
+    /// sides, so `(, (e $x $y) $x)` keeps only the edges whose source is itself a stored atom.
+    #[test]
+    fn variable_conjunct_is_a_first_class_join_variable() {
+        let mut map = PathMap::<()>::new();
+        map.insert(&nest("e", &[sym("a"), sym("b")]), ());
+        map.insert(&nest("e", &[sym("b"), sym("c")]), ());
+        map.insert(&sym("a"), ());
+        map.insert(&sym("c"), ());
+
+        let shared = conj(&[nest("e", &[new_var(), new_var()]), var_ref(0)]);
+        assert_eq!(
+            body_safe(&map, &shared).unwrap(),
+            BTreeSet::from([vec![sym("a"), sym("b")]]),
+            "only (e a b) has a source that is also a stored atom"
+        );
+
+        // Unshared, the conjunct matches ANY atom: the full cross product of the two edges with
+        // every one of the four stored facts, compound facts included.
+        let free = conj(&[nest("e", &[new_var(), new_var()]), new_var()]);
+        let atoms = [
+            nest("e", &[sym("a"), sym("b")]),
+            nest("e", &[sym("b"), sym("c")]),
+            sym("a"),
+            sym("c"),
+        ];
+        let mut want = BTreeSet::new();
+        for (x, y) in [(sym("a"), sym("b")), (sym("b"), sym("c"))] {
+            for z in &atoms {
+                want.insert(vec![x.clone(), y.clone(), z.clone()]);
+            }
+        }
+        assert_eq!(body_safe(&map, &free).unwrap(), want);
     }
 
     /// The lead's mutual-seek intersection prunes exactly the symbol-headed (hence ground)

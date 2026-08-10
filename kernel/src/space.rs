@@ -1010,23 +1010,22 @@ impl Space {
         pathmap::paths_serialization::deserialize_paths(self.btm.write_zipper(), &mut file, ())
     }
 
-    /// [`Space::query_multi`] behind the leapfrog dispatch: with the `leapfrog` feature a nonempty
-    /// relation-prefixed conjunction routes to the worst-case-optimal join in
-    /// [`crate::zipper_join`], which streams the same matches through `effect`; any other body,
-    /// and every build without the feature, takes the ProductZipper path below. Only the
-    /// space-to-space transform dispatches: interpreted sources and sinks and the pattern-directed
-    /// dumps keep the stock path and its enumeration order.
+    /// [`Space::query_multi`] behind the leapfrog dispatch: with the `leapfrog` feature a
+    /// conjunction body routes to the worst-case-optimal join in [`crate::zipper_join`], which
+    /// streams the same matches through `effect`; every build without the feature takes the
+    /// ProductZipper path below. Only the space-to-space transform dispatches: interpreted sources
+    /// and sinks and the pattern-directed dumps keep the stock path and its enumeration order.
+    ///
+    /// The join owns every CONJUNCT shape -- compounds, bare symbols, bare variables -- and the
+    /// bare `(,)` with no conjunct, so there is no shape test here. The remaining fallback is for
+    /// a body that is not a conjunction at all: a non-compound body or the arity-0 body `()`,
+    /// which `query_multi` handles (or fails on) exactly as it always has, plus the encoding
+    /// pathologies `parse_body_factors` rejects (a `VarRef` naming a variable the body never
+    /// introduced, or more than `u8::MAX` variables).
     pub fn query_multi_dispatch<F : FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(btm: &PathMap<()>, pat_expr: Expr, mut effect: F) -> usize {
-        // A body is `(, p1 .. pk)`, so its arity is `k + 1`. The degenerate arities -- a
-        // non-compound body, and the bare `(,)` with no conjunct -- are settled here rather than
-        // inside the join, which makes "at least one conjunct" the join's precondition instead of
-        // something it has to re-check. Both currently take the ProductZipper; nothing stops them
-        // moving to the join later.
         #[cfg(feature = "leapfrog")]
-        if pat_expr.arity().is_some_and(|arity| arity >= 2) {
-            if let Some(touched) = crate::zipper_join::query_multi_leapfrog(btm, pat_expr, &mut effect) {
-                return touched;
-            }
+        if let Some(touched) = crate::zipper_join::query_multi_leapfrog(btm, pat_expr, &mut effect) {
+            return touched;
         }
         Self::query_multi(btm, pat_expr, effect)
     }
