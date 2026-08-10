@@ -499,6 +499,124 @@ impl<'a> FactorColumn<'a> {
     }
 }
 
+/// The query-side view of one position in the pre-order walk of a factor's columns: exactly enough
+/// to rebuild the [`ExprEnv`] the recursive descent used to derive with `ExprEnv::args`, so a
+/// stored wildcard at this position unifies against precisely the same pattern it always did.
+/// `base` is the whole COLUMN's bytes and `offset` the position inside it -- the same
+/// base/offset split `args` produces, kept byte-for-byte because `ExprEnv`'s equality and
+/// `same_functor` fast path read `offset` and `base` and not just `subsexpr()`.
+#[derive(Clone, Copy, Debug)]
+struct Site<'a> {
+    base: &'a [u8],
+    offset: u32,
+    /// Query variables introduced before this position, i.e. the `v` an `args`-derived env carries.
+    intro: u8,
+}
+
+impl Site<'_> {
+    fn env(&self) -> ExprEnv {
+        ExprEnv {
+            n: QUERY_NS,
+            v: self.intro,
+            offset: self.offset,
+            base: expr_from_bytes(self.base),
+        }
+    }
+}
+
+/// One seek position in the pre-order walk of a factor's query columns -- the unit the join
+/// schedules and consumes, generalizing "a top-level argument column" to "any position at any
+/// depth".
+///
+/// Flattening is what lets a variable nested inside a namespace wrapper, say `$x` in
+/// `(data (e $x $y))`, be scheduled and intersected across factors instead of being enumerated by
+/// the structural descent inside one factor (which is the ProductZipper's nested-loop algorithm).
+///
+/// The ground structure around a variable is NOT absorbed into the cursor's seek prefix. Each
+/// `Sym`/`Compound` position stays its own step precisely so the descent can take the stored
+/// WILDCARD branch there: a fact `(data $w)` whose `$w` captures the whole `(e a b)` must still
+/// unify, and only a per-position mask read can find it. Taking that branch consumes the position's
+/// whole subtree, which is what `Compound::end` records.
+#[derive(Clone, Copy, Debug)]
+enum Step<'a> {
+    /// Query variable `v` occupies this position: the schedulable slot.
+    Var(usize),
+    /// A ground symbol leaf spanning `len` bytes from the site.
+    Sym { site: Site<'a>, len: usize },
+    /// A compound node; its children are the steps `s+1 .. end`.
+    Compound { site: Site<'a>, arity: u8, end: usize },
+}
+
+/// Flatten one column's encoded subterm at `base[offset..]` into steps, returning the offset and
+/// introduced-variable count just past it. `None` on a truncated term or a variable overflow, which
+/// the caller turns into "not routable".
+fn push_steps<'a>(
+    base: &'a [u8],
+    mut offset: usize,
+    mut intro: u8,
+    out: &mut Vec<Step<'a>>,
+) -> Option<(usize, u8)> {
+    let b = *base.get(offset)?;
+    let site = Site {
+        base,
+        offset: u32::try_from(offset).ok()?,
+        intro,
+    };
+    match byte_item(b) {
+        Tag::NewVar => {
+            out.push(Step::Var(intro as usize));
+            Some((offset + 1, intro.checked_add(1)?))
+        }
+        Tag::VarRef(id) => {
+            out.push(Step::Var(id as usize));
+            Some((offset + 1, intro))
+        }
+        Tag::SymbolSize(size) => {
+            let len = 1 + size as usize;
+            if offset.checked_add(len)? > base.len() {
+                return None;
+            }
+            out.push(Step::Sym { site, len });
+            Some((offset + len, intro))
+        }
+        Tag::Arity(arity) => {
+            let at = out.len();
+            out.push(Step::Compound {
+                site,
+                arity,
+                end: 0,
+            });
+            offset += 1;
+            for _ in 0..arity {
+                let (next_offset, next_intro) = push_steps(base, offset, intro, out)?;
+                offset = next_offset;
+                intro = next_intro;
+            }
+            let end = out.len();
+            match &mut out[at] {
+                Step::Compound { end: slot, .. } => *slot = end,
+                _ => unreachable!("the pushed step is the compound just written"),
+            }
+            Some((offset, intro))
+        }
+    }
+}
+
+/// The factor's columns flattened into one ordered step list. A top-level `Var` column is one slot,
+/// exactly as before; a `Term` column expands into its own pre-order walk.
+fn factor_steps<'a>(factor: &Factor<'a>) -> Option<Vec<Step<'a>>> {
+    let mut out = Vec::with_capacity(factor.cols.len());
+    for col in &factor.cols {
+        match col {
+            FactorColumn::Var(v) => out.push(Step::Var(*v)),
+            FactorColumn::Term(term) => {
+                push_steps(term.bytes, 0, term.intro, &mut out)?;
+            }
+        }
+    }
+    Some(out)
+}
+
 /// A query factor: its seek prefix in the PathMap, and every column in syntactic order. For a
 /// compound conjunct the body parser emits the arity byte alone as the prefix, with the relation
 /// head as column 0 (a direct construction may bake a ground head into the prefix instead, at the
@@ -647,6 +765,15 @@ fn column_matches_by_equality(mask: &ByteMask) -> bool {
         least_ge(mask, item_byte(Tag::VarRef(0))),
         Some(b) if b <= item_byte(Tag::NewVar)
     )
+}
+
+/// Whether a position whose trie children are `mask` offers a stored variable, i.e. a wildcard that
+/// unifies with whatever the query has here. The complement of [`column_matches_by_equality`], read
+/// off the same single mask probe so a position with no wildcard skips the byte-by-byte scan
+/// entirely.
+#[inline]
+fn mask_has_wildcard(mask: &ByteMask) -> bool {
+    !column_matches_by_equality(mask)
 }
 
 /// A factor is inverted when its columns are not in `var_order` order, so the join cannot seek it
@@ -916,19 +1043,25 @@ struct JoinPlan<'a> {
     /// Owned because a re-indexed factor's prefix and columns differ from the input factor's;
     /// the column bytes are still borrowed from the body.
     factors: Vec<Factor<'a>>,
+    /// Per factor, its columns flattened into the pre-order seek positions the join schedules and
+    /// consumes ([`Step`]). Derived from `factors`, so a re-indexed factor's steps follow its
+    /// permuted column order.
+    steps: Vec<Vec<Step<'a>>>,
     /// `var_pos[v]` = position of global variable `v` in `var_order`, for the catch-up test.
     var_pos: Vec<usize>,
 }
 
 /// Build the join's borrowed inputs: re-index inverted factors so the join can seek them in
 /// var_order; a compatible factor keeps its live-map prefix and pays nothing. `factor_src[f]`
-/// selects which map factor `f` reads from.
+/// selects which map factor `f` reads from. `None` when a factor's column bytes do not flatten
+/// into seek positions (a truncated term, or more than `u8::MAX` variables), which the caller
+/// sends down the ProductZipper path.
 fn join_plan<'a>(
     map: &PathMap<()>,
     factors: &[Factor<'a>],
     var_order: &[usize],
     nvars: usize,
-) -> JoinPlan<'a> {
+) -> Option<JoinPlan<'a>> {
     let nf = factors.len();
     let mut var_pos = vec![0usize; nvars];
     for (pos, &v) in var_order.iter().enumerate() {
@@ -956,13 +1089,19 @@ fn join_plan<'a>(
         }
     }
 
-    JoinPlan {
+    let steps = owned
+        .iter()
+        .map(factor_steps)
+        .collect::<Option<Vec<Vec<Step<'a>>>>>()?;
+
+    Some(JoinPlan {
         reindexes,
         factor_src,
         originals,
         factors: owned,
+        steps,
         var_pos,
-    }
+    })
 }
 
 /// Build the join state over a prepared plan without running it. One zipper per factor is opened
@@ -991,12 +1130,13 @@ fn join_state<'a>(
         map,
         originals: &plan.originals,
         factors: &plan.factors,
+        steps: &plan.steps,
         var_order,
         var_pos: &plan.var_pos,
         cursors,
         nvars,
         bound: vec![Vec::new(); nf],
-        next_col: vec![0; nf],
+        next_step: vec![0; nf],
         data_intro: vec![0; nf],
         bindings: BTreeMap::new(),
         arena: Vec::new(),
@@ -1022,7 +1162,9 @@ fn run_unify_join(
     nvars: usize,
     want_coordinated: bool,
 ) -> (BTreeSet<Vec<Option<Vec<u8>>>>, BTreeSet<Vec<u8>>) {
-    let plan = join_plan(map, factors, var_order, nvars);
+    let Some(plan) = join_plan(map, factors, var_order, nvars) else {
+        return (BTreeSet::new(), BTreeSet::new());
+    };
     let mut state = join_state(map, &plan, var_order, nvars, want_coordinated);
     state.recurse(0);
     (state.out, state.coordinated)
@@ -1030,18 +1172,22 @@ fn run_unify_join(
 
 /// Run the join streaming each accepted assignment's own solved bindings (and factor 0's stored
 /// fact, the `loc` the stock callback contract carries) to `on_match` instead of collecting rows;
-/// a `false` return stops the search early.
+/// a `false` return stops the search early. `false` = the plan does not flatten, so nothing ran and
+/// the caller must fall back.
 fn run_unify_join_stream_bindings(
     map: &PathMap<()>,
     factors: &[Factor],
     var_order: &[usize],
     nvars: usize,
     on_match: &mut dyn FnMut(&Bindings, Expr) -> bool,
-) {
-    let plan = join_plan(map, factors, var_order, nvars);
+) -> bool {
+    let Some(plan) = join_plan(map, factors, var_order, nvars) else {
+        return false;
+    };
     let mut state = join_state(map, &plan, var_order, nvars, false);
     state.on_match = Some(on_match);
     state.recurse(0);
+    true
 }
 
 /// Run the join streaming each accepted assignment's per-factor original fact bytes to `on_tuple`.
@@ -1056,7 +1202,7 @@ fn run_unify_join_stream(
     nvars: usize,
     on_tuple: &mut dyn FnMut(&[Vec<u8>]) -> bool,
 ) {
-    let plan = join_plan(map, factors, var_order, nvars);
+    let plan = join_plan(map, factors, var_order, nvars).expect("test factors must flatten");
     let mut state = join_state(map, &plan, var_order, nvars, false);
     state.on_tuple = Some(on_tuple);
     state.recurse(0);
@@ -1277,7 +1423,9 @@ pub fn query_multi_leapfrog<F: FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>
         // whole-tuple re-unification (plus a fact rebuild per factor) this replaces.
         effect(Err(bindings.clone()), loc)
     };
-    run_unify_join_stream_bindings(map, &factors, &var_order, nvars, &mut on_match);
+    if !run_unify_join_stream_bindings(map, &factors, &var_order, nvars, &mut on_match) {
+        return None;
+    }
     Some(candidate)
 }
 
@@ -1333,6 +1481,10 @@ struct UnifyJoin<'a> {
     /// leaf.
     originals: &'a [Option<(Vec<u8>, Vec<usize>)>],
     factors: &'a [Factor<'a>],
+    /// Per factor, its columns flattened into pre-order seek positions ([`Step`]). This, not
+    /// `factors[f].cols`, is what the join walks: a variable at ANY depth is its own position, so
+    /// it can be scheduled and intersected across factors.
+    steps: &'a [Vec<Step<'a>>],
     var_order: &'a [usize],
     /// `var_pos[v]` = position of global variable `v` in `var_order`, for the catch-up test.
     var_pos: &'a [usize],
@@ -1344,7 +1496,8 @@ struct UnifyJoin<'a> {
     cursors: Vec<SubtermCursor<ReadZipperUntracked<'a, 'static, ()>>>,
     nvars: usize,
     bound: Vec<Vec<u8>>,
-    next_col: Vec<usize>,
+    /// Per factor, the index of the seek position it is currently at in `steps[f]`.
+    next_step: Vec<usize>,
     data_intro: Vec<u8>,
     bindings: Bindings,
     arena: Vec<Box<[u8]>>,
@@ -1485,10 +1638,15 @@ impl UnifyJoin<'_> {
             return;
         }
         let v = self.var_order[i];
+        // The participating factors are those whose CURRENT seek position is this variable --
+        // wherever that position sits in the term. Before flattening this asked only about
+        // top-level argument columns, so under a namespace wrapper no factor ever qualified, the
+        // multiway intersection never engaged, and the structural descent degenerated into the
+        // ProductZipper's nested loop with the join's machinery on top.
         let mut parts: Vec<usize> = (0..self.factors.len())
             .filter(|&f| {
-                let nc = self.next_col[f];
-                matches!(self.factors[f].cols.get(nc), Some(FactorColumn::Var(cv)) if *cv == v)
+                let ns = self.next_step[f];
+                matches!(self.steps[f].get(ns), Some(Step::Var(cv)) if *cv == v)
             })
             .collect();
         if parts.is_empty() {
@@ -1642,7 +1800,7 @@ impl UnifyJoin<'_> {
     }
 
     fn factor_has_value(&self, f: usize) -> bool {
-        if self.next_col[f] != self.factors[f].cols.len() {
+        if self.next_step[f] != self.steps[f].len() {
             return false;
         }
         self.cursors[f].has_value()
@@ -1988,11 +2146,11 @@ impl UnifyJoin<'_> {
             };
             let cand = &buf.entries[ci];
             let mut cont = |this: &mut Self| {
-                this.next_col[f] += 1;
+                this.next_step[f] += 1;
                 this.descend_restrictors(restrictors, 0, cand, &mut |this| {
                     this.consume_var_parts(rest, 0, v, i);
                 });
-                this.next_col[f] -= 1;
+                this.next_step[f] -= 1;
             };
             if first_subterm_is_ground(cand) {
                 // The ground fast bind, with the same precondition and reasoning as the general
@@ -2043,7 +2201,7 @@ impl UnifyJoin<'_> {
         let len = self.bound[r].len();
         self.bound[r].extend_from_slice(value);
         self.cursors[r].descend_floor();
-        self.next_col[r] += 1;
+        self.next_step[r] += 1;
         #[cfg(debug_assertions)]
         debug_assert_eq!(
             self.cursors[r].floor_len(),
@@ -2051,16 +2209,16 @@ impl UnifyJoin<'_> {
             "held cursor drifted from prefix+bound"
         );
         self.descend_restrictors(restrictors, j + 1, value, cont);
-        self.next_col[r] -= 1;
+        self.next_step[r] -= 1;
         self.cursors[r].ascend_floor();
         self.bound[r].truncate(len);
         self.cursors[r].reset_to_floor();
     }
 
-    /// Match `env` against factor `f`'s current column and recurse with the column consumed
-    /// (`next_col` advanced), stack-disciplined.
-    /// `node` is the [`FixedTerms`] node for `env` when `env` is one of the plan's fixed column
-    /// subterms, and `None` for an env built from live bindings.
+    /// Match `env` against factor `f`'s current seek position and recurse with that position
+    /// consumed (`next_step` advanced by one), stack-disciplined. Used for a [`Step::Var`] slot,
+    /// whose value may be anything the variable is bound to, so the dynamic descent in
+    /// [`Self::match_expr_at_current`] does the work.
     fn consume_env(
         &mut self,
         f: usize,
@@ -2068,14 +2226,105 @@ impl UnifyJoin<'_> {
         cont: &mut dyn FnMut(&mut Self),
     ) {
         self.match_expr_at_current(f, env, &mut |this| {
-            this.next_col[f] += 1;
+            this.next_step[f] += 1;
             cont(this);
-            this.next_col[f] -= 1;
+            this.next_step[f] -= 1;
         });
     }
 
     fn consume_col(&mut self, f: usize, v: usize, cont: &mut dyn FnMut(&mut Self)) {
         self.consume_env(f, self.query_var_env(v), cont);
+    }
+
+    /// Consume factor `f`'s current seek position, calling `cont` once per way the stored data can
+    /// match it, with `next_step[f]` advanced past exactly what that match covered.
+    fn consume_step(&mut self, f: usize, cont: &mut dyn FnMut(&mut Self)) {
+        let s = self.next_step[f];
+        match self.steps[f][s] {
+            Step::Var(v) => self.consume_col(f, v, cont),
+            Step::Sym { site, len } => self.consume_sym(f, s, site, len, cont),
+            Step::Compound { site, arity, end } => {
+                self.consume_compound(f, s, site, arity, end, cont)
+            }
+        }
+    }
+
+    /// A ground symbol position. Byte equality is unifiability on ground terms, so an exact probe
+    /// hit binds the bytes directly; and a stored WILDCARD at this position unifies with the symbol
+    /// too, so every variable tag byte in the column's child mask is its own branch. Both are what
+    /// [`Self::match_expr_at_current`]'s `Tag::SymbolSize` arm did for a top-level symbol column;
+    /// the only change is that this now also runs at depth.
+    fn consume_sym(
+        &mut self,
+        f: usize,
+        s: usize,
+        site: Site<'_>,
+        len: usize,
+        cont: &mut dyn FnMut(&mut Self),
+    ) {
+        let start = site.offset as usize;
+        let bytes = &site.base[start..start + len];
+        let (exact, mask) = self.ground_probe(f, bytes);
+        if exact {
+            self.with_bound_path_bytes(f, bytes, 0, &mut |this| {
+                this.next_step[f] = s + 1;
+                cont(this);
+                this.next_step[f] = s;
+            });
+        }
+        if mask_has_wildcard(&mask) {
+            let pattern = site.env();
+            for w in mask.iter() {
+                if is_wildcard_term(&[w]) {
+                    self.match_candidate(f, pattern, &[w], &mut |this| {
+                        this.next_step[f] = s + 1;
+                        cont(this);
+                        this.next_step[f] = s;
+                    });
+                }
+            }
+        }
+    }
+
+    /// A compound position. THE trap this module keeps re-learning: the ground structure must NOT
+    /// be absorbed into a seek prefix. A stored variable at this very position is a wildcard that
+    /// captures the WHOLE subterm -- `(data $w)` must match a query `(data (e a b))` -- so the
+    /// child mask is read here and every wildcard byte becomes its own branch, unified against the
+    /// whole query subterm and skipping the subtree's steps (`end`). Only then is the arity byte
+    /// descended, with the children left to the following steps, so a variable inside them is
+    /// schedulable.
+    fn consume_compound(
+        &mut self,
+        f: usize,
+        s: usize,
+        site: Site<'_>,
+        arity: u8,
+        end: usize,
+        cont: &mut dyn FnMut(&mut Self),
+    ) {
+        // One mask read serves both the wildcard candidates and the arity-byte test: each
+        // `match_candidate` restores `bound[f]`, so the zipper position is the same throughout.
+        let mask = self.cursors[f].floor_child_mask();
+        if mask_has_wildcard(&mask) {
+            let pattern = site.env();
+            for w in mask.iter() {
+                if is_wildcard_term(&[w]) {
+                    self.match_candidate(f, pattern, &[w], &mut |this| {
+                        this.next_step[f] = end;
+                        cont(this);
+                        this.next_step[f] = s;
+                    });
+                }
+            }
+        }
+        let arity_byte = item_byte(Tag::Arity(arity));
+        if mask.test_bit(arity_byte) {
+            self.with_bound_path_bytes(f, &[arity_byte], 0, &mut |this| {
+                this.next_step[f] = s + 1;
+                cont(this);
+                this.next_step[f] = s;
+            });
+        }
     }
 
     fn with_bound_path_bytes(
@@ -2255,10 +2504,14 @@ impl UnifyJoin<'_> {
     }
 
 
-    /// Before each scheduled variable, consume every column whose value is already known: ground
-    /// query arguments, compound arguments, and repeated or inverted variables already bound by
-    /// earlier levels. Columns can branch because a stored data variable may capture the fixed query
-    /// value or compound.
+    /// Before each scheduled variable, walk every factor forward over the seek positions whose
+    /// value is already determined: the query's own ground structure (symbols and compound nodes,
+    /// at any depth) and variables an earlier level already bound. A factor stops at the first
+    /// position holding a variable this level has not reached yet, which is what leaves that
+    /// variable available to `recurse_after_catch_up`'s multiway intersection.
+    ///
+    /// Every determined position can still BRANCH, because a stored data variable at it is a
+    /// wildcard that captures whatever the query has there; the step consumers take those branches.
     fn catch_up(&mut self, i: usize, f: usize) {
         if self.stopped {
             return;
@@ -2267,34 +2520,18 @@ impl UnifyJoin<'_> {
             self.recurse_after_catch_up(i);
             return;
         }
-        // Read the column in place: cloning it here deep-copied a Term column's bytes at every
-        // node. A Var column needs only its id. A Term column's bytes are owned by the plan's
-        // factors (`self.factors: &'a [Factor]`, never mutated after construction), so an
-        // `ExprEnv` view over them (a raw `Expr` pointer, like the arena's) stays valid for the
-        // whole recursion — same namespace, intro, and bytes the former arena copy carried.
-        let col = self.next_col[f];
-        let term_env = match self.factors[f].cols.get(col) {
-            None => {
+        let Some(step) = self.steps[f].get(self.next_step[f]).copied() else {
+            self.catch_up(i, f + 1);
+            return;
+        };
+        if let Step::Var(vp) = step {
+            if self.var_pos[vp] >= i {
+                // Scheduled at this level or later: leave it for the intersection.
                 self.catch_up(i, f + 1);
                 return;
             }
-            Some(FactorColumn::Var(vp)) => {
-                let vp = *vp;
-                if self.var_pos[vp] < i {
-                    self.consume_col(f, vp, &mut |this| this.catch_up(i, f));
-                } else {
-                    self.catch_up(i, f + 1);
-                }
-                return;
-            }
-            Some(FactorColumn::Term(term)) => ExprEnv {
-                n: QUERY_NS,
-                v: term.intro,
-                offset: 0,
-                base: term.expr(),
-            },
-        };
-        self.consume_env(f, term_env, &mut |this| this.catch_up(i, f));
+        }
+        self.consume_step(f, &mut |this| this.catch_up(i, f));
     }
 }
 
@@ -3479,6 +3716,34 @@ mod tests {
                     nest("h", &[var_ref(1), var_ref(0)]),
                 ]),
             ),
+            // The NAMESPACED shapes: every join variable sits under a wrapper, so no factor has a
+            // top-level variable column at all. These are the shapes the flattened seek positions
+            // exist for, and they are the ones that would break first if a level ever absorbed the
+            // wrapper's structure into a seek prefix instead of branching on the stored wildcard --
+            // the generated facts here carry wildcard heads, wildcard columns and compound columns
+            // at exactly those positions.
+            (
+                "namespaced-triangle",
+                conj(&[
+                    nest("e", &[nest("k", &[new_var()]), nest("k", &[new_var()])]),
+                    nest("e", &[nest("k", &[var_ref(1)]), nest("k", &[new_var()])]),
+                    nest("h", &[nest("k", &[var_ref(0)]), nest("k", &[var_ref(2)])]),
+                ]),
+            ),
+            (
+                "namespaced-deep",
+                conj(&[
+                    nest("e", &[nest("k", &[nest("k", &[new_var()])]), new_var()]),
+                    nest("h", &[nest("k", &[nest("k", &[var_ref(0)])]), var_ref(1)]),
+                ]),
+            ),
+            (
+                "namespaced-repeat",
+                conj(&[
+                    nest("e", &[nest("k", &[new_var()]), nest("k", &[var_ref(0)])]),
+                    nest("h", &[nest("k", &[var_ref(0)]), new_var()]),
+                ]),
+            ),
             (
                 "ground-and-compound",
                 conj(&[
@@ -3583,6 +3848,80 @@ mod tests {
             }
         }
     }
+    /// A variable under a namespace wrapper is its OWN seek position, so it can be scheduled and
+    /// intersected across factors. While a "column" meant "a top-level argument",
+    /// `(data (e $x $y))` offered no variable column at all: the multiway intersection never
+    /// engaged and the wrapper was walked factor-at-a-time, which is the ProductZipper's algorithm
+    /// paid for with the join's machinery.
+    #[test]
+    fn nested_variables_become_seek_positions() {
+        let body = conj(&[nest("data", &[nest("e", &[new_var(), new_var()])])]);
+        let (factors, nvars) = parse_body_factors(&body).expect("body parses");
+        assert_eq!(nvars, 2);
+        let steps = factor_steps(&factors[0]).expect("factor flattens");
+        // The wrapper symbol, the inner compound node, its head symbol, then a position each for
+        // `$0` and `$1`. The compound's subtree runs to the end of the factor.
+        assert_eq!(steps.len(), 5, "one position per node of the pre-order walk");
+        assert!(matches!(steps[0], Step::Sym { .. }));
+        assert!(matches!(
+            steps[1],
+            Step::Compound {
+                arity: 3,
+                end: 5,
+                ..
+            }
+        ));
+        assert!(matches!(steps[2], Step::Sym { .. }));
+        assert!(matches!(steps[3], Step::Var(0)));
+        assert!(matches!(steps[4], Step::Var(1)));
+    }
+
+    /// The trap the flattening must not spring: every level it descends still branches on a stored
+    /// wildcard. A fact `(data $w)` whose `$w` captures the whole `(e a b)` unifies with the nested
+    /// query, and would vanish the moment the wrapper's structure were absorbed into a seek prefix.
+    #[test]
+    fn namespaced_query_keeps_wildcard_branches() {
+        let mut map = PathMap::<()>::new();
+        map.insert(&nest("data", &[nest("e", &[sym("a"), sym("b")])]), ());
+        map.insert(&nest("data", &[new_var()]), ());
+        let body = conj(&[nest("data", &[nest("e", &[new_var(), new_var()])])]);
+        let (nvars, rows) = body_partial(&map, &body).expect("body routes");
+        assert_eq!(nvars, 2);
+        assert_eq!(
+            rows,
+            BTreeSet::from([
+                vec![Some(sym("a")), Some(sym("b"))],
+                vec![None, None],
+            ]),
+            "the stored wildcard must capture the whole nested subterm"
+        );
+    }
+
+    /// The namespaced triangle end to end: three conjuncts, every join variable nested, answered
+    /// through the multiway intersection over nested positions.
+    #[test]
+    fn namespaced_triangle_answers() {
+        let edge = |a: &str, b: &str| nest("data", &[nest("e", &[sym(a), sym(b)])]);
+        let mut map = PathMap::<()>::new();
+        for (a, b) in [("a", "b"), ("b", "c"), ("a", "c"), ("c", "a"), ("b", "a")] {
+            map.insert(&edge(a, b), ());
+        }
+        let body = conj(&[
+            nest("data", &[nest("e", &[new_var(), new_var()])]),
+            nest("data", &[nest("e", &[var_ref(1), new_var()])]),
+            nest("data", &[nest("e", &[var_ref(0), var_ref(2)])]),
+        ]);
+        let rows = body_safe(&map, &body).expect("body routes");
+        assert_eq!(
+            rows,
+            BTreeSet::from([
+                vec![sym("a"), sym("b"), sym("c")],
+                vec![sym("b"), sym("c"), sym("a")],
+                vec![sym("b"), sym("a"), sym("c")],
+            ])
+        );
+    }
+
     /// The head position is a join column like any other. A variable query head ranges over
     /// stored heads, and a wildcard stored head is captured under a ground query head; with the
     /// head baked into the seek prefix, both directions were silently empty (caught against the
