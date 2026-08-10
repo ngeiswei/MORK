@@ -1162,32 +1162,29 @@ fn run_unify_join(
     nvars: usize,
     want_coordinated: bool,
 ) -> (BTreeSet<Vec<Option<Vec<u8>>>>, BTreeSet<Vec<u8>>) {
-    let Some(plan) = join_plan(map, factors, var_order, nvars) else {
-        return (BTreeSet::new(), BTreeSet::new());
-    };
+    let plan = join_plan(map, factors, var_order, nvars)
+        .expect("parsed factors must flatten into steps");
     let mut state = join_state(map, &plan, var_order, nvars, want_coordinated);
     state.recurse(0);
     (state.out, state.coordinated)
 }
 
 /// Run the join streaming each accepted assignment's own solved bindings (and factor 0's stored
-/// fact, the `loc` the stock callback contract carries) to `on_match` instead of collecting rows;
-/// a `false` return stops the search early. `false` = the plan does not flatten, so nothing ran and
-/// the caller must fall back.
+/// fact, the `loc` the stock callback contract carries) to `on_match` instead of collecting rows.
+/// Flattening the plan is a precondition: the factors came from `parse_body_factors`, which has
+/// already walked the whole body and rejected the encodings `push_steps` could fail on.
 fn run_unify_join_stream_bindings(
     map: &PathMap<()>,
     factors: &[Factor],
     var_order: &[usize],
     nvars: usize,
     on_match: &mut dyn FnMut(&Bindings, Expr) -> bool,
-) -> bool {
-    let Some(plan) = join_plan(map, factors, var_order, nvars) else {
-        return false;
-    };
+) {
+    let plan = join_plan(map, factors, var_order, nvars)
+        .expect("parsed factors must flatten into steps");
     let mut state = join_state(map, &plan, var_order, nvars, false);
     state.on_match = Some(on_match);
     state.recurse(0);
-    true
 }
 
 /// Run the join streaming each accepted assignment's per-factor original fact bytes to `on_tuple`.
@@ -1389,20 +1386,23 @@ pub fn query_multi_leapfrog<F: FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>
     map: &PathMap<()>,
     pat_expr: Expr,
     mut effect: F,
-) -> Option<usize> {
+) -> usize {
     let body = unsafe { pat_expr.span().as_ref().unwrap() };
-    // `None` means only that the body is not a well-formed conjunction: a non-compound body, the
-    // arity-0 body `()`, a truncated term, a `VarRef` naming a variable the body never introduced,
-    // or more than `u8::MAX` variables. Every shape a CONJUNCT can take is a factor, so no body
-    // is declined for the shape of its conjuncts any more.
-    let (factors, nvars) = parse_body_factors(body)?;
+    // The join owns every body the engine hands it, so parsing is a precondition rather than a
+    // decline: every conjunct shape is a factor, and the frontend does not emit the encodings that
+    // would fail here (a truncated term, a `VarRef` naming a variable the body never introduced,
+    // more than `u8::MAX` variables). A probe over the differential corpus, every resource program
+    // and the CLI suite saw no body fail. A violation is a bug in the producer and should surface
+    // as one, not as a silent detour to a different engine.
+    let (factors, nvars) =
+        parse_body_factors(body).expect("a transform body must be a well-formed conjunction");
     if factors.is_empty() {
         // `(,)`: nothing constrains anything, so the body matches exactly once with empty
         // bindings. This mirrors `Space::query_multi`'s `n_factors == 1` arm byte for byte,
         // including that it calls `effect` once, ignores the answer, and returns 1 -- and that it
         // does NOT bump the `unifications` counter, so the printed statistics stay identical.
         effect(Err(BTreeMap::new()), pat_expr);
-        return Some(1);
+        return 1;
     }
     let var_order: Vec<usize> = (0..nvars).collect();
     #[cfg(debug_assertions)]
@@ -1423,10 +1423,8 @@ pub fn query_multi_leapfrog<F: FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>
         // whole-tuple re-unification (plus a fact rebuild per factor) this replaces.
         effect(Err(bindings.clone()), loc)
     };
-    if !run_unify_join_stream_bindings(map, &factors, &var_order, nvars, &mut on_match) {
-        return None;
-    }
-    Some(candidate)
+    run_unify_join_stream_bindings(map, &factors, &var_order, nvars, &mut on_match);
+    candidate
 }
 
 

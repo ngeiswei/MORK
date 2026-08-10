@@ -1023,11 +1023,18 @@ impl Space {
     /// pathologies `parse_body_factors` rejects (a `VarRef` naming a variable the body never
     /// introduced, or more than `u8::MAX` variables).
     pub fn query_multi_dispatch<F : FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(btm: &PathMap<()>, pat_expr: Expr, mut effect: F) -> usize {
+        // Which engine answers the space-to-space transform is a compile-time choice and nothing
+        // more: with the `leapfrog` feature the join owns every body, and without it the module
+        // does not exist. `query_multi` stays reachable for the paths that are not dispatched --
+        // the pattern-directed dumps and the interpreted source/sink transforms.
         #[cfg(feature = "leapfrog")]
-        if let Some(touched) = crate::zipper_join::query_multi_leapfrog(btm, pat_expr, &mut effect) {
-            return touched;
+        {
+            crate::zipper_join::query_multi_leapfrog(btm, pat_expr, effect)
         }
-        Self::query_multi(btm, pat_expr, effect)
+        #[cfg(not(feature = "leapfrog"))]
+        {
+            Self::query_multi(btm, pat_expr, effect)
+        }
     }
 
     pub fn query_multi<F : FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(btm: &PathMap<()>, pat_expr: Expr, mut effect: F) -> usize {
