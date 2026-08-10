@@ -6325,11 +6325,19 @@ fn main() {
             s.timing = timing;
             let f = std::fs::File::open(&input_path).unwrap();
             let mmapf = unsafe { memmap2::Mmap::map(&f).unwrap() };
-            s.add_all_sexpr(&*mmapf);
+            // Surface a load failure instead of running on a silently truncated space: the loader
+            // stops at the offending atom, so ignoring this reported success over a partial space.
+            if let Err(e) = s.add_all_sexpr(&*mmapf) {
+                eprintln!("{input_path}: {e}");
+                std::process::exit(1);
+            }
             for repeated_aux_path in &aux_path {
                 let f = std::fs::File::open(&repeated_aux_path).unwrap();
                 let mmapf = unsafe { memmap2::Mmap::map(&f).unwrap() };
-                s.add_all_sexpr(&*mmapf);
+                if let Err(e) = s.add_all_sexpr(&*mmapf) {
+                    eprintln!("{repeated_aux_path}: {e}");
+                    std::process::exit(1);
+                }
             }
             if instrumentation > 0 { println!("loaded {} expressions", s.btm.val_count()) }
             println!("loaded {:?} ; running and outputing to {:?}", &input_path, output_path.as_ref().or(Some(&"stdout".to_string())));
