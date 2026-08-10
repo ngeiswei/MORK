@@ -215,7 +215,7 @@ impl Sink for USink {
             let mut tmp = self.tmp.unwrap();
             let eau = Expr{ ptr: e };
 
-            let mut cursor = std::io::Cursor::new(unsafe { core::slice::from_raw_parts_mut(tmp, 1 << 32) });
+            let mut cursor = mork_expr::SliceSink::new(unsafe { core::slice::from_raw_parts_mut(tmp, 1 << 32) });
 
             if !mork_expr::unifies_reuse_state(
                 eau,
@@ -229,7 +229,7 @@ impl Sink for USink {
                 return;
             }
 
-            self.last_len = cursor.position() as usize;
+            self.last_len = cursor.position();
 
 
             std::mem::swap(&mut self.buf, &mut self.tmp);

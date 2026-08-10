@@ -967,12 +967,18 @@ impl Space {
                 Err(ref bindings) => {
                     buffer.clear();
 
-                    let (oi, ni, true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0,0,0, pattern, bindings, buffer, stack, assignments)
+                    let (oi, ni, true) = ({
+                        let mut bs = mork_expr::VecSink(&mut buffer);
+                        mork_expr::apply_e_clears_stacks_and_cycles_check!(0,0,0, pattern, bindings, bs, stack, assignments)
+                    })
                     else { break 'query true};
 
                     buffer.clear();
 
-                    let (_,_,true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0,oi,ni, template, bindings, buffer, stack, assignments)
+                    let (_,_,true) = ({
+                        let mut bs = mork_expr::VecSink(&mut buffer);
+                        mork_expr::apply_e_clears_stacks_and_cycles_check!(0,oi,ni, template, bindings, bs, stack, assignments)
+                    })
                     else { break 'query true;};
                 }
             }
@@ -1431,10 +1437,11 @@ impl Space {
                     #[cfg(debug_assertions)]
                     bindings.iter().for_each(|(v, ee)| trace!(target: "transform", "binding {:?} {}", *v, ee.show()));
 
-                    let (mut oi, ni, true) = ({
-                        let mut void = std::io::sink();
-                        mork_expr::apply_e_clears_stacks_and_cycles_check!(0,0,0,pat_expr,bindings,void,trace,assignments)
-                    }) else {break 'query true;};
+                    // Only the intro counts and the occurs check are read here, never the bytes,
+                    // so this applies into `NullSink` rather than emitting an expression to discard.
+                    let (mut oi, ni, true) =
+                        mork_expr::apply_e_cycles_only!(0,0,0,pat_expr,bindings,trace,assignments)
+                    else {break 'query true;};
 
                     'writes : for (i, template) in templates.iter().enumerate() {
                         let wz = &mut template_wzs[subsumption[i]];
@@ -1443,7 +1450,8 @@ impl Space {
 
 
                         buffer.clear();
-                        let (toi, _, true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0,oi,ni,*template,bindings,buffer,astack,ass) else { continue 'writes; };
+                        let mut bs = mork_expr::VecSink(&mut buffer);
+                        let (toi, _, true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0,oi,ni,*template,bindings,bs,astack,ass) else { continue 'writes; };
                         oi = toi;
 
 
@@ -1506,10 +1514,11 @@ impl Space {
                     #[cfg(debug_assertions)]
                     bindings.iter().for_each(|(v, ee)| trace!(target: "transform", "binding {:?} {}", *v, ee.show()));
 
-                    let (mut oi, ni, true) = ({
-                        let mut void = std::io::sink();
-                        mork_expr::apply_e_clears_stacks_and_cycles_check!(0,0,0,pat_expr,bindings,void,trace,assignments)
-                    }) else {break 'query true;};
+                    // Only the intro counts and the occurs check are read here, never the bytes,
+                    // so this applies into `NullSink` rather than emitting an expression to discard.
+                    let (mut oi, ni, true) =
+                        mork_expr::apply_e_cycles_only!(0,0,0,pat_expr,bindings,trace,assignments)
+                    else {break 'query true;};
 
                     'writes : for (i, template) in templates.iter().enumerate() {
                         let wz = &mut template_wzs[subsumption[i]];
@@ -1517,7 +1526,8 @@ impl Space {
                         trace!(target: "transform", "{i} template {} @ ({oi} {ni})", serialize(unsafe { template.span().as_ref().unwrap()}));
 
                         buffer.clear();
-                        let (toi, _, true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0,oi,ni,*template,bindings,buffer,astack,ass) else { continue 'writes; };
+                        let mut bs = mork_expr::VecSink(&mut buffer);
+                        let (toi, _, true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0,oi,ni,*template,bindings,bs,astack,ass) else { continue 'writes; };
                         oi = toi;
 
 
@@ -1589,10 +1599,11 @@ impl Space {
                     #[cfg(debug_assertions)]
                     bindings.iter().for_each(|(v, ee)| trace!(target: "transform", "binding {:?} {}", *v, ee.show()));
 
-                    let (mut oi, ni, true) = ({
-                        let mut void = std::io::sink();
-                        mork_expr::apply_e_clears_stacks_and_cycles_check!(0,0,0,pat_expr,bindings,void,trace,assignments)
-                    }) else {break 'query true;};
+                    // Only the intro counts and the occurs check are read here, never the bytes,
+                    // so this applies into `NullSink` rather than emitting an expression to discard.
+                    let (mut oi, ni, true) =
+                        mork_expr::apply_e_cycles_only!(0,0,0,pat_expr,bindings,trace,assignments)
+                    else {break 'query true;};
 
                     'writes : for (i, template) in templates.iter().enumerate() {
                         let wz = unsafe { std::ptr::read(&template_resources[subsumption[i]]) };
@@ -1600,7 +1611,8 @@ impl Space {
                         trace!(target: "transform", "{i} template {} @ ({oi} {ni})", serialize(unsafe { template.span().as_ref().unwrap()}));
 
                         buffer.clear();
-                        let (toi, _, true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0,oi,ni,*template,bindings,buffer,astack,ass) else { continue 'writes; };
+                        let mut bs = mork_expr::VecSink(&mut buffer);
+                        let (toi, _, true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0,oi,ni,*template,bindings,bs,astack,ass) else { continue 'writes; };
                         oi = toi;
 
                         trace!(target: "transform", "U {i} out {:?}", Expr{ ptr: buffer.as_mut_ptr() });
@@ -1675,10 +1687,11 @@ impl Space {
                     #[cfg(debug_assertions)]
                     bindings.iter().for_each(|(v, ee)| trace!(target: "transform", "binding {:?} {}", *v, ee.show()));
 
-                    let (mut oi, ni, true) = ({
-                        let mut void = std::io::sink();
-                        mork_expr::apply_e_clears_stacks_and_cycles_check!(0,0,0,pat_expr,bindings,void,trace,assignments)
-                    }) else {break 'query true;};
+                    // Only the intro counts and the occurs check are read here, never the bytes,
+                    // so this applies into `NullSink` rather than emitting an expression to discard.
+                    let (mut oi, ni, true) =
+                        mork_expr::apply_e_cycles_only!(0,0,0,pat_expr,bindings,trace,assignments)
+                    else {break 'query true;};
 
                     'writes : for (i, template) in templates.iter().enumerate() {
                         let wz = unsafe { std::ptr::read(&template_resources[subsumption[i]]) };
@@ -1686,7 +1699,8 @@ impl Space {
                         trace!(target: "transform", "{i} template {} @ ({oi} {ni})", serialize(unsafe { template.span().as_ref().unwrap()}));
 
                         buffer.clear();
-                        let (toi, _, true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0,oi,ni,*template,bindings,buffer,astack,ass) else { continue 'writes; };
+                        let mut bs = mork_expr::VecSink(&mut buffer);
+                        let (toi, _, true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0,oi,ni,*template,bindings,bs,astack,ass) else { continue 'writes; };
 
                         trace!(target: "transform", "U {i} out {:?}", Expr{ ptr: buffer.as_mut_ptr() });
                         sinks[i].sink(std::iter::once(wz), &buffer[..]);

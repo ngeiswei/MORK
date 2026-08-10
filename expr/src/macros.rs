@@ -422,7 +422,7 @@ macro_rules! construct_impl {
 ///     mut new_intros     : u8,                          // :expr
 ///     e                  : Expr,                        // :expr
 ///     bindings           : &BTreeMap<ExprVar, ExprEnv>, // :expr
-///     es                 : &mut W,                      // :ident, Writer is converted internally to a sink
+///     es                 : &mut S,                      // :ident, an `ItemSink`
 ///     stack              : &mut Vec<ExprVar>,           // :ident, This gets cleared before application
 ///     assignments        : &mut Vec<ExprVar>            // :ident, This gets cleared before application
 /// ) -> (u8,u8,no_cycles:bool)
@@ -431,15 +431,28 @@ macro_rules! construct_impl {
 #[macro_export]
 macro_rules! apply_e_clears_stacks_and_cycles_check {
     ($n:expr, $original_intros:expr, $new_intros:expr, $pat_expr:expr, $bindings:expr, $es:ident, $stack:ident, $assignments:ident) => {{
-        let mut snk = $crate::item_sink(&mut $es);
-
         let mut cycled = std::collections::BTreeMap::<(u8, u8), u8>::new();
         $stack.clear();
         $assignments.clear();
-        let (l,r) = $crate::apply_e($n, $original_intros, $new_intros, $pat_expr, $bindings, &mut std::pin::pin!(snk), &mut cycled, &mut $stack, &mut $assignments);
+        let (l,r) = $crate::apply_e($n, $original_intros, $new_intros, $pat_expr, $bindings, &mut $es, &mut cycled, &mut $stack, &mut $assignments);
 
         (l,r,cycled.is_empty())
-        // $crate::apply_e_clears_stacks_and_cycles_check_takes_coroutine!($n,$original_intros,$new_intros,$pat_expr,$bindings,snk,$stack,$assignments)
+    }};
+}
+
+/// [`apply_e_clears_stacks_and_cycles_check`] for callers that want only the variable counts and
+/// the occurs check, not the instantiated bytes -- the "does this pattern apply" pass.
+///
+/// Takes no sink: it applies into [`NullSink`], so the walk carries no output machinery at all.
+#[macro_export]
+macro_rules! apply_e_cycles_only {
+    ($n:expr, $original_intros:expr, $new_intros:expr, $pat_expr:expr, $bindings:expr, $stack:ident, $assignments:ident) => {{
+        let mut cycled = std::collections::BTreeMap::<(u8, u8), u8>::new();
+        $stack.clear();
+        $assignments.clear();
+        let (l,r) = $crate::apply_e($n, $original_intros, $new_intros, $pat_expr, $bindings, &mut $crate::NullSink, &mut cycled, &mut $stack, &mut $assignments);
+
+        (l,r,cycled.is_empty())
     }};
 }
 
