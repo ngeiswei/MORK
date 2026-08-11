@@ -1718,8 +1718,27 @@ pub struct ExprEnv {
     pub n: u8,
     pub v: u8,
     pub offset: u32,
+    /// Skip stamp: the byte distance from `subsexpr()` to the first location after the grounded
+    /// subterm starting there, or 0 when no such subterm is known.
+    ///
+    /// A nonzero stamp certifies two facts at once -- the subterm's extent AND that it contains
+    /// no variable -- which is exactly the license every walk needs to jump it: a walker may
+    /// treat the whole span as one opaque item, an emitter may copy it verbatim (a ground
+    /// subterm re-encodes to exactly its own bytes), a comparer may judge it by `memcmp` (the
+    /// encoding is prefix-free, so byte equality of complete terms is term equality), and
+    /// anything hunting variables may ignore it entirely. 0 is always safe: it means "walk it",
+    /// never "has variables".
+    ///
+    /// Stamps come from whoever already holds the facts -- the join's arena scans nothing to
+    /// mint one, its enumerating cursor counts variable tags as a byproduct of the walk it does
+    /// anyway. Every derivation that changes what span the env denotes (a shifted
+    /// [`ExprEnv::offset`]) clears it: the stamp describes one exact span. Sits in what was
+    /// padding, so the struct stays 16 bytes.
+    pub ground_skip: u16,
     pub base: Expr
 }
+
+const _: () = assert!(size_of::<ExprEnv>() == 16, "ExprEnv must not grow: it is copied per binding per answer");
 
 impl PartialEq<Self> for ExprEnv {
     fn eq(&self, other: &Self) -> bool {
@@ -1758,6 +1777,7 @@ impl ExprEnv {
             n: i,
             v: 0,
             offset: 0,
+            ground_skip: 0,
             base: e,
         }
     }
@@ -1767,7 +1787,7 @@ impl ExprEnv {
     }
 
     pub fn offset(&self, offset: u32) -> ExprEnv {
-        ExprEnv{ n: self.n, v: self.v, offset: self.offset + offset, base: self.base }
+        ExprEnv{ n: self.n, v: self.v, offset: self.offset + offset, ground_skip: 0, base: self.base }
     }
 
     pub fn subsexpr(&self) -> Expr {
@@ -1823,6 +1843,7 @@ impl ExprEnv {
                     n: self.n,
                     v: self.v,
                     offset: self.offset + 1,
+                    ground_skip: 0,
                     base: self.base,
                 };
                 for sk in 0..k {
@@ -2805,8 +2826,8 @@ mod tests {
             // (F $_ ($x $x) ($x $x))
             let mut ev = parse!(r"[4] F $ [2] $ _2 [2] _2 _2");
             let e = Expr { ptr: ev.as_mut_ptr() };
-            let lhs = RelExprEnv(ExprEnv{ n: 0, v: 1, offset:  1 + 2 + 1, base: e});
-            let rhs = RelExprEnv(ExprEnv{ n: 0, v: 2, offset:  1 + 2 + 1 + 1 + 1 + 1, base: e});
+            let lhs = RelExprEnv(ExprEnv{ n: 0, v: 1, offset:  1 + 2 + 1, ground_skip: 0, base: e});
+            let rhs = RelExprEnv(ExprEnv{ n: 0, v: 2, offset:  1 + 2 + 1 + 1 + 1 + 1, ground_skip: 0, base: e});
             println!("lhs {}", lhs.0.show());
             println!("rhs {}", rhs.0.show());
             assert_eq!(lhs, rhs);
@@ -2818,8 +2839,8 @@ mod tests {
             // (F $_ ($x $x) ($y $x))
             let mut ev = parse!(r"[4] F $ [2] $ _2 [2] $ _2");
             let e = Expr { ptr: ev.as_mut_ptr() };
-            let lhs = RelExprEnv(ExprEnv{ n: 0, v: 1, offset:  1 + 2 + 1, base: e});
-            let rhs = RelExprEnv(ExprEnv{ n: 0, v: 2, offset:  1 + 2 + 1 + 1 + 1 + 1, base: e});
+            let lhs = RelExprEnv(ExprEnv{ n: 0, v: 1, offset:  1 + 2 + 1, ground_skip: 0, base: e});
+            let rhs = RelExprEnv(ExprEnv{ n: 0, v: 2, offset:  1 + 2 + 1 + 1 + 1 + 1, ground_skip: 0, base: e});
             println!("lhs {}", lhs.0.show());
             println!("rhs {}", rhs.0.show());
             assert_ne!(lhs, rhs);
@@ -2831,8 +2852,8 @@ mod tests {
             // ($x $x)
             let mut ev = parse!(r"[2] $ _1");
             let e = Expr { ptr: ev.as_mut_ptr() };
-            let lhs = RelExprEnv(ExprEnv{ n: 0, v: 0, offset: 1, base: e});
-            let rhs = RelExprEnv(ExprEnv{ n: 0, v: 1, offset: 2, base: e});
+            let lhs = RelExprEnv(ExprEnv{ n: 0, v: 0, offset: 1, ground_skip: 0, base: e});
+            let rhs = RelExprEnv(ExprEnv{ n: 0, v: 1, offset: 2, ground_skip: 0, base: e});
             println!("lhs {}", lhs.0.show());
             println!("rhs {}", rhs.0.show());
             assert_eq!(lhs, rhs);

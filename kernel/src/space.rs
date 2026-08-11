@@ -188,11 +188,11 @@ fn coreferential_transition<Z : ZipperMoving + Zipper + ZipperAbsolutePath + Zip
                         trace!(target: "coref trans", "varref {i} {:?}", &loc.path()[references[i as usize] as usize..]);
                         // trace!(target: "coref trans", "varref against {:?}", loc.child_mask());
                         // trace!(target: "coref trans", "varref path {:?}", serialize(loc.origin_path()));
-                        ExprEnv{ n: 254, v: 0, offset: 0, base: Expr{ ptr: loc.path().as_ptr().cast_mut().offset(references[i as usize] as _) } }
+                        ExprEnv{ n: 254, v: 0, offset: 0, ground_skip: 0, base: Expr{ ptr: loc.path().as_ptr().cast_mut().offset(references[i as usize] as _) } }
                     } else {
                         trace!(target: "coref trans", "varref <{},{i}> 'any'", e.n);
                         static nv: u8 = item_byte(Tag::NewVar);
-                        ExprEnv{ n: 255, v: 0, offset: 0, base: Expr{ ptr: ((&nv) as *const u8).cast_mut() } }
+                        ExprEnv{ n: 255, v: 0, offset: 0, ground_skip: 0, base: Expr{ ptr: ((&nv) as *const u8).cast_mut() } }
                     };
                     stack.push(addition);
                     vs!(e, false);
