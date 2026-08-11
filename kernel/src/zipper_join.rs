@@ -20,6 +20,7 @@ use pathmap::zipper::{
 };
 use pathmap::PathMap;
 use std::collections::{BTreeMap, BTreeSet};
+use std::marker::PhantomData;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 const QUERY_NS: u8 = 0;
@@ -479,19 +480,18 @@ use mork_expr::{Bindings, ExprVar, NEW_VAR_EXPR_BYTES};
 /// A materialized encoded term plus the query-variable intro count before it in the original body.
 /// The bytes stay in MORK's native encoding; unification and substitution operate through
 /// [`ExprEnv`] views over them.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct EncodedTerm<'a> {
-    /// Borrowed straight out of the body being evaluated. The body outlives the join, so a plan
-    /// never copies term bytes. A slice rather than a bare `Expr`/offset deliberately: its length
-    /// is the bounds authority for every raw parse the plan performs (`push_steps`,
-    /// `scan_subterm` index with `get`, never trusting the encoding), which a pointer alone
-    /// cannot offer.
-    pub bytes: &'a [u8],
+    /// The column's subterm, pointing straight into the body being evaluated (which outlives the
+    /// join, witnessed by the lifetime). The encoding is trusted: every consumer walks it by
+    /// structure, so no length rides along.
+    pub expr: Expr,
     pub intro: u8,
     /// Bitmask of the query variables this term mentions, filled in by the single parse scan so
     /// groundness and variable-position queries need no further traversal. The parser caps an
     /// expression at 63 variables (a body that exceeds it is not routable), so the mask is total.
     vars: u64,
+    _borrow: PhantomData<&'a [u8]>,
 }
 
 impl<'a> EncodedTerm<'a> {
@@ -514,7 +514,7 @@ impl<'a> EncodedTerm<'a> {
 
 /// One query argument column in a factor. Top-level variables are exposed so the leapfrog order can
 /// seek them directly; every structured or ground column stays as native encoded bytes.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum FactorColumn<'a> {
     Var(usize),
     Term(EncodedTerm<'a>),
@@ -528,32 +528,6 @@ impl<'a> FactorColumn<'a> {
         }
     }
 
-}
-
-/// The query-side view of one position in the pre-order walk of a factor's columns: exactly enough
-/// to rebuild the [`ExprEnv`] the recursive descent used to derive with `ExprEnv::args`, so a
-/// stored wildcard at this position unifies against precisely the same pattern it always did.
-/// `base` is the whole COLUMN's bytes and `offset` the position inside it -- the same
-/// base/offset split `args` produces, kept byte-for-byte because `ExprEnv`'s equality and
-/// `same_functor` fast path read `offset` and `base` and not just `subsexpr()`.
-#[derive(Clone, Copy, Debug)]
-struct Site<'a> {
-    base: &'a [u8],
-    offset: u32,
-    /// Query variables introduced before this position, i.e. the `v` an `args`-derived env carries.
-    intro: u8,
-}
-
-impl Site<'_> {
-    fn env(&self) -> ExprEnv {
-        ExprEnv {
-            n: QUERY_NS,
-            v: self.intro,
-            offset: self.offset,
-            ground_skip: 0,
-            base: Expr::from_slice(self.base),
-        }
-    }
 }
 
 /// One seek position in the pre-order walk of a factor's query columns -- the unit the join
@@ -573,54 +547,56 @@ impl Site<'_> {
 enum Step<'a> {
     /// Query variable `v` occupies this position: the schedulable slot.
     Var(usize),
-    /// A ground symbol leaf spanning `len` bytes from the site.
-    Sym { site: Site<'a>, len: usize },
-    /// A compound node; its children are the steps `s+1 .. end`.
-    Compound { site: Site<'a>, arity: u8, end: usize },
+    /// A ground symbol leaf. The env is the position in the column, exactly what the recursive
+    /// descent used to derive with `ExprEnv::args` (a stored wildcard here unifies against the
+    /// same pattern it always did); the symbol's byte length reads off its tag in O(1).
+    Sym(ExprEnv, PhantomData<&'a [u8]>),
+    /// A compound node; its children are the steps `s+1 .. end`. Arity reads off the tag byte.
+    Compound { env: ExprEnv, end: usize, _borrow: PhantomData<&'a [u8]> },
 }
 
 /// Flatten one column's encoded subterm at `base[offset..]` into steps, returning the offset and
 /// introduced-variable count just past it. `None` on a truncated term or a variable overflow, which
 /// the caller turns into "not routable".
 fn push_steps<'a>(
-    base: &'a [u8],
+    base: Expr,
     mut offset: usize,
     mut intro: u8,
     out: &mut Vec<Step<'a>>,
-) -> Option<(usize, u8)> {
-    let b = *base.get(offset)?;
-    let site = Site {
+) -> (usize, u8) {
+    // The body is engine-produced and already validated by the factor parse; the encoding is
+    // trusted, so this walk reads it raw.
+    let b = unsafe { *base.ptr.add(offset) };
+    let env = ExprEnv {
+        n: QUERY_NS,
+        v: intro,
+        offset: offset as u32,
+        ground_skip: 0,
         base,
-        offset: u32::try_from(offset).ok()?,
-        intro,
     };
     match byte_item(b) {
         Tag::NewVar => {
             out.push(Step::Var(intro as usize));
-            Some((offset + 1, intro.checked_add(1)?))
+            (offset + 1, intro + 1)
         }
         Tag::VarRef(id) => {
             out.push(Step::Var(id as usize));
-            Some((offset + 1, intro))
+            (offset + 1, intro)
         }
         Tag::SymbolSize(size) => {
-            let len = 1 + size as usize;
-            if offset.checked_add(len)? > base.len() {
-                return None;
-            }
-            out.push(Step::Sym { site, len });
-            Some((offset + len, intro))
+            out.push(Step::Sym(env, PhantomData));
+            (offset + 1 + size as usize, intro)
         }
         Tag::Arity(arity) => {
             let at = out.len();
             out.push(Step::Compound {
-                site,
-                arity,
+                env,
                 end: 0,
+                _borrow: PhantomData,
             });
             offset += 1;
             for _ in 0..arity {
-                let (next_offset, next_intro) = push_steps(base, offset, intro, out)?;
+                let (next_offset, next_intro) = push_steps(base, offset, intro, out);
                 offset = next_offset;
                 intro = next_intro;
             }
@@ -629,24 +605,24 @@ fn push_steps<'a>(
                 Step::Compound { end: slot, .. } => *slot = end,
                 _ => unreachable!("the pushed step is the compound just written"),
             }
-            Some((offset, intro))
+            (offset, intro)
         }
     }
 }
 
 /// The factor's columns flattened into one ordered step list. A top-level `Var` column is one slot,
 /// exactly as before; a `Term` column expands into its own pre-order walk.
-fn factor_steps<'a>(factor: &Factor<'a>) -> Option<Vec<Step<'a>>> {
+fn factor_steps<'a>(factor: &Factor<'a>) -> Vec<Step<'a>> {
     let mut out = Vec::with_capacity(factor.cols.len());
     for col in &factor.cols {
         match col {
             FactorColumn::Var(v) => out.push(Step::Var(*v)),
             FactorColumn::Term(term) => {
-                push_steps(term.bytes, 0, term.intro, &mut out)?;
+                push_steps(term.expr, 0, term.intro, &mut out);
             }
         }
     }
-    Some(out)
+    out
 }
 
 /// A query factor: its seek prefix in the PathMap, and every column in syntactic order. For a
@@ -658,9 +634,12 @@ fn factor_steps<'a>(factor: &Factor<'a>) -> Option<Vec<Step<'a>>> {
 /// variables at their trie position.
 #[derive(Clone, Debug)]
 pub struct Factor<'a> {
-    /// The relation's seek prefix: the conjunct's arity byte, borrowed from the body (empty for a
-    /// whole-atom factor, whose cursor opens at the root, and for a re-indexed factor, whose
-    /// columns were permuted into a private map).
+    /// The relation's seek prefix: TRIE PATH bytes, not an expression, which is why this stays a
+    /// slice while the columns hold `Expr`s. The body parser emits the conjunct's arity byte
+    /// alone (empty for a whole-atom factor, whose cursor opens at the trie root, and for a
+    /// re-indexed factor, whose columns were permuted into a private map); a direct construction
+    /// may bake a ground head into the prefix instead, at the cost of never matching a wildcard
+    /// stored head.
     pub prefix: &'a [u8],
     pub cols: Vec<FactorColumn<'a>>,
 }
@@ -836,14 +815,15 @@ fn reindex_regions(map: &PathMap<()>, factor: &Factor) -> Option<Vec<Vec<u8>>> {
     let FactorColumn::Term(head) = factor.cols.first()? else {
         return None;
     };
-    if !matches!(byte_item(head.bytes[0]), Tag::SymbolSize(_)) {
+    let head_tag = unsafe { byte_item(*head.expr.ptr) };
+    let Tag::SymbolSize(hsize) = head_tag else {
         return None;
-    }
-    // Only the head's first subterm is what the join matches; ignore any trailing bytes.
-    let hlen = first_subterm(&head.bytes)?.0;
+    };
+    // The head column IS the symbol: tag byte plus payload, read off the trusted encoding.
+    let head_bytes = unsafe { core::slice::from_raw_parts(head.expr.ptr, 1 + hsize as usize) };
     let mut regions = Vec::new();
     let mut ground = factor.prefix.to_vec();
-    ground.extend_from_slice(&head.bytes[..hlen]);
+    ground.extend_from_slice(head_bytes);
     regions.push(ground);
     let mask = map.read_zipper_at_path(factor.prefix).child_mask();
     for w in mask.iter() {
@@ -925,6 +905,8 @@ fn build_reindex<'a>(
 /// fully-ground answer rows (`row[v]` = global variable `v`'s value). A row with any still-free query
 /// variable is dropped here; the live route uses [`unify_join_zipper_partial`] instead, to keep it
 /// and bind only its ground components, exactly as the materialized route does.
+/// TEST tooling over the streaming join.
+#[cfg(test)]
 pub fn unify_join_zipper(
     map: &PathMap<()>,
     factors: &[Factor],
@@ -947,6 +929,8 @@ pub fn unify_join_zipper(
 /// through the trail. Inverted factors (a cyclic query has one) are re-indexed up front so the join
 /// can seek them; every other factor stays zero-copy on the live map. An assignment whose bindings
 /// close a cycle (an occurs violation built across columns) yields no row.
+/// TEST tooling over the streaming join.
+#[cfg(test)]
 pub fn unify_join_zipper_partial(
     map: &PathMap<()>,
     factors: &[Factor],
@@ -959,6 +943,8 @@ pub fn unify_join_zipper_partial(
 /// As [`unify_join_zipper_partial`], but returns each answer as one variable-coordinated tuple
 /// encoding (query variables `0..nvars` in order, sharing one intro map), so a free variable that
 /// spans answer positions renders with coordinated NewVar/VarRef the way MORK's emit does.
+/// TEST tooling over the streaming join.
+#[cfg(test)]
 fn unify_join_zipper_coordinated(
     map: &PathMap<()>,
     factors: &[Factor],
@@ -1030,10 +1016,7 @@ fn join_plan<'a>(
         }
     }
 
-    let steps = owned
-        .iter()
-        .map(factor_steps)
-        .collect::<Option<Vec<Vec<Step<'a>>>>>()?;
+    let steps = owned.iter().map(factor_steps).collect::<Vec<Vec<Step<'a>>>>();
 
     Some(JoinPlan {
         reindexes,
@@ -1054,7 +1037,6 @@ fn join_state<'a>(
     plan: &'a JoinPlan,
     var_order: &'a [usize],
     nvars: usize,
-    want_coordinated: bool,
 ) -> UnifyJoin<'a> {
     let nf = plan.factors.len();
     let cursors = (0..nf)
@@ -1063,7 +1045,7 @@ fn join_state<'a>(
                 Some(ri) => &plan.reindexes[ri],
                 None => map,
             };
-            SubtermCursor::new(src.read_zipper_at_path(&plan.factors[f].prefix))
+            SubtermCursor::new(src.read_zipper_at_path(plan.factors[f].prefix))
         })
         .collect();
 
@@ -1083,8 +1065,11 @@ fn join_state<'a>(
         free_bufs: Vec::new(),
         free_child_bufs: Vec::new(),
         lead_max: Vec::new(),
+        #[cfg(test)]
         out: BTreeSet::new(),
-        want_coordinated,
+        #[cfg(test)]
+        want_coordinated: false,
+        #[cfg(test)]
         coordinated: BTreeSet::new(),
         on_match: None,
         loc_buf: Vec::new(),
@@ -1095,6 +1080,9 @@ fn join_state<'a>(
 }
 
 /// Build the join state and run it, collecting answer rows (and coordinated tuples when asked).
+/// Materialization is TEST tooling: the live dispatch always streams (`on_match`), so the
+/// collecting fields, the row renderer and this runner compile only for tests.
+#[cfg(test)]
 fn run_unify_join(
     map: &PathMap<()>,
     factors: &[Factor],
@@ -1104,7 +1092,8 @@ fn run_unify_join(
 ) -> (BTreeSet<Vec<Option<Vec<u8>>>>, BTreeSet<Vec<u8>>) {
     let plan = join_plan(map, factors, var_order, nvars)
         .expect("parsed factors must flatten into steps");
-    let mut state = join_state(map, &plan, var_order, nvars, want_coordinated);
+    let mut state = join_state(map, &plan, var_order, nvars);
+    state.want_coordinated = want_coordinated;
     state.recurse(0);
     (state.out, state.coordinated)
 }
@@ -1122,7 +1111,7 @@ fn run_unify_join_stream_bindings(
 ) {
     let plan = join_plan(map, factors, var_order, nvars)
         .expect("parsed factors must flatten into steps");
-    let mut state = join_state(map, &plan, var_order, nvars, false);
+    let mut state = join_state(map, &plan, var_order, nvars);
     state.on_match = Some(on_match);
     state.recurse(0);
 }
@@ -1140,7 +1129,7 @@ fn run_unify_join_stream(
     on_tuple: &mut dyn FnMut(&[Vec<u8>]) -> bool,
 ) {
     let plan = join_plan(map, factors, var_order, nvars).expect("test factors must flatten");
-    let mut state = join_state(map, &plan, var_order, nvars, false);
+    let mut state = join_state(map, &plan, var_order, nvars);
     state.on_tuple = Some(on_tuple);
     state.recurse(0);
 }
@@ -1164,8 +1153,8 @@ fn run_unify_join_stream(
 /// Returns the factors and the variable count, or `None` if the body is not a well-formed
 /// conjunction: a non-compound body, the arity-0 body `()`, a truncated term, a `VarRef` naming a
 /// variable the body never introduced, or more than `u8::MAX` variables.
-pub fn parse_body_factors<'a>(body: &'a [u8]) -> Option<(Vec<Factor<'a>>, usize)> {
-    let Tag::Arity(nconj) = byte_item(*body.first()?) else {
+pub fn parse_body_factors<'a>(body: &'a Expr) -> Option<(Vec<Factor<'a>>, usize)> {
+    let Tag::Arity(nconj) = byte_item(unsafe { *body.ptr }) else {
         return None;
     };
     if nconj == 0 {
@@ -1178,7 +1167,7 @@ pub fn parse_body_factors<'a>(body: &'a [u8]) -> Option<(Vec<Factor<'a>>, usize)
         let conj_start = pos;
         if ci == 0 {
             // The `,` head itself carries no factor.
-            let scan = scan_subterm(body, pos, &mut intro)?;
+            let scan = scan_subterm(*body, pos, &mut intro)?;
             pos += scan.len;
             continue;
         }
@@ -1203,9 +1192,10 @@ pub fn parse_body_factors<'a>(body: &'a [u8]) -> Option<(Vec<Factor<'a>>, usize)
         // column is a plain `Var`, the variable is a first-class join variable that can be shared
         // with (and seeked in) any other conjunct. A single-column factor is never inverted, so
         // neither shape ever reaches the re-index path.
-        let (prefix, ncols): (&'a [u8], usize) = match byte_item(*body.get(pos)?) {
+        let (prefix, ncols): (&'a [u8], usize) = match byte_item(unsafe { *body.ptr.add(pos) }) {
             Tag::Arity(arity) if arity != 0 => {
-                let prefix = body.get(conj_start..conj_start + 1)?;
+                let prefix: &'a [u8] =
+                    unsafe { core::slice::from_raw_parts(body.ptr.add(conj_start), 1) };
                 pos += 1;
                 (prefix, arity as usize)
             }
@@ -1215,33 +1205,33 @@ pub fn parse_body_factors<'a>(body: &'a [u8]) -> Option<(Vec<Factor<'a>>, usize)
         for _ in 0..ncols {
             let col_intro = intro;
             let col_start = pos;
-            let scan = scan_subterm(body, pos, &mut intro)?;
-            let bytes = body.get(col_start..col_start + scan.len)?;
-            cols.push(if bytes.len() == 1 {
-                match byte_item(bytes[0]) {
+            let scan = scan_subterm(*body, pos, &mut intro)?;
+            let col_expr = Expr { ptr: unsafe { body.ptr.add(col_start) } };
+            cols.push(if scan.len == 1 {
+                match byte_item(unsafe { *col_expr.ptr }) {
                     Tag::NewVar => FactorColumn::Var(col_intro as usize),
                     Tag::VarRef(id) => FactorColumn::Var(id as usize),
                     Tag::SymbolSize(_) | Tag::Arity(_) => FactorColumn::Term(EncodedTerm {
-                        bytes,
+                        expr: col_expr,
                         intro: col_intro,
                         vars: scan.vars,
+                        _borrow: PhantomData,
                     }),
                 }
             } else {
                 FactorColumn::Term(EncodedTerm {
-                    bytes,
+                    expr: col_expr,
                     intro: col_intro,
                     vars: scan.vars,
+                    _borrow: PhantomData,
                 })
             });
             pos += scan.len;
         }
         factors.push(Factor { prefix, cols });
     }
-    // The body must be exactly one complete subterm.
-    if pos != body.len() {
-        return None;
-    }
+    // The conjunct scans consumed exactly the body's own span: an engine-produced body is one
+    // complete subterm by construction, so there is no trailing-byte case left to reject.
     Some((factors, intro as usize))
 }
 
@@ -1256,21 +1246,20 @@ struct SubtermScan {
 /// so far and is advanced past this subterm's own `NewVar`s, which is what gives each variable its
 /// body-global id. Returns `None` on a truncated term, a `VarRef` naming a variable that has not
 /// been introduced, or more than `u8::MAX` variables.
-fn scan_subterm(bytes: &[u8], at: usize, intro: &mut u8) -> Option<SubtermScan> {
+fn scan_subterm(body: Expr, at: usize, intro: &mut u8) -> Option<SubtermScan> {
     let mut i = at;
     let mut pending = 1usize;
     let mut vars = 0u64;
     while pending != 0 {
-        let b = *bytes.get(i)?;
+        // The body is engine-produced: the encoding is trusted and read raw. What remains
+        // fallible is the SEMANTIC validation -- variable numbering and the 63-variable cap.
+        let b = unsafe { *body.ptr.add(i) };
         i += 1;
         pending -= 1;
         match byte_item(b) {
             Tag::Arity(arity) => pending += arity as usize,
             Tag::SymbolSize(size) => {
-                i = i.checked_add(size as usize)?;
-                if i > bytes.len() {
-                    return None;
-                }
+                i += size as usize;
             }
             Tag::NewVar => {
                 let id = *intro;
@@ -1319,15 +1308,14 @@ pub fn query_multi_leapfrog<F: FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>
     pat_expr: Expr,
     mut effect: F,
 ) -> usize {
-    let body = unsafe { pat_expr.span().as_ref().unwrap() };
     // The join owns every body the engine hands it, so parsing is a precondition rather than a
     // decline: every conjunct shape is a factor, and the frontend does not emit the encodings that
-    // would fail here (a truncated term, a `VarRef` naming a variable the body never introduced,
-    // more than `u8::MAX` variables). A probe over the differential corpus, every resource program
-    // and the CLI suite saw no body fail. A violation is a bug in the producer and should surface
-    // as one, not as a silent detour to a different engine.
+    // would fail here (a `VarRef` naming a variable the body never introduced, more than 63
+    // variables). A probe over the differential corpus, every resource program and the CLI suite
+    // saw no body fail. A violation is a bug in the producer and should surface as one, not as a
+    // silent detour to a different engine.
     let (factors, nvars) =
-        parse_body_factors(body).expect("a transform body must be a well-formed conjunction");
+        parse_body_factors(&pat_expr).expect("a transform body must be a well-formed conjunction");
     if factors.is_empty() {
         // `(,)`: nothing constrains anything, so the body matches exactly once with empty
         // bindings. This mirrors `Space::query_multi`'s `n_factors == 1` arm byte for byte,
@@ -1450,12 +1438,15 @@ struct UnifyJoin<'a> {
     /// depth.
     lead_max: Vec<u8>,
     /// Answer rows, one `Option` per query variable: `Some(bytes)` for a resolved term, `None` for
-    /// a still-free variable. The all-ground entry filters to fully-ground rows.
+    /// a still-free variable. TEST-ONLY: the live dispatch always streams.
+    #[cfg(test)]
     out: BTreeSet<Vec<Option<Vec<u8>>>>,
-    /// When set, also collect each answer as one variable-coordinated tuple encoding in `coordinated`.
+    /// When set, also collect each answer as one variable-coordinated tuple encoding. TEST-ONLY.
+    #[cfg(test)]
     want_coordinated: bool,
-    /// Answer tuples encoded through one shared intro map, so free-variable coreference across answer
-    /// positions survives for the live renderer. Empty unless `want_coordinated`.
+    /// Answer tuples encoded through one shared intro map, so free-variable coreference across
+    /// answer positions survives. TEST-ONLY.
+    #[cfg(test)]
     coordinated: BTreeSet<Vec<u8>>,
     /// When set, each accepted assignment streams the join's OWN bindings (plus factor 0's stored
     /// fact as the stock contract's `loc`) here instead of collecting rows, and a `false` return
@@ -1549,26 +1540,34 @@ impl UnifyJoin<'_> {
                 }
                 return;
             }
+            // TEST-ONLY materialization below: the live dispatch always installs `on_match`.
+            #[cfg(not(test))]
+            unreachable!("the live join always streams through on_match");
             // Keep every component that resolved to a term, ground or schematic. A variable that is
             // still free is None; the live emit can then render schematic compounds and leave free
             // variables fresh, matching the ProductZipper's byte output.
             //
-            // `mork_expr::unify` checks occurs only per equation, so a cycle can arrive through a
-            // chain of columns (the join-propagated capture builds x0 = (k (k x0))). `apply`
-            // records in `cycled` every variable whose cycle it had to cut; `Expr::_unify` rejects
-            // exactly that after its own apply. Mirror it per answer row: a cyclic assignment is an
-            // occurs violation and yields no answer, as the ProductZipper's full unification does.
-            let mut cycled = BTreeMap::new();
-            let row: Vec<Option<Vec<u8>>> = (0..self.nvars)
-                .map(|v| self.query_component(v, &mut cycled))
-                .collect();
-            if !cycled.is_empty() {
-                return;
+            #[cfg(test)]
+            {
+                // `mork_expr::unify` checks occurs only per equation, so a cycle can arrive
+                // through a chain of columns (the join-propagated capture builds x0 = (k (k x0))).
+                // `apply` records in `cycled` every variable whose cycle it had to cut;
+                // `Expr::_unify` rejects exactly that after its own apply. Mirror it per answer
+                // row: a cyclic assignment is an occurs violation and yields no answer, as the
+                // ProductZipper's full unification does.
+                let mut cycled = BTreeMap::new();
+                let row: Vec<Option<Vec<u8>>> = (0..self.nvars)
+                    .map(|v| self.query_component(v, &mut cycled))
+                    .collect();
+                if !cycled.is_empty() {
+                    return;
+                }
+                self.out.insert(row);
+                if self.want_coordinated {
+                    self.coordinated.insert(self.emit_coordinated_tuple());
+                }
             }
-            self.out.insert(row);
-            if self.want_coordinated {
-                self.coordinated.insert(self.emit_coordinated_tuple());
-            }
+            #[cfg(test)]
             return;
         }
         let v = self.var_order[i];
@@ -1709,7 +1708,7 @@ impl UnifyJoin<'_> {
     fn original_fact_bytes_into(&self, f: usize, out: &mut Vec<u8>) {
         match &self.originals[f] {
             None => {
-                out.extend_from_slice(&self.factors[f].prefix);
+                out.extend_from_slice(self.factors[f].prefix);
                 out.extend_from_slice(self.cursors[f].consumed_bytes());
             }
             Some((orig_prefix, new_order)) => {
@@ -1932,6 +1931,7 @@ impl UnifyJoin<'_> {
         }
     }
 
+    #[cfg(test)]
     fn query_component(&self, v: usize, cycled: &mut BTreeMap<ExprVar, u8>) -> Option<Vec<u8>> {
         let env = self.query_var_env(v);
         if self.deref_env(env).var_opt().is_some() {
@@ -1941,6 +1941,7 @@ impl UnifyJoin<'_> {
         }
     }
 
+    #[cfg(test)]
     fn applied_var_len(&self, key: ExprVar, stack: &mut Vec<ExprVar>) -> usize {
         let Some(bound) = self.bindings.get(&key) else {
             return 1;
@@ -1954,6 +1955,7 @@ impl UnifyJoin<'_> {
         len
     }
 
+    #[cfg(test)]
     fn applied_len_inner(&self, env: ExprEnv, stack: &mut Vec<ExprVar>) -> usize {
         let mut ez = ExprZipper::new(env.subsexpr());
         let mut original = env.v;
@@ -1975,11 +1977,13 @@ impl UnifyJoin<'_> {
         }
     }
 
+    #[cfg(test)]
     fn applied_len(&self, env: ExprEnv) -> usize {
         self.applied_len_inner(env, &mut Vec::new())
     }
 
     #[allow(deprecated)]
+    #[cfg(test)]
     fn apply_env_into(
         &self,
         env: ExprEnv,
@@ -2017,6 +2021,7 @@ impl UnifyJoin<'_> {
         next_new
     }
 
+    #[cfg(test)]
     fn emit_env_bytes(&self, env: ExprEnv, cycled: &mut BTreeMap<ExprVar, u8>) -> Vec<u8> {
         let mut out = Vec::new();
         let mut stack = Vec::new();
@@ -2025,6 +2030,7 @@ impl UnifyJoin<'_> {
         out
     }
 
+    #[cfg(test)]
     fn emit_coordinated_tuple(&self) -> Vec<u8> {
         let mut out = Vec::new();
         let mut cycled = BTreeMap::new();
@@ -2189,10 +2195,8 @@ impl UnifyJoin<'_> {
         let s = self.next_step[f];
         match self.steps[f][s] {
             Step::Var(v) => self.consume_col(f, v, cont),
-            Step::Sym { site, len } => self.consume_sym(f, s, site, len, cont),
-            Step::Compound { site, arity, end } => {
-                self.consume_compound(f, s, site, arity, end, cont)
-            }
+            Step::Sym(env, _) => self.consume_sym(f, s, env, cont),
+            Step::Compound { env, end, .. } => self.consume_compound(f, s, env, end, cont),
         }
     }
 
@@ -2205,12 +2209,17 @@ impl UnifyJoin<'_> {
         &mut self,
         f: usize,
         s: usize,
-        site: Site<'_>,
-        len: usize,
+        env: ExprEnv,
         cont: &mut dyn FnMut(&mut Self),
     ) {
-        let start = site.offset as usize;
-        let bytes = &site.base[start..start + len];
+        // The symbol's span reads off its own tag: the encoding is trusted.
+        let bytes = unsafe {
+            let p = env.base.ptr.add(env.offset as usize);
+            let Tag::SymbolSize(size) = byte_item(*p) else {
+                unreachable!("a Sym step points at a symbol tag");
+            };
+            core::slice::from_raw_parts(p, 1 + size as usize)
+        };
         let (exact, mask) = self.ground_probe(f, bytes);
         if exact {
             self.with_bound_path_bytes(f, bytes, 0, &mut |this| {
@@ -2220,10 +2229,9 @@ impl UnifyJoin<'_> {
             });
         }
         if mask_has_wildcard(&mask) {
-            let pattern = site.env();
             for w in mask.iter() {
                 if is_wildcard_term(&[w]) {
-                    self.match_candidate(f, pattern, &[w], Self::wildcard_counts(w), &mut |this| {
+                    self.match_candidate(f, env, &[w], Self::wildcard_counts(w), &mut |this| {
                         this.next_step[f] = s + 1;
                         cont(this);
                         this.next_step[f] = s;
@@ -2244,19 +2252,24 @@ impl UnifyJoin<'_> {
         &mut self,
         f: usize,
         s: usize,
-        site: Site<'_>,
-        arity: u8,
+        env: ExprEnv,
         end: usize,
         cont: &mut dyn FnMut(&mut Self),
     ) {
+        // Arity reads off the tag byte: the encoding is trusted.
+        let arity = unsafe {
+            let Tag::Arity(arity) = byte_item(*env.base.ptr.add(env.offset as usize)) else {
+                unreachable!("a Compound step points at an arity tag");
+            };
+            arity
+        };
         // One mask read serves both the wildcard candidates and the arity-byte test: each
         // `match_candidate` restores `bound[f]`, so the zipper position is the same throughout.
         let mask = self.cursors[f].floor_child_mask();
         if mask_has_wildcard(&mask) {
-            let pattern = site.env();
             for w in mask.iter() {
                 if is_wildcard_term(&[w]) {
-                    self.match_candidate(f, pattern, &[w], Self::wildcard_counts(w), &mut |this| {
+                    self.match_candidate(f, env, &[w], Self::wildcard_counts(w), &mut |this| {
                         this.next_step[f] = end;
                         cont(this);
                         this.next_step[f] = s;
@@ -2494,14 +2507,15 @@ mod tests {
     }
 
     fn body_routable(body: &[u8]) -> bool {
-        parse_body_factors(body).is_some_and(|(factors, _)| !factors.is_empty())
+        parse_body_factors(&Expr::from_slice(body)).is_some_and(|(factors, _)| !factors.is_empty())
     }
 
     fn body_partial(
         map: &PathMap<()>,
         body: &[u8],
     ) -> Option<(usize, BTreeSet<Vec<Option<Vec<u8>>>>)> {
-        let (factors, nvars) = parse_body_factors(body)?;
+        let be = Expr::from_slice(body);
+        let (factors, nvars) = parse_body_factors(&be)?;
         if factors.is_empty() {
             return None;
         }
@@ -2521,7 +2535,8 @@ mod tests {
     }
 
     fn body_rows_rendered(map: &PathMap<()>, body: &[u8]) -> Option<BTreeSet<Vec<u8>>> {
-        let (factors, nvars) = parse_body_factors(body)?;
+        let be = Expr::from_slice(body);
+        let (factors, nvars) = parse_body_factors(&be)?;
         if factors.is_empty() {
             return None;
         }
@@ -2723,7 +2738,8 @@ mod tests {
             nest("e", &[nest("k", &[var_ref(1)]), new_var()]),
             nest("h", &[var_ref(2), var_ref(0)]),
         ]);
-        let (factors, nvars) = parse_body_factors(&body).expect("body parses");
+        let be = Expr::from_slice(&body);
+        let (factors, nvars) = parse_body_factors(&be).expect("body parses");
         let order: Vec<usize> = (0..nvars).collect();
         let rows = unify_join_zipper_partial(&map, &factors, &order, nvars);
         let k_v0 = nest("k", &[sym("v0")]);
@@ -2909,7 +2925,7 @@ mod tests {
             for (ci, col) in factors[f].cols.iter().enumerate() {
                 match col {
                     FactorColumn::Term(term) if term.is_ground() => {
-                        if term.bytes != row[ci] {
+                        if unsafe { term.expr.span().as_ref().unwrap() } != &row[ci][..] {
                             ok = false;
                             break;
                         }
@@ -2975,7 +2991,8 @@ mod tests {
             new_var(),
             vec![item_byte(Tag::Arity(0))],
         ]);
-        let (factors, nvars) = parse_body_factors(&body).expect("every conjunct shape must parse");
+        let be = Expr::from_slice(&body);
+        let (factors, nvars) = parse_body_factors(&be).expect("every conjunct shape must parse");
         assert_eq!(nvars, 3, "the trailing NewVar conjunct introduces a variable");
         assert_eq!(factors.len(), 5);
 
@@ -2992,18 +3009,17 @@ mod tests {
         let FactorColumn::Term(present) = &factors[1].cols[0] else {
             panic!("a bare symbol conjunct is a ground Term column");
         };
-        assert_eq!(present.bytes, &sym("present")[..]);
+        assert_eq!(unsafe { present.expr.span().as_ref().unwrap() }, &sym("present")[..]);
         assert!(present.is_ground());
-        assert_eq!(
-            factors[2].cols[0],
-            FactorColumn::Var(0),
+        assert!(
+            matches!(factors[2].cols[0], FactorColumn::Var(0)),
             "a bare VarRef conjunct is the same join variable its introducer named"
         );
-        assert_eq!(factors[3].cols[0], FactorColumn::Var(2));
+        assert!(matches!(factors[3].cols[0], FactorColumn::Var(2)));
         let FactorColumn::Term(nil) = &factors[4].cols[0] else {
             panic!("the empty compound is a ground Term column");
         };
-        assert_eq!(nil.bytes, &[item_byte(Tag::Arity(0))]);
+        assert_eq!(unsafe { nil.expr.span().as_ref().unwrap() }, &[item_byte(Tag::Arity(0))]);
     }
 
     /// `(,)` is a body with no conjunct. It parses to zero factors, which the dispatch reads as
@@ -3011,12 +3027,14 @@ mod tests {
     #[test]
     fn empty_conjunction_parses_to_no_factors() {
         let empty = conj(&[]);
-        let (factors, nvars) = parse_body_factors(&empty).expect("`(,)` is well formed");
+        let be = Expr::from_slice(&empty);
+        let (factors, nvars) = parse_body_factors(&be).expect("`(,)` is well formed");
         assert!(factors.is_empty());
         assert_eq!(nvars, 0);
         // A body that is not a conjunction at all is still declined, and is the only thing that is.
-        assert!(parse_body_factors(&sym("nope")).is_none());
-        assert!(parse_body_factors(&[item_byte(Tag::Arity(0))]).is_none());
+        let nb = sym("nope");
+        assert!(parse_body_factors(&Expr::from_slice(&nb)).is_none());
+        assert!(parse_body_factors(&Expr::from_slice(&[item_byte(Tag::Arity(0))])).is_none());
     }
 
     /// A constant conjunct is an existence check on that atom, and a fact stored as a bare
@@ -3227,7 +3245,7 @@ mod tests {
         for col in &factor.cols {
             match col {
                 FactorColumn::Var(id) => v.push(item_byte(Tag::VarRef(*id as u8))),
-                FactorColumn::Term(term) => v.extend_from_slice(&term.bytes),
+                FactorColumn::Term(term) => v.extend_from_slice(unsafe { term.expr.span().as_ref().unwrap() }),
             }
         }
         v
@@ -3478,7 +3496,7 @@ mod tests {
     /// when the factor is read standalone.
     fn globalize_term_vars(term: &EncodedTerm, out: &mut Vec<u8>) {
         let mut intro = term.intro;
-        let mut ez = ExprZipper::new(Expr::from_slice(term.bytes));
+        let mut ez = ExprZipper::new(term.expr);
         loop {
             match ez.item() {
                 Ok(Tag::NewVar) => {
@@ -3765,7 +3783,8 @@ mod tests {
             let all_facts: Vec<Vec<u8>> = e_facts.iter().chain(h_facts.iter()).cloned().collect();
 
             for (name, body) in &templates {
-                let Some((factors, nvars)) = parse_body_factors(body) else {
+                let be = Expr::from_slice(body);
+                let Some((factors, nvars)) = parse_body_factors(&be) else {
                     panic!("{name}: template must parse");
                 };
                 let order: Vec<usize> = (0..nvars).collect();
@@ -3807,17 +3826,17 @@ mod tests {
     #[test]
     fn nested_variables_become_seek_positions() {
         let body = conj(&[nest("data", &[nest("e", &[new_var(), new_var()])])]);
-        let (factors, nvars) = parse_body_factors(&body).expect("body parses");
+        let be = Expr::from_slice(&body);
+        let (factors, nvars) = parse_body_factors(&be).expect("body parses");
         assert_eq!(nvars, 2);
-        let steps = factor_steps(&factors[0]).expect("factor flattens");
+        let steps = factor_steps(&factors[0]);
         // The wrapper symbol, the inner compound node, its head symbol, then a position each for
         // `$0` and `$1`. The compound's subtree runs to the end of the factor.
         assert_eq!(steps.len(), 5, "one position per node of the pre-order walk");
-        assert!(matches!(steps[0], Step::Sym { .. }));
+        assert!(matches!(steps[0], Step::Sym(..)));
         assert!(matches!(
             steps[1],
             Step::Compound {
-                arity: 3,
                 end: 5,
                 ..
             }
@@ -3945,7 +3964,8 @@ mod tests {
         s.add_all_sexpr("(e a a)\n(e b a)\n(f $u $u)\n(f a b)\n".as_bytes())
             .unwrap();
         let body = enc("(, (e $x $y) (f $y $x))");
-        let (factors, nvars) = parse_body_factors(&body).unwrap();
+        let be = Expr::from_slice(&body);
+        let (factors, nvars) = parse_body_factors(&be).unwrap();
         let var_order: Vec<usize> = (0..nvars).collect();
         {
             let mut var_pos = vec![0usize; nvars];
