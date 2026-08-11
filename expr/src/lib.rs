@@ -113,6 +113,11 @@ pub enum Tag {
 // - stay shared as long as possible
 // - bring shared information to the front (bulk)
 
+/// The one-byte encoding of a lone new variable, `$`: the expression every fresh, unconstrained
+/// variable position denotes. Callers that need "an expression that is just a variable" (variable
+///-to-variable binding links, placeholder envs) point at this instead of re-deriving the byte.
+pub const NEW_VAR_EXPR_BYTES: [u8; 1] = [item_byte(Tag::NewVar)];
+
 #[inline(always)]
 pub const fn item_byte(b: Tag) -> u8 {
     match b {
@@ -293,6 +298,12 @@ impl Expr {
             if let Tag::Arity(n) = byte_item(*self.ptr) { Some(n) }
             else { None }
         }
+    }
+
+    /// View encoded bytes as an expression. The pointer is stored mutably for historical reasons,
+    /// but every read-side consumer treats it as immutable; the caller keeps the bytes alive.
+    pub fn from_slice(bytes: &[u8]) -> Expr {
+        Expr { ptr: bytes.as_ptr().cast_mut() }
     }
 
     pub fn span(self) -> *const [u8] {
@@ -1711,7 +1722,13 @@ pub fn serialize(bytes: &[u8]) -> String {
 unsafe impl Sync for Expr {}
 unsafe impl Send for Expr {}
 
-type ExprVar = (u8, u8);
+/// A variable's identity in a multi-expression unification: `(namespace, introduction index)`.
+/// Public so consumers of [`unify`]'s bindings (the kernel's joins) name the key type instead of
+/// re-declaring the tuple.
+pub type ExprVar = (u8, u8);
+/// What [`unify`] solves to: each variable's binding, an [`ExprEnv`] view into one of the unified
+/// expressions.
+pub type Bindings = BTreeMap<ExprVar, ExprEnv>;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ExprEnv {

@@ -23,7 +23,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 const QUERY_NS: u8 = 0;
-const NEW_VAR_EXPR_BYTES: [u8; 1] = [item_byte(Tag::NewVar)];
 
 /// The least byte present in `mask` that is `>= k`, or `None` if every set bit is below `k`.
 /// `ByteMask::next_bit` returns the least bit strictly above its argument, so test `k` itself
@@ -171,12 +170,6 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
         }
     }
 
-    /// The key: the current column's (possibly partial) subterm, as a view of the zipper's path.
-    #[inline]
-    fn key_bytes(&self) -> &[u8] {
-        &self.z.path()[self.floor..]
-    }
-
     #[inline]
     fn key_len(&self) -> usize {
         self.z.path().len() - self.floor
@@ -208,7 +201,7 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
         );
         debug_assert_eq!(
             complete,
-            is_complete(self.key_bytes()),
+            is_complete(&self.z.path()[self.floor..]),
             "incremental subterm-parse state diverged from the replay"
         );
         complete
@@ -416,15 +409,18 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
         }
     }
 
-    /// The current subterm bytes, or `None` when exhausted.
+    /// The current subterm bytes, or `None` when exhausted: the enumeration's read API, a view
+    /// of the zipper's own path.
     pub fn key(&self) -> Option<&[u8]> {
         if self.at_end {
             None
         } else {
-            Some(self.key_bytes())
+            Some(&self.z.path()[self.floor..])
         }
     }
 
+    /// Exhaustion without borrowing the key: the leapfrog's candidate loop tests this while
+    /// `seek` takes OTHER cursors mutably, which a `key().is_some()` borrow would forbid.
     pub fn at_end(&self) -> bool {
         self.at_end
     }
@@ -478,10 +474,7 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
 }
 
 
-/// The `(namespace, variable)` key of `mork_expr::unify`'s bindings map. `mork_expr` keeps its
-/// `ExprVar = (u8, u8)` alias private, so the concrete pair type is named again here.
-type BindingKey = (u8, u8);
-type Bindings = BTreeMap<BindingKey, ExprEnv>;
+use mork_expr::{Bindings, ExprVar, NEW_VAR_EXPR_BYTES};
 
 /// A materialized encoded term plus the query-variable intro count before it in the original body.
 /// The bytes stay in MORK's native encoding; unification and substitution operate through
@@ -489,39 +482,24 @@ type Bindings = BTreeMap<BindingKey, ExprEnv>;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EncodedTerm<'a> {
     /// Borrowed straight out of the body being evaluated. The body outlives the join, so a plan
-    /// never copies term bytes.
+    /// never copies term bytes. A slice rather than a bare `Expr`/offset deliberately: its length
+    /// is the bounds authority for every raw parse the plan performs (`push_steps`,
+    /// `scan_subterm` index with `get`, never trusting the encoding), which a pointer alone
+    /// cannot offer.
     pub bytes: &'a [u8],
     pub intro: u8,
     /// Bitmask of the query variables this term mentions, filled in by the single parse scan so
-    /// groundness and variable-position queries need no further traversal.
+    /// groundness and variable-position queries need no further traversal. The parser caps an
+    /// expression at 63 variables (a body that exceeds it is not routable), so the mask is total.
     vars: u64,
-    /// Set when a variable id >= 64 occurs, which the mask cannot represent; the affected queries
-    /// then fall back to a walk. MORK's parser caps an expression at 63 variables, so in practice
-    /// this never trips.
-    wide: bool,
 }
 
 impl<'a> EncodedTerm<'a> {
-    fn expr(&self) -> Expr {
-        expr_from_bytes(self.bytes)
-    }
-
-    fn tag(&self) -> Tag {
-        byte_item(self.bytes[0])
-    }
-
     fn is_ground(&self) -> bool {
-        self.vars == 0 && !self.wide
-    }
-
-    fn is_nonground_compound(&self) -> bool {
-        matches!(self.tag(), Tag::Arity(_)) && !self.is_ground()
+        self.vars == 0
     }
 
     fn min_var_pos(&self, var_pos: &[usize]) -> Option<usize> {
-        if self.wide {
-            return min_var_pos_in_expr(self.expr(), self.intro, var_pos);
-        }
         let mut best: Option<usize> = None;
         let mut m = self.vars;
         while m != 0 {
@@ -550,11 +528,6 @@ impl<'a> FactorColumn<'a> {
         }
     }
 
-    /// Whether this column is a compound containing a variable, the shape the routing gate
-    /// inspects.
-    pub fn is_nonground_compound(&self) -> bool {
-        matches!(self, FactorColumn::Term(term) if term.is_nonground_compound())
-    }
 }
 
 /// The query-side view of one position in the pre-order walk of a factor's columns: exactly enough
@@ -578,7 +551,7 @@ impl Site<'_> {
             v: self.intro,
             offset: self.offset,
             ground_skip: 0,
-            base: expr_from_bytes(self.base),
+            base: Expr::from_slice(self.base),
         }
     }
 }
@@ -692,97 +665,6 @@ pub struct Factor<'a> {
     pub cols: Vec<FactorColumn<'a>>,
 }
 
-fn expr_from_bytes(bytes: &[u8]) -> Expr {
-    Expr {
-        ptr: bytes.as_ptr().cast_mut(),
-    }
-}
-
-fn expr_span_len(expr: Expr) -> usize {
-    unsafe { expr.span().as_ref().unwrap().len() }
-}
-
-fn expr_is_ground(expr: Expr) -> bool {
-    let mut ez = ExprZipper::new(expr);
-    loop {
-        match ez.tag() {
-            Tag::NewVar | Tag::VarRef(_) => return false,
-            Tag::SymbolSize(_) | Tag::Arity(_) => {}
-        }
-        if !ez.next() {
-            return true;
-        }
-    }
-}
-
-fn expr_children<'a>(term: &EncodedTerm<'a>) -> Option<Vec<EncodedTerm<'a>>> {
-    let Tag::Arity(arity) = term.tag() else {
-        return None;
-    };
-    let mut children = Vec::with_capacity(arity as usize);
-    if arity == 0 {
-        return Some(children);
-    }
-    let mut intro = term.intro;
-    let mut pos = 1usize;
-    for _ in 0..arity {
-        let child_intro = intro;
-        let scan = scan_subterm(term.bytes, pos, &mut intro)?;
-        children.push(EncodedTerm {
-            bytes: term.bytes.get(pos..pos + scan.len)?,
-            intro: child_intro,
-            vars: scan.vars,
-            wide: scan.wide,
-        });
-        pos += scan.len;
-    }
-    Some(children)
-}
-
-fn validate_vars_and_count(expr: Expr) -> Option<usize> {
-    let mut ez = ExprZipper::new(expr);
-    let mut intros = 0usize;
-    loop {
-        match ez.tag() {
-            Tag::NewVar => {
-                intros = intros.checked_add(1)?;
-                if intros > u8::MAX as usize {
-                    return None;
-                }
-            }
-            Tag::VarRef(i) if i as usize >= intros => return None,
-            Tag::VarRef(_) | Tag::SymbolSize(_) | Tag::Arity(_) => {}
-        }
-        if !ez.next() {
-            return Some(intros);
-        }
-    }
-}
-
-fn min_var_pos_in_expr(expr: Expr, intro_start: u8, var_pos: &[usize]) -> Option<usize> {
-    let mut ez = ExprZipper::new(expr);
-    let mut intro = intro_start as usize;
-    let mut min_pos: Option<usize> = None;
-    loop {
-        let var = match ez.tag() {
-            Tag::NewVar => {
-                let id = intro;
-                intro += 1;
-                Some(id)
-            }
-            Tag::VarRef(i) => Some(i as usize),
-            Tag::SymbolSize(_) | Tag::Arity(_) => None,
-        };
-        if let Some(id) = var {
-            let pos = var_pos[id];
-            min_pos = Some(min_pos.map_or(pos, |current| current.min(pos)));
-        }
-        if !ez.next() {
-            return min_pos;
-        }
-    }
-}
-
 
 
 
@@ -863,7 +745,7 @@ fn split_columns(bytes: &[u8], ncols: usize) -> Vec<&[u8]> {
     let mut cols = Vec::with_capacity(ncols);
     let mut i = 0;
     for _ in 0..ncols {
-        let len = expr_span_len(expr_from_bytes(&bytes[i..]));
+        let len = unsafe { Expr::from_slice(&bytes[i..]).span().as_ref().unwrap().len() };
         cols.push(&bytes[i..i + len]);
         i += len;
     }
@@ -878,7 +760,7 @@ fn columns_to_items(cols: &[&[u8]]) -> Vec<Vec<Item>> {
     let mut out = Vec::with_capacity(cols.len());
     for col in cols {
         let mut items = Vec::new();
-        let mut ez = ExprZipper::new(expr_from_bytes(col));
+        let mut ez = ExprZipper::new(Expr::from_slice(col));
         loop {
             match ez.item() {
                 Ok(Tag::Arity(arity)) => items.push(Item::Byte(item_byte(Tag::Arity(arity)))),
@@ -954,7 +836,7 @@ fn reindex_regions(map: &PathMap<()>, factor: &Factor) -> Option<Vec<Vec<u8>>> {
     let FactorColumn::Term(head) = factor.cols.first()? else {
         return None;
     };
-    if !matches!(head.tag(), Tag::SymbolSize(_)) {
+    if !matches!(byte_item(head.bytes[0]), Tag::SymbolSize(_)) {
         return None;
     }
     // Only the head's first subterm is what the join matches; ignore any trailing bytes.
@@ -1272,8 +1154,8 @@ fn run_unify_join_stream(
 /// borrow it. The same scan that finds each column's span also validates the variable numbering
 /// (a `VarRef` must name an already-introduced variable), counts the body's variables, and records
 /// each column's variable mask -- work that used to cost a separate traversal apiece
-/// (`validate_vars_and_count`, `expr_is_ground`, `min_var_pos_in_expr`) on top of three rounds of
-/// copying. Every byte of the body is visited exactly once.
+/// (a variable-numbering validation, a groundness walk, a variable-position walk apiece) on top
+/// of three rounds of copying. Every byte of the body is visited exactly once.
 ///
 /// EVERY conjunct shape is a factor; see the per-conjunct comment below for the two encodings.
 /// A body with no conjunct at all (`(,)`, arity 1) parses to zero factors, which the join reads as
@@ -1343,7 +1225,6 @@ pub fn parse_body_factors<'a>(body: &'a [u8]) -> Option<(Vec<Factor<'a>>, usize)
                         bytes,
                         intro: col_intro,
                         vars: scan.vars,
-                        wide: scan.wide,
                     }),
                 }
             } else {
@@ -1351,7 +1232,6 @@ pub fn parse_body_factors<'a>(body: &'a [u8]) -> Option<(Vec<Factor<'a>>, usize)
                     bytes,
                     intro: col_intro,
                     vars: scan.vars,
-                    wide: scan.wide,
                 })
             });
             pos += scan.len;
@@ -1369,7 +1249,6 @@ pub fn parse_body_factors<'a>(body: &'a [u8]) -> Option<(Vec<Factor<'a>>, usize)
 struct SubtermScan {
     len: usize,
     vars: u64,
-    wide: bool,
 }
 
 /// Walk the complete subterm at `bytes[at..]` once, returning its byte length and the mask of
@@ -1381,7 +1260,6 @@ fn scan_subterm(bytes: &[u8], at: usize, intro: &mut u8) -> Option<SubtermScan> 
     let mut i = at;
     let mut pending = 1usize;
     let mut vars = 0u64;
-    let mut wide = false;
     while pending != 0 {
         let b = *bytes.get(i)?;
         i += 1;
@@ -1396,29 +1274,25 @@ fn scan_subterm(bytes: &[u8], at: usize, intro: &mut u8) -> Option<SubtermScan> 
             }
             Tag::NewVar => {
                 let id = *intro;
-                *intro = intro.checked_add(1)?;
-                if (id as usize) < 64 {
-                    vars |= 1u64 << id;
-                } else {
-                    wide = true;
+                // The parser caps an expression at 63 variables, so an id never escapes the
+                // mask; a body that violates that is simply not routable.
+                if id >= 64 {
+                    return None;
                 }
+                *intro = intro.checked_add(1)?;
+                vars |= 1u64 << id;
             }
             Tag::VarRef(id) => {
                 if id >= *intro {
                     return None;
                 }
-                if (id as usize) < 64 {
-                    vars |= 1u64 << id;
-                } else {
-                    wide = true;
-                }
+                vars |= 1u64 << id;
             }
         }
     }
     Some(SubtermScan {
         len: i - at,
         vars,
-        wide,
     })
 }
 
@@ -2003,17 +1877,17 @@ impl UnifyJoin<'_> {
             v: v as u8,
             offset: 0,
             ground_skip: 0,
-            base: expr_from_bytes(&NEW_VAR_EXPR_BYTES),
+            base: Expr::from_slice(&NEW_VAR_EXPR_BYTES),
         }
     }
 
-    fn var_env(&self, (n, v): BindingKey) -> ExprEnv {
+    fn var_env(&self, (n, v): ExprVar) -> ExprEnv {
         ExprEnv {
             n,
             v,
             offset: 0,
             ground_skip: 0,
-            base: expr_from_bytes(&NEW_VAR_EXPR_BYTES),
+            base: Expr::from_slice(&NEW_VAR_EXPR_BYTES),
         }
     }
 
@@ -2028,7 +1902,7 @@ impl UnifyJoin<'_> {
             v: intro,
             offset: 0,
             ground_skip,
-            base: expr_from_bytes(bytes),
+            base: Expr::from_slice(bytes),
         }
     }
 
@@ -2058,7 +1932,7 @@ impl UnifyJoin<'_> {
         }
     }
 
-    fn query_component(&self, v: usize, cycled: &mut BTreeMap<BindingKey, u8>) -> Option<Vec<u8>> {
+    fn query_component(&self, v: usize, cycled: &mut BTreeMap<ExprVar, u8>) -> Option<Vec<u8>> {
         let env = self.query_var_env(v);
         if self.deref_env(env).var_opt().is_some() {
             None
@@ -2067,7 +1941,7 @@ impl UnifyJoin<'_> {
         }
     }
 
-    fn applied_var_len(&self, key: BindingKey, stack: &mut Vec<BindingKey>) -> usize {
+    fn applied_var_len(&self, key: ExprVar, stack: &mut Vec<ExprVar>) -> usize {
         let Some(bound) = self.bindings.get(&key) else {
             return 1;
         };
@@ -2080,7 +1954,7 @@ impl UnifyJoin<'_> {
         len
     }
 
-    fn applied_len_inner(&self, env: ExprEnv, stack: &mut Vec<BindingKey>) -> usize {
+    fn applied_len_inner(&self, env: ExprEnv, stack: &mut Vec<ExprVar>) -> usize {
         let mut ez = ExprZipper::new(env.subsexpr());
         let mut original = env.v;
         let mut len = 0usize;
@@ -2111,9 +1985,9 @@ impl UnifyJoin<'_> {
         env: ExprEnv,
         new_intros: u8,
         out: &mut Vec<u8>,
-        cycled: &mut BTreeMap<BindingKey, u8>,
-        stack: &mut Vec<BindingKey>,
-        assignments: &mut Vec<BindingKey>,
+        cycled: &mut BTreeMap<ExprVar, u8>,
+        stack: &mut Vec<ExprVar>,
+        assignments: &mut Vec<ExprVar>,
     ) -> u8 {
         let len = self.applied_len(env).max(1);
         let start = out.len();
@@ -2143,7 +2017,7 @@ impl UnifyJoin<'_> {
         next_new
     }
 
-    fn emit_env_bytes(&self, env: ExprEnv, cycled: &mut BTreeMap<BindingKey, u8>) -> Vec<u8> {
+    fn emit_env_bytes(&self, env: ExprEnv, cycled: &mut BTreeMap<ExprVar, u8>) -> Vec<u8> {
         let mut out = Vec::new();
         let mut stack = Vec::new();
         let mut assignments = Vec::new();
@@ -3378,8 +3252,8 @@ mod tests {
             .enumerate()
             .map(|(i, (q, f))| {
                 (
-                    ExprEnv::new(QUERY_NS, expr_from_bytes(q)),
-                    ExprEnv::new(1 + i as u8, expr_from_bytes(f)),
+                    ExprEnv::new(QUERY_NS, Expr::from_slice(q)),
+                    ExprEnv::new(1 + i as u8, Expr::from_slice(f)),
                 )
             })
             .collect();
@@ -3394,7 +3268,7 @@ mod tests {
                     v: v as u8,
                     offset: 0,
                     ground_skip: 0,
-                    base: expr_from_bytes(&NEW_VAR_EXPR_BYTES),
+                    base: Expr::from_slice(&NEW_VAR_EXPR_BYTES),
                 };
                 loop {
                     let Some(var) = env.var_opt() else { break };
@@ -3604,7 +3478,7 @@ mod tests {
     /// when the factor is read standalone.
     fn globalize_term_vars(term: &EncodedTerm, out: &mut Vec<u8>) {
         let mut intro = term.intro;
-        let mut ez = ExprZipper::new(term.expr());
+        let mut ez = ExprZipper::new(Expr::from_slice(term.bytes));
         loop {
             match ez.item() {
                 Ok(Tag::NewVar) => {
@@ -3641,14 +3515,14 @@ mod tests {
     fn naive_component(
         bindings: &Bindings,
         v: usize,
-        cycled: &mut BTreeMap<BindingKey, u8>,
+        cycled: &mut BTreeMap<ExprVar, u8>,
     ) -> Option<Vec<u8>> {
         let mut env = ExprEnv {
             n: QUERY_NS,
             v: v as u8,
             offset: 0,
             ground_skip: 0,
-            base: expr_from_bytes(&NEW_VAR_EXPR_BYTES),
+            base: Expr::from_slice(&NEW_VAR_EXPR_BYTES),
         };
         loop {
             match env.var_opt() {
@@ -3700,8 +3574,8 @@ mod tests {
             .enumerate()
             .map(|(i, (q, f))| {
                 (
-                    ExprEnv::new(QUERY_NS, expr_from_bytes(q)),
-                    ExprEnv::new(1 + i as u8, expr_from_bytes(f)),
+                    ExprEnv::new(QUERY_NS, Expr::from_slice(q)),
+                    ExprEnv::new(1 + i as u8, Expr::from_slice(f)),
                 )
             })
             .collect();
