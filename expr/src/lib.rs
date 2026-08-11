@@ -1806,6 +1806,69 @@ impl std::hash::Hash for ExprEnv {
     }
 }
 
+// ---- The subterm walk, in its three canonical forms. ----
+//
+// The encoding is prefix-free and self-delimiting: an `Arity(k)` owes the next `k` complete
+// subterms, a `SymbolSize(s)` owes `s` raw payload bytes, a variable is one byte. Everything that
+// walks an expression is an instance of that one recurrence, and the facts a walk yields --
+// byte length, groundness, variable introductions -- are exactly what [`ExprEnv`] carries
+// (`ground_skip`, `v`), so walks should produce them once and stamp them, never be repeated.
+// The three forms below differ only in how the walk is driven:
+//  - [`subterm_parse_step`]: byte-at-a-time, resumable -- for cursors that interleave the parse
+//    with trie navigation and must know mid-descent whether a subterm has completed;
+//  - [`first_subterm`]: batch over raw bytes -- length and groundness of the first complete
+//    subterm, tolerant of `VarRef`s that point outside the span (a subterm cut from the middle
+//    of a fact may reference variables introduced before it);
+//  - [`apply_e`]'s item loop and the `traverse!`/`traverseh!` folds: item-at-a-time -- symbols
+//    consumed whole, so only the subterm counter is live (no payload state).
+
+/// One byte of the resumable parse: `subterms` complete terms and `payload` raw bytes are still
+/// owed; a key spells exactly one complete subterm iff both are zero (starting from `(1, 0)`).
+/// An expression is at most `u32::MAX - 1` bytes, which bounds both.
+#[inline]
+pub fn subterm_parse_step(b: u8, subterms: &mut u32, payload: &mut u32) {
+    if *payload > 0 {
+        *payload -= 1;
+    } else {
+        *subterms -= 1;
+        match byte_item(b) {
+            Tag::Arity(arity) => *subterms += arity as u32,
+            Tag::SymbolSize(size) => *payload += size as u32,
+            Tag::VarRef(_) | Tag::NewVar => {}
+        }
+    }
+}
+
+/// The extent of one complete subterm at the front of a byte run.
+pub struct SubtermProps {
+    pub length: usize,
+    pub ground: bool,
+}
+
+/// Batch form: the extent of the first complete subterm at `bytes[0..]`, or `None` on a truncated
+/// term. Groundness here is the same fact [`ExprEnv::ground_skip`] stamps.
+pub fn first_subterm(bytes: &[u8]) -> Option<SubtermProps> {
+    let mut i = 0usize;
+    let mut remaining = 1usize;
+    let mut ground = true;
+    while remaining > 0 {
+        let b = *bytes.get(i)?;
+        i += 1;
+        remaining -= 1;
+        match byte_item(b) {
+            Tag::Arity(arity) => remaining += arity as usize,
+            Tag::VarRef(_) | Tag::NewVar => ground = false,
+            Tag::SymbolSize(size) => {
+                i = i.checked_add(size as usize)?;
+                if i > bytes.len() {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(SubtermProps { length: i, ground })
+}
+
 pub struct TraverseSide { ee: ExprEnv, vars: u32 }
 impl Traversal<(), ()> for TraverseSide {
     #[inline(always)] fn new_var(&mut self, offset: usize) -> () { self.ee.v += 1; self.vars += 1; }

@@ -60,53 +60,6 @@ pub fn least_ge(mask: &ByteMask, k: u8) -> Option<u8> {
     }
 }
 
-/// One byte of the resumable subterm parse: `subterms` complete terms and `payload` raw bytes
-/// are still owed; a key spells exactly one complete subterm iff both are zero (starting from
-/// `(1, 0)`). An expression is at most `u32::MAX - 1` bytes, which bounds both.
-#[inline]
-fn subterm_parse_step(b: u8, subterms: &mut u32, payload: &mut u32) {
-    if *payload > 0 {
-        *payload -= 1;
-    } else {
-        *subterms -= 1;
-        match byte_item(b) {
-            Tag::Arity(arity) => *subterms += arity as u32,
-            Tag::SymbolSize(size) => *payload += size as u32,
-            Tag::VarRef(_) | Tag::NewVar => {}
-        }
-    }
-}
-
-/// The extent of one complete subterm at the front of a byte run.
-struct SubtermProps {
-    length: usize,
-    ground: bool,
-}
-
-/// Batch form of the parse: the first complete subterm at `bytes[0..]`, or `None` on a truncated
-/// term.
-fn first_subterm(bytes: &[u8]) -> Option<SubtermProps> {
-    let mut i = 0usize;
-    let mut remaining = 1usize;
-    let mut ground = true;
-    while remaining > 0 {
-        let b = *bytes.get(i)?;
-        i += 1;
-        remaining -= 1;
-        match byte_item(b) {
-            Tag::Arity(arity) => remaining += arity as usize,
-            Tag::VarRef(_) | Tag::NewVar => ground = false,
-            Tag::SymbolSize(size) => {
-                i = i.checked_add(size as usize)?;
-                if i > bytes.len() {
-                    return None;
-                }
-            }
-        }
-    }
-    Some(SubtermProps { length: i, ground })
-}
-
 /// Whether `bytes` (from the column-start focus) spell exactly one complete subterm, by replaying
 /// the parse from scratch. [`SubtermCursor`] tracks this incrementally instead — replaying it per
 /// descent step made completing an L-byte subterm O(L^2), which dominated the join on MORK's real
@@ -117,7 +70,7 @@ fn first_subterm(bytes: &[u8]) -> Option<SubtermProps> {
 fn is_complete(bytes: &[u8]) -> bool {
     let (mut subterms, mut payload) = (1u32, 0u32);
     for &b in bytes {
-        subterm_parse_step(b, &mut subterms, &mut payload);
+        mork_expr::subterm_parse_step(b, &mut subterms, &mut payload);
     }
     subterms == 0 && payload == 0
 }
@@ -284,7 +237,7 @@ impl<Z: Zipper + ZipperMoving + ZipperIteration> SubtermCursor<Z> {
                 _ => {}
             }
         }
-        subterm_parse_step(b, &mut self.col.owed_subterms, &mut self.col.owed_payload);
+        mork_expr::subterm_parse_step(b, &mut self.col.owed_subterms, &mut self.col.owed_payload);
     }
 
     /// Account for the key's last byte `b` leaving (the caller moves the zipper), restoring the
@@ -995,7 +948,7 @@ pub fn unify_join_zipper(
         .into_iter()
         .filter_map(|row| {
             row.into_iter()
-                .map(|component| component.filter(|bytes| first_subterm(bytes).is_some_and(|props| props.ground)))
+                .map(|component| component.filter(|bytes| mork_expr::first_subterm(bytes).is_some_and(|props| props.ground)))
                 .collect::<Option<Vec<Vec<u8>>>>()
         })
         .collect()
@@ -2561,7 +2514,7 @@ mod tests {
         rows.into_iter()
             .map(|row| {
                 row.into_iter()
-                    .map(|component| component.filter(|bytes| first_subterm(bytes).is_some_and(|props| props.ground)))
+                    .map(|component| component.filter(|bytes| mork_expr::first_subterm(bytes).is_some_and(|props| props.ground)))
                     .collect::<Option<Vec<Vec<u8>>>>()
             })
             .collect()
@@ -3186,10 +3139,10 @@ mod tests {
 
     /// Test-local aliases over the shared walk (the join's own copies are gone).
     fn first_subterm_len(bytes: &[u8]) -> usize {
-        first_subterm(bytes).expect("well-formed test term").length
+        mork_expr::first_subterm(bytes).expect("well-formed test term").length
     }
     fn first_subterm_is_ground(bytes: &[u8]) -> bool {
-        first_subterm(bytes).expect("well-formed test term").ground
+        mork_expr::first_subterm(bytes).expect("well-formed test term").ground
     }
 
     #[test]
@@ -3325,7 +3278,7 @@ mod tests {
                     }
                 }
                 let bytes = unsafe { env.subsexpr().span().as_ref().unwrap() }.to_vec();
-                if !first_subterm(&bytes).is_some_and(|props| props.ground) {
+                if !mork_expr::first_subterm(&bytes).is_some_and(|props| props.ground) {
                     return;
                 }
                 row.push(bytes);
