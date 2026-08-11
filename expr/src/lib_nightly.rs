@@ -77,6 +77,13 @@ impl Debug for OwnedSourceItem {
 pub trait ItemSink {
     fn tag(&mut self, tag: Tag);
     fn symbol(&mut self, bytes: &[u8]);
+    /// Append an already-encoded, variable-free expression whole.
+    ///
+    /// A ground subterm re-encodes to exactly its own bytes, so the item walk over it is the
+    /// identity; this lets [`apply_e`] replace that walk with one bulk copy when a binding
+    /// carries a ground stamp ([`crate::ExprEnv::ground_skip`]). Item-for-item equivalent to
+    /// feeding the span through `tag`/`symbol`.
+    fn ground(&mut self, bytes: &[u8]);
 }
 
 impl<T: ItemSink + ?Sized> ItemSink for &mut T {
@@ -87,6 +94,10 @@ impl<T: ItemSink + ?Sized> ItemSink for &mut T {
     #[inline(always)]
     fn symbol(&mut self, bytes: &[u8]) {
         (**self).symbol(bytes)
+    }
+    #[inline(always)]
+    fn ground(&mut self, bytes: &[u8]) {
+        (**self).ground(bytes)
     }
 }
 
@@ -101,6 +112,8 @@ impl ItemSink for NullSink {
     fn tag(&mut self, _tag: Tag) {}
     #[inline(always)]
     fn symbol(&mut self, _bytes: &[u8]) {}
+    #[inline(always)]
+    fn ground(&mut self, _bytes: &[u8]) {}
 }
 
 /// Appends the encoded expression to a byte vector.
@@ -115,6 +128,10 @@ impl ItemSink for VecSink<'_> {
     fn symbol(&mut self, bytes: &[u8]) {
         debug_assert!(bytes.len() < 64);
         self.0.push(item_byte(Tag::SymbolSize(bytes.len() as _)));
+        self.0.extend_from_slice(bytes);
+    }
+    #[inline(always)]
+    fn ground(&mut self, bytes: &[u8]) {
         self.0.extend_from_slice(bytes);
     }
 }
@@ -151,6 +168,11 @@ impl ItemSink for SliceSink<'_> {
         debug_assert!(bytes.len() < 64);
         self.buf[self.at] = item_byte(Tag::SymbolSize(bytes.len() as _));
         self.at += 1;
+        self.buf[self.at..self.at + bytes.len()].copy_from_slice(bytes);
+        self.at += bytes.len();
+    }
+    #[inline(always)]
+    fn ground(&mut self, bytes: &[u8]) {
         self.buf[self.at..self.at + bytes.len()].copy_from_slice(bytes);
         self.at += bytes.len();
     }
@@ -245,7 +267,13 @@ pub fn apply_e<S: ItemSink>(n: u8, mut original_intros: u8, mut new_intros: u8, 
                     Some(rhs) => {
                         if PRINT_DEBUG { println!("{}@ $ with bindings +{} {} for {:?}", "  ".repeat(depth), rhs.n, rhs.show(), (n, original_intros)); }
                         // println!("stack={stack:?}");
-                        if let Some(introduced) = cycled.get(&(n, original_intros)) {
+                        // A ground binding needs no walk: it re-encodes to exactly its own bytes,
+                        // introduces no variable, and cannot lie on the application stack or in
+                        // `cycled` -- either would require a variable inside it -- so those probes
+                        // are guaranteed misses. One bulk copy replaces the recursion.
+                        if rhs.ground_skip != 0 {
+                            sink.ground(unsafe { &*slice_from_raw_parts(rhs.base.ptr.add(rhs.offset as usize), rhs.ground_skip as usize) });
+                        } else if let Some(introduced) = cycled.get(&(n, original_intros)) {
                             if PRINT_DEBUG { println!("{}cycled _{} for {:?} (newvar)", "  ".repeat(depth), *introduced+1, (n, original_intros)) };
                             sink.tag(Tag::VarRef(*introduced));
                             // println!("nv cycled contains {:?}", (n, original_intros));
@@ -280,7 +308,13 @@ pub fn apply_e<S: ItemSink>(n: u8, mut original_intros: u8, mut new_intros: u8, 
                     Some(rhs) => {
                         if PRINT_DEBUG { println!("{}@ _{} with binding +{} {} for {:?}", "  ".repeat(depth), i+1, rhs.n, rhs.show(), (n, i)); }
                         // println!("stack={stack:?}");
-                        if let Some(introduced) = cycled.get(&(n, i)) {
+                        // A ground binding needs no walk: it re-encodes to exactly its own bytes,
+                        // introduces no variable, and cannot lie on the application stack or in
+                        // `cycled` -- either would require a variable inside it -- so those probes
+                        // are guaranteed misses. One bulk copy replaces the recursion.
+                        if rhs.ground_skip != 0 {
+                            sink.ground(unsafe { &*slice_from_raw_parts(rhs.base.ptr.add(rhs.offset as usize), rhs.ground_skip as usize) });
+                        } else if let Some(introduced) = cycled.get(&(n, i)) {
                             // println!("vr cycled contains {:?}", (n, i));
                             if PRINT_DEBUG { println!("{}cycled _{} for {:?} (ref) rhs={}", "  ".repeat(depth), *introduced+1, (n, i), rhs.show()); }
                             sink.tag(Tag::VarRef(*introduced));

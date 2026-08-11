@@ -933,6 +933,10 @@ pub trait Traversal<A, R> {
     fn zero(&mut self, offset: usize, a: u8) -> A;
     fn add(&mut self, offset: usize, acc: A, sub: R) -> A;
     fn finalize(&mut self, offset: usize, acc: A) -> R;
+    /// How many variables this traversal has passed so far, if it counts them. `None` (the
+    /// default) means "not tracked", which callers must read as "possibly some": it disables
+    /// ground stamping, never enables it.
+    fn vars_seen(&self) -> Option<u32> { None }
 }
 
 pub struct PairTraversal<A1, A2, R1, R2, T1, T2> { t1: T1, t2: T2, pd: std::marker::PhantomData<(A1, A2, R1, R2)> }
@@ -1024,24 +1028,48 @@ pub fn execute_loop<A, R, T : Traversal<A, R>>(t: &mut T, e: Expr, i: usize) -> 
     }
 }
 
+/// What [`match2`] just walked past on the non-variable side of a variable pairing: the
+/// subterm's byte extent, and how many variables the traversal met inside it (`None` when the
+/// traversal does not count). Reported to `stamp` right after the corresponding `hole` call, so
+/// the caller can grade the pair it pushed -- extent and groundness fall out of the skip walk
+/// that `match2` performs anyway.
+pub struct SkippedSubterm {
+    pub extent: usize,
+    pub vars: Option<u32>,
+    /// True when the skipped subterm is the right (`e2`) side.
+    pub right: bool,
+}
+
 // functor same -> functor arguments -> call recursively
 // unify(f(a b), f(p, q)) -> unify(a, p) /\ unify(b, q)
 // unify(f(g(1, A), b), f(g(1, p), q)) -> unify(A, p) /\ unify(b, q)
-fn match2<F : FnMut(&mut T1, Expr, usize, &mut T2, Expr, usize),
+fn match2<F : FnMut(&mut T1, Expr, usize, &mut T2, Expr, usize, Option<SkippedSubterm>),
     A1, R1, T1 : Traversal<A1, R1>,
     A2, R2, T2 : Traversal<A2, R2>>(t1: &mut T1, e1: Expr, i1: usize,
                                     t2: &mut T2, e2: Expr, i2: usize, hole: &mut F) -> Result<(usize, R1, usize, R2), (usize, usize)> {
     match unsafe { (byte_item(*e1.ptr.byte_add(i1)), byte_item(*e2.ptr.byte_add(i2))) } {
         (b1 @ (Tag::NewVar | Tag::VarRef(_)), _) => {
-            hole(t1, e1, i1, t2, e2, i2);
+            hole(t1, e1, i1, t2, e2, i2, None);
             let r1 = if let Tag::VarRef(k1) = b1 { t1.var_ref(i1, k1) } else { t1.new_var(i1) };
+            let vars0 = t2.vars_seen();
             let (d2, r2) = execute_loop(t2, e2, i2);
+            hole(t1, e1, i1, t2, e2, i2, Some(SkippedSubterm {
+                extent: d2 - i2,
+                vars: t2.vars_seen().zip(vars0).map(|(after, before)| after - before),
+                right: true,
+            }));
             Ok((1, r1, d2 - i2, r2))
         }
         (_, b2 @ (Tag::NewVar | Tag::VarRef(_))) => {
-            hole(t1, e1, i1, t2, e2, i2);
+            hole(t1, e1, i1, t2, e2, i2, None);
             let r2 = if let Tag::VarRef(k2) = b2 { t2.var_ref(i2, k2) } else { t2.new_var(i2) };
+            let vars0 = t1.vars_seen();
             let (d1, r1) = execute_loop(t1, e1, i1);
+            hole(t1, e1, i1, t2, e2, i2, Some(SkippedSubterm {
+                extent: d1 - i1,
+                vars: t1.vars_seen().zip(vars0).map(|(after, before)| after - before),
+                right: false,
+            }));
             Ok((d1 - i1, r1, 1, r2))
         }
         (Tag::SymbolSize(s1), Tag::SymbolSize(s2)) if s1 == s2 => {
@@ -1740,17 +1768,17 @@ pub struct ExprEnv {
     ///
     /// A nonzero stamp certifies two facts at once -- the subterm's extent AND that it contains
     /// no variable -- which is exactly the license every walk needs to jump it: a walker may
-    /// treat the whole span as one opaque item, an emitter may copy it verbatim (a ground
-    /// subterm re-encodes to exactly its own bytes), a comparer may judge it by `memcmp` (the
-    /// encoding is prefix-free, so byte equality of complete terms is term equality), and
-    /// anything hunting variables may ignore it entirely. 0 is always safe: it means "walk it",
-    /// never "has variables".
+    /// treat the whole span as one opaque item (`owed -= 1; at += ground_skip`), an emitter may
+    /// copy it verbatim (a ground subterm re-encodes to exactly its own bytes), a comparer may
+    /// judge it by `memcmp` (the encoding is prefix-free, so byte equality of complete terms is
+    /// term equality), and anything hunting variables (occurs checks, `newvars`, cycle cuts) may
+    /// ignore it entirely. 0 is always safe: it means "walk it", never "has variables".
     ///
-    /// Stamps come from whoever already holds the facts -- the join's arena scans nothing to
-    /// mint one, its enumerating cursor counts variable tags as a byproduct of the walk it does
-    /// anyway. Every derivation that changes what span the env denotes (a shifted
-    /// [`ExprEnv::offset`]) clears it: the stamp describes one exact span. Sits in what was
-    /// padding, so the struct stays 16 bytes.
+    /// Stamps come from whoever already holds the facts: the join's arena scans the bytes it
+    /// copies anyway, and `unify` stamps the subterms `match2` walks past when pairing them with
+    /// variables -- extent and groundness both fall out of that walk for free. Every derivation
+    /// that changes what span the env denotes (a shifted [`ExprEnv::offset`]) clears it: the
+    /// stamp describes one exact span. Sits in what was padding, so the struct stays 16 bytes.
     pub ground_skip: u16,
     pub base: Expr
 }
@@ -1778,14 +1806,15 @@ impl std::hash::Hash for ExprEnv {
     }
 }
 
-pub struct TraverseSide { ee: ExprEnv }
+pub struct TraverseSide { ee: ExprEnv, vars: u32 }
 impl Traversal<(), ()> for TraverseSide {
-    #[inline(always)] fn new_var(&mut self, offset: usize) -> () { self.ee.v += 1; }
-    #[inline(always)] fn var_ref(&mut self, offset: usize, i: u8) -> () {}
+    #[inline(always)] fn new_var(&mut self, offset: usize) -> () { self.ee.v += 1; self.vars += 1; }
+    #[inline(always)] fn var_ref(&mut self, offset: usize, i: u8) -> () { self.vars += 1; }
     #[inline(always)] fn symbol(&mut self, offset: usize, s: &[u8]) -> () {}
     #[inline(always)] fn zero(&mut self, offset: usize, a: u8) -> () {}
     #[inline(always)] fn add(&mut self, offset: usize, acc: (), sub: ()) -> () {}
     #[inline(always)] fn finalize(&mut self, offset: usize, acc: ()) -> () {}
+    #[inline(always)] fn vars_seen(&self) -> Option<u32> { Some(self.vars) }
 }
 
 impl ExprEnv {
@@ -1800,7 +1829,7 @@ impl ExprEnv {
     }
 
     pub fn v_incr_traversal(&self) -> TraverseSide {
-        TraverseSide{ ee: self.clone() }
+        TraverseSide{ ee: self.clone(), vars: 0 }
     }
 
     pub fn offset(&self, offset: u32) -> ExprEnv {
@@ -1873,18 +1902,33 @@ impl ExprEnv {
                     // calls `args` per node (`Space::coreferential_transition`) quadratic in the
                     // pattern's size. Skipping it makes such a descent linear.
                     if sk + 1 == k {
+                        // The one child the advancement walk never measures. A stamped parent
+                        // measures it anyway: the parent's end IS the last child's end, and a
+                        // ground parent has ground children.
+                        if self.ground_skip != 0 {
+                            let end = self.offset + self.ground_skip as u32;
+                            dest.last_mut().unwrap().ground_skip = (end - env.offset) as u16;
+                        }
                         break;
                     }
-                    let (se_c, _, se_offset) = traverseh!((), (), u8, env.subsexpr(), 0,
-                        |c: &mut u8, o| { *c += 1; },
-                        |_, o, r| {},
+                    // The advancement walk visits every item of the child regardless, so let it
+                    // count the variables it passes: a child it saw none in earns a skip stamp
+                    // for free -- independently of whether the PARENT is ground, which is what
+                    // lets a constant conjunct inside a variable-carrying conjunction reach
+                    // `unify` stamped and settle against a stamped fact by byte comparison.
+                    let (se, _, se_offset) = traverseh!((), (), (u8, bool), env.subsexpr(), (0u8, false),
+                        |c: &mut (u8, bool), o| { c.0 += 1; c.1 = true; },
+                        |c: &mut (u8, bool), o, r| { c.1 = true; },
                         |_, o, _| {},
                         |_, o, _| {},
                         |_, o, x, y| {},
                         |_, _, _| {});
 
+                    if !se.1 && se_offset > 0 && se_offset <= u16::MAX as usize {
+                        dest.last_mut().unwrap().ground_skip = se_offset as u16;
+                    }
                     env.offset += se_offset as u32;
-                    env.v += se_c;
+                    env.v += se.0;
                 }
             }
         }
@@ -2097,12 +2141,14 @@ pub fn unify(mut stack: &mut Vec<(ExprEnv, ExprEnv)>) -> Result<BTreeMap<ExprVar
             match (_x.var_opt(), _y.var_opt()) {
                 (Some(xvs), Some(yvs)) if step!(isUnbound xvs) && step!(isUnbound yvs) => {
                     stack.push((_x, _y));
+                    true
                 }
                 _ if !encountered.contains(&(_x, _y)) => {
                     encountered.insert((_x, _y));
                     stack.push((_x, _y));
+                    true
                 }
-                _ => {}
+                _ => { false }
             }
         }};
     }
@@ -2141,12 +2187,61 @@ pub fn unify(mut stack: &mut Vec<(ExprEnv, ExprEnv)>) -> Result<BTreeMap<ExprVar
 
         match (dt1.var_opt(), dt2.var_opt()) {
             (None, None) => {
+                // Skip-stamp fast paths. The encoding is prefix-free, so byte equality of
+                // complete terms IS term equality, and byte positions of equal prefixes are
+                // structurally synchronized (the structure is determined by the prefix). Three
+                // consequences, graded by what we know:
+                //  - both stamped: two ground terms; equal iff same length and same bytes, and
+                //    any mismatch is a genuine Difference (no variable can be waiting to bind).
+                //  - one stamped: if every byte of the stamped span matches, the other term
+                //    decodes to exactly that span (a complete term is never a proper prefix of
+                //    another), so the pair is settled without walking. On the first mismatch we
+                //    know nothing -- the differing byte may be a variable on the unstamped side
+                //    that must bind -- so fall through to the structural walk. The byte loop is
+                //    in-bounds: a difference must occur before either term ends, because a full
+                //    match through the shorter would make it a proper prefix of the longer.
+                let (s1, s2) = (dt1.ground_skip as usize, dt2.ground_skip as usize);
+                if s1 != 0 && s2 != 0 {
+                    if s1 != s2 { return Err(UnificationFailure::Difference(dt1, dt2)); }
+                    let b1 = unsafe { &*slice_from_raw_parts(dt1.subsexpr().ptr, s1) };
+                    let b2 = unsafe { &*slice_from_raw_parts(dt2.subsexpr().ptr, s2) };
+                    if b1 == b2 { continue 'popping; }
+                    return Err(UnificationFailure::Difference(dt1, dt2));
+                } else if s1 != 0 || s2 != 0 {
+                    let (skip, ground, other) = if s1 != 0 { (s1, dt1.subsexpr().ptr, dt2.subsexpr().ptr) }
+                                                else { (s2, dt2.subsexpr().ptr, dt1.subsexpr().ptr) };
+                    let mut i = 0usize;
+                    while i < skip && unsafe { *ground.add(i) == *other.add(i) } { i += 1; }
+                    if i == skip { continue 'popping; }
+                    // Mismatch: possibly a variable on the unstamped side; do the full walk.
+                }
+
                 let mut ts1 = dt1.clone().v_incr_traversal();
                 let mut ts2 = dt2.clone().v_incr_traversal();
 
+                // `hole` pushes the (variable, subterm) pair; right after, match2 walks past the
+                // subterm and reports its extent and variable count, which grades the very pair
+                // just pushed: variable-free and small enough -> stamp it. The stamp then rides
+                // the env into `bindings` (making apply_e's bulk copy and the occurs skip fire),
+                // and into later coreference pops (settled above by byte compare). `pushed_at`
+                // guards against grading a pair the push macro deduplicated away.
+                let mut pushed_at: Option<usize> = None;
                 if let Err((o1, o2)) = match2(&mut ts1, dt1.subsexpr(), 0, &mut ts2, dt2.subsexpr(), 0,
-                                              &mut |_ts1, e1, i1, _ts2, e2, i2| {
-                                                  step!(push _ts1.ee.offset(i1 as u32), _ts2.ee.offset(i2 as u32))
+                                              &mut |_ts1, e1, i1, _ts2, e2, i2, skipped: Option<SkippedSubterm>| {
+                                                  match skipped {
+                                                      None => {
+                                                          let did = step!(push _ts1.ee.offset(i1 as u32), _ts2.ee.offset(i2 as u32));
+                                                          pushed_at = if did { Some(stack.len() - 1) } else { None };
+                                                      }
+                                                      Some(skipped) => {
+                                                          if let (Some(at), Some(0), 1..=0xFFFF) = (pushed_at, skipped.vars, skipped.extent) {
+                                                              let pair = &mut stack[at];
+                                                              let side = if skipped.right { &mut pair.1 } else { &mut pair.0 };
+                                                              side.ground_skip = skipped.extent as u16;
+                                                          }
+                                                          pushed_at = None;
+                                                      }
+                                                  }
                                               }) {
                     if PRINT_DEBUG { println!("diff {} @ {}  != {} @ {}", dt1.offset(o1 as u32).show(), o1, dt2.offset(o2 as u32).show(), o2); }
                     return Err(UnificationFailure::Difference(dt1, dt2));
@@ -2169,12 +2264,13 @@ pub fn unify(mut stack: &mut Vec<(ExprEnv, ExprEnv)>) -> Result<BTreeMap<ExprVar
             }
             (Some(vx), ov) => {
                 if let Some(sv) = ov { if vx == sv { continue 'popping } }
-                if step!(occurs vx, dt2)  { return Err(UnificationFailure::Occurs(vx, dt2)) }
+                // A stamped subterm contains no variable, so the occurs walk is a guaranteed miss.
+                if dt2.ground_skip == 0 && step!(occurs vx, dt2)  { return Err(UnificationFailure::Occurs(vx, dt2)) }
                 bindings.insert(vx, dt2.clone());
             }
             (ov, Some(vy)) => {
                 if let Some(sv) = ov { if vy == sv { continue 'popping } }
-                if step!(occurs vy, dt1)  { return Err(UnificationFailure::Occurs(vy, dt1)) }
+                if dt1.ground_skip == 0 && step!(occurs vy, dt1)  { return Err(UnificationFailure::Occurs(vy, dt1)) }
                 bindings.insert(vy, dt1.clone());
             }
         }
