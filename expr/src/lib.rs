@@ -2136,43 +2136,57 @@ pub struct AntiUnifyResult {
 pub struct RelExprEnv(ExprEnv);
 
 impl PartialEq for RelExprEnv {
+    /// Relational structural equality: NewVars match by their running introduction number, so
+    /// `($x $x)` at v=1 equals `(_2 _2)`-shaped occurrences elsewhere, exactly as the memo in
+    /// [`anti_unify_apply`] needs.
+    ///
+    /// The walk is lockstep over BOTH encodings, each side read only at its own item boundaries,
+    /// with an early exit on the first mismatch. Its predecessor walked `self`'s structure and
+    /// interpreted `other`'s bytes at `self`'s item offsets; the moment the two structures
+    /// diverged the offsets desynchronized into symbol payload, where `byte_item` panics on
+    /// reserved-range bytes. A hash map only calls `eq` on same-bucket keys, so whether a
+    /// structurally different pair ever met depended on the process's random hash seed -- the
+    /// source of a long-standing nondeterministic `mork test` failure ("reserved 97/69" panics
+    /// under the anti-unify sink, roughly one run in thirty).
     fn eq(&self, other: &Self) -> bool {
         let mut vs = self.0.v;
         let mut vo = other.0.v;
+        let (mut i, mut j) = (self.0.offset as usize, other.0.offset as usize);
+        // One slot owed initially; every item settles one, an Arity(k) opens k more. Matching
+        // arities keep both counters equal, so both walks finish together or fail early.
+        let mut owed = 1usize;
         unsafe {
-        traverseh!((), (), bool, self.0.subsexpr(), true,
-                        |b: &mut bool, o| {
-                            *b &= match byte_item(*other.0.base.ptr.add(other.0.offset as usize + o)) {
-                                Tag::NewVar => { let eq = vs == vo; vo += 1; eq }
-                                Tag::VarRef(j) => { vs == j }
-                                _ => { false }
-                            };
-                            // println!("$ {:?}", b);
-                            vs += 1;
-                        },
-                        |b: &mut bool, o, r| {
-                            *b &= match byte_item(*other.0.base.ptr.add(other.0.offset as usize + o)) {
-                                Tag::NewVar => { let eq = r == vo; vo += 1; eq }
-                                Tag::VarRef(j) => { r == j }
-                                _ => { false }
-                            };
-                            // println!("_{} {:?}", r as usize + 1, b);
-                        },
-                        |b: &mut bool, o, s: &[u8]| {
-                            let oss = byte_item(*other.0.base.ptr.add(other.0.offset as usize + o));
-                            *b &= oss == Tag::SymbolSize(s.len() as _);
-                            if !*b { return };
-                            let Tag::SymbolSize(ss) = oss else { unreachable!() };
-                            *b &= slice_from_raw_parts(other.0.base.ptr.add(other.0.offset as usize + o + 1), ss as usize).as_ref().unwrap() == s;
-                            // println!("'{}' {:?}", std::str::from_utf8(s).unwrap(), b);
-                        },
-                        |b: &mut bool, o, a| {
-                            *b &= *other.0.base.ptr.add(other.0.offset as usize + o) == item_byte(Tag::Arity(a));
-                            // println!("[{}] {}", a as usize, b);
-                        },
-                        |_, o, x, y| {},
-                        |_, _, _| {}).0
+            while owed > 0 {
+                let bs = byte_item(*self.0.base.ptr.add(i));
+                let bo = byte_item(*other.0.base.ptr.add(j));
+                i += 1;
+                j += 1;
+                owed -= 1;
+                let item_eq = match (bs, bo) {
+                    (Tag::NewVar, Tag::NewVar) => { let e = vs == vo; vs += 1; vo += 1; e }
+                    (Tag::NewVar, Tag::VarRef(k)) => { let e = vs == k; vs += 1; e }
+                    (Tag::VarRef(r), Tag::NewVar) => { let e = r == vo; vo += 1; e }
+                    (Tag::VarRef(r), Tag::VarRef(k)) => r == k,
+                    (Tag::SymbolSize(a), Tag::SymbolSize(b)) => {
+                        let e = a == b
+                            && slice_from_raw_parts(self.0.base.ptr.add(i), a as usize).as_ref()
+                                == slice_from_raw_parts(other.0.base.ptr.add(j), b as usize).as_ref();
+                        i += a as usize;
+                        j += b as usize;
+                        e
+                    }
+                    (Tag::Arity(a), Tag::Arity(b)) => {
+                        owed += a as usize;
+                        a == b
+                    }
+                    _ => false,
+                };
+                if !item_eq {
+                    return false;
+                }
+            }
         }
+        true
     }
 }
 
@@ -2713,6 +2727,38 @@ mod tests {
             x.anti_unify(y, &mut ExprZipper::new(to));
             println!("{:?}", to);
             assert_eq!(format!("{:?}", to), format!("{:?}", r));
+        }
+    }
+
+    #[test]
+    fn rel_eq_structurally_different_keys() {
+        // eq between STRUCTURALLY DIFFERENT subterms must return false -- never read the other
+        // side at self's item offsets. The old implementation walked self's structure and
+        // interpreted other's bytes at the same offsets; on the first structural divergence the
+        // offsets desynchronize, land in symbol payload, and byte_item panics on reserved bytes
+        // (the nondeterministic "reserved 97/69" mork-test failures: whether a hash-bucket probe
+        // ever compares a different-key pair depends on the process's random hash seed).
+        {
+            // self = (x y): [2] '1 x '1 y     other = 'x' followed by payload-range garbage
+            let mut sv = parse!(r"[2] x y");
+            let se = Expr { ptr: sv.as_mut_ptr() };
+            // A 1-byte symbol whose base buffer continues with a reserved-range byte, exactly
+            // like a longer symbol's payload ("Ex...") following a short subterm in a fact.
+            let mut ov: Vec<u8> = vec![item_byte(Tag::SymbolSize(1)), b'x', b'E', b'x', b'p', b'r'];
+            let oe = Expr { ptr: ov.as_mut_ptr() };
+            let lhs = RelExprEnv(ExprEnv::new(0, se));
+            let rhs = RelExprEnv(ExprEnv::new(0, oe));
+            assert!(lhs != rhs, "structurally different subterms must compare unequal");
+            assert!(rhs != lhs, "in both directions");
+        }
+        {
+            // Same shapes but the longer side is `other`: self's walk must not run past its own
+            // subterm either.
+            let mut sv: Vec<u8> = vec![item_byte(Tag::SymbolSize(1)), b'x', b'E', b'x', b'p', b'r'];
+            let se = Expr { ptr: sv.as_mut_ptr() };
+            let mut ov = parse!(r"[2] x y");
+            let oe = Expr { ptr: ov.as_mut_ptr() };
+            assert!(RelExprEnv(ExprEnv::new(0, se)) != RelExprEnv(ExprEnv::new(0, oe)));
         }
     }
 
