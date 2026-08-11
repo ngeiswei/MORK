@@ -981,7 +981,7 @@ impl Space {
                 Ok(refs) => {
                     assert!(false)
                 }
-                Err(ref bindings) => {
+                Err(bindings) => {
                     let (oi, ni, true) =
                         mork_expr::apply_e_cycles_only!(0,0,0, pat_vars_expr, bindings, stack, assignments)
                     else { break 'query true};
@@ -1070,7 +1070,7 @@ impl Space {
     /// which `query_multi` handles (or fails on) exactly as it always has, plus the encoding
     /// pathologies `parse_body_factors` rejects (a `VarRef` naming a variable the body never
     /// introduced, or more than `u8::MAX` variables).
-    pub fn query_multi_dispatch<F : FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(btm: &PathMap<()>, pat_expr: Expr, mut effect: F) -> usize {
+    pub fn query_multi_dispatch<F : FnMut(Result<&[u32], &BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(btm: &PathMap<()>, pat_expr: Expr, mut effect: F) -> usize {
         // Which engine answers the space-to-space transform is a compile-time choice and nothing
         // more: with the `leapfrog` feature the join owns every body, and without it the module
         // does not exist. `query_multi` stays reachable for the paths that are not dispatched --
@@ -1085,13 +1085,13 @@ impl Space {
         }
     }
 
-    pub fn query_multi<F : FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(btm: &PathMap<()>, pat_expr: Expr, mut effect: F) -> usize {
+    pub fn query_multi<F : FnMut(Result<&[u32], &BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(btm: &PathMap<()>, pat_expr: Expr, mut effect: F) -> usize {
         let pat_newvars = pat_expr.newvars();
         trace!(target: "query_multi", "pattern (newvars={}) {:?}", pat_newvars, serialize(unsafe { pat_expr.span().as_ref().unwrap() }));
         let n_factors = pat_expr.arity().unwrap() as usize;
         debug_assert!(n_factors > 0);
         if n_factors == 1 {
-            effect(Err(BTreeMap::new()), pat_expr);
+            effect(Err(&BTreeMap::new()), pat_expr);
             return 1;
         }
         let mut pat_args = Vec::with_capacity(n_factors);
@@ -1188,7 +1188,7 @@ impl Space {
         }
     }
 
-    pub fn query_multi_i<F : FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(no_source: bool,
+    pub fn query_multi_i<F : FnMut(Result<&[u32], &BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(no_source: bool,
             mmaps: &mut HashMap<OwnedSourceItem, ArenaCompactTree<memmap2::Mmap>>,
             z3s: &mut HashMap<OwnedSourceItem, Box<Popen>>,
             btm: &PathMap<()>, pat_expr: Expr, mut effect: F) -> usize {
@@ -1199,7 +1199,7 @@ impl Space {
         let n_factors = pat_expr.arity().unwrap() as usize;
         debug_assert!(n_factors > 0);
         if n_factors == 1 {
-            effect(Err(BTreeMap::new()), pat_expr);
+            effect(Err(&BTreeMap::new()), pat_expr);
             return 1;
         }
         let mut pat_args = Vec::with_capacity(n_factors);
@@ -1231,8 +1231,11 @@ impl Space {
 
     #[cfg(feature="no_search")]
     #[inline(always)]
-    pub fn query_multi_raw<PZ : ZipperProduct, F : FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(mut prz: &mut PZ, sources: &[ExprEnv], mut effect: F) -> usize {
+    pub fn query_multi_raw<PZ : ZipperProduct, F : FnMut(Result<&[u32], &BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(mut prz: &mut PZ, sources: &[ExprEnv], mut effect: F) -> usize {
         let mut candidate = 0;
+        // One pair buffer for the whole enumeration: `unify` drains it, so a `clear` per
+        // candidate makes it allocation-free after warmup.
+        let mut pairs: Vec<(ExprEnv, ExprEnv)> = Vec::new();
 
         while prz.to_next_val() {
             if prz.focus_factor() != prz.factor_count() - 1 { continue };
@@ -1250,7 +1253,8 @@ impl Space {
             // per-byte hook the way the coreferential descent does, so there is no walk to learn
             // groundness from and the root envs stay unstamped -- a rescan here would be exactly
             // the traversal the stamps exist to avoid.
-            let mut pairs = vec![(sources[0], ExprEnv::new(1, e))];
+            pairs.clear();
+            pairs.push((sources[0], ExprEnv::new(1, e)));
 
             for (&pa, &other_i) in sources[1..].iter().zip(prz.path_indices()) {
                 let fe = ExprEnv::new((pairs.len() + 1) as u8,
@@ -1266,7 +1270,7 @@ impl Space {
                 Ok(bs) => {
 
                     unsafe { std::ptr::write_volatile(&mut candidate, std::ptr::read_volatile(&candidate) + 1); }
-                    if !effect(Err(bs), e) {
+                    if !effect(Err(&bs), e) {
                         break
                     }
                 }
@@ -1292,10 +1296,13 @@ impl Space {
 
     #[cfg(not(feature="no_search"))]
     #[inline(always)]
-    pub fn query_multi_raw<PZ : ZipperProduct, F : FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(mut prz: &mut PZ, sources: &[ExprEnv], mut effect: F) -> usize {
+    pub fn query_multi_raw<PZ : ZipperProduct, F : FnMut(Result<&[u32], &BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(mut prz: &mut PZ, sources: &[ExprEnv], mut effect: F) -> usize {
         let mut stack = sources[0..].iter().rev().cloned().collect::<Vec<_>>();
 
         let mut references: Vec<u32> = vec![];
+        // One pair buffer for the whole walk: `unify` drains it, so a `clear` per candidate
+        // makes it allocation-free after warmup.
+        let mut pairs: Vec<(ExprEnv, ExprEnv)> = Vec::new();
         let mut candidate = 0;
         thread_local! {
             static BREAK: std::cell::RefCell<[u64; 64]> = const { std::cell::RefCell::new([0; 64]) };
@@ -1334,7 +1341,8 @@ impl Space {
 
                         let mut root = ExprEnv::new(1, e);
                         root.ground_skip = span_stamp(0, 0, fact_end(0));
-                        let mut pairs = vec![(sources[0], root)];
+                        pairs.clear();
+                        pairs.push((sources[0], root));
 
                         for (&pa, &other_i) in sources[1..].iter().zip(loc.path_indices()) {
                             let mut fe = ExprEnv::new((pairs.len() + 1) as u8,
@@ -1350,7 +1358,7 @@ impl Space {
                         match bindings {
                             Ok(bs) => {
                                 unsafe { std::ptr::write_volatile(&mut candidate, std::ptr::read_volatile(&candidate) + 1); }
-                                if !effect(Err(bs), e) {
+                                if !effect(Err(&bs), e) {
                                     unsafe { longjmp(a, 1) }
                                 }
                             }
@@ -1490,7 +1498,7 @@ impl Space {
                 Ok(refs) => {
                     unreachable!()
                 }
-                Err(ref bindings) => {
+                Err(bindings) => {
                     #[cfg(debug_assertions)]
                     bindings.iter().for_each(|(v, ee)| trace!(target: "transform", "binding {:?} {}", *v, ee.show()));
 
@@ -1584,7 +1592,7 @@ impl Space {
                 Ok(refs) => {
                     unreachable!()
                 }
-                Err(ref bindings) => {
+                Err(bindings) => {
                     #[cfg(debug_assertions)]
                     bindings.iter().for_each(|(v, ee)| trace!(target: "transform", "binding {:?} {}", *v, ee.show()));
 
@@ -1686,7 +1694,7 @@ impl Space {
                 Ok(refs) => {
                     unreachable!()
                 }
-                Err(ref bindings) => {
+                Err(bindings) => {
                     #[cfg(debug_assertions)]
                     bindings.iter().for_each(|(v, ee)| trace!(target: "transform", "binding {:?} {}", *v, ee.show()));
 
@@ -1791,7 +1799,7 @@ impl Space {
                 Ok(refs) => {
                     unreachable!()
                 }
-                Err(ref bindings) => {
+                Err(bindings) => {
                     #[cfg(debug_assertions)]
                     bindings.iter().for_each(|(v, ee)| trace!(target: "transform", "binding {:?} {}", *v, ee.show()));
 
