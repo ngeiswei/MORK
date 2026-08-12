@@ -25,14 +25,14 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 const QUERY_NS: u8 = 0;
 
-/// The least byte present in `mask` that is `>= k`, or `None` if every set bit is below `k`.
-/// `ByteMask::next_bit` returns the least bit strictly above its argument, so test `k` itself
-/// first. This is the per-byte leapfrog seek on a trie node's children.
+/// The least byte present in `mask` that is `>= k`, or `None` if every set bit is below `k`. This
+/// is the per-byte leapfrog seek on a trie node's children.
 #[inline]
 pub fn least_ge(mask: &ByteMask, k: u8) -> Option<u8> {
     if mask.test_bit(k) {
         Some(k)
     } else {
+        // next_bit is strictly above its argument, so k itself needs the separate test above.
         mask.next_bit(k)
     }
 }
@@ -54,9 +54,15 @@ fn subterm_parse_step(b: u8, subterms: &mut u32, payload: &mut u32) {
     }
 }
 
-/// Batch form: byte length and groundness of the first complete subterm at `bytes[0..]`, or
-/// `None` on a truncated term.
-fn first_subterm(bytes: &[u8]) -> Option<(usize, bool)> {
+/// The extent of one complete subterm at the front of a byte run.
+struct SubtermProps {
+    length: usize,
+    ground: bool,
+}
+
+/// Batch form of the parse: the first complete subterm at `bytes[0..]`, or `None` on a truncated
+/// term.
+fn first_subterm(bytes: &[u8]) -> Option<SubtermProps> {
     let mut i = 0usize;
     let mut remaining = 1usize;
     let mut ground = true;
@@ -75,7 +81,7 @@ fn first_subterm(bytes: &[u8]) -> Option<(usize, bool)> {
             }
         }
     }
-    Some((i, ground))
+    Some(SubtermProps { length: i, ground })
 }
 
 /// Whether `bytes` (from the column-start focus) spell exactly one complete subterm, by replaying
@@ -97,25 +103,42 @@ fn is_complete(bytes: &[u8]) -> bool {
 /// ascending lexicographic order, with a leapfrog `seek`. This is the zipper-native replacement for
 /// a materialized per-variable domain: it seeks on the live byte-trie instead of scanning a `Vec`.
 ///
-/// `key` holds the bytes of the current subterm relative to the focus the cursor was built at
-/// (its "floor"). The cursor descends with `descend_to_byte` and ascends with `ascend_byte`, never
-/// above the floor (it stops when `key` is empty), so the zipper is left at the floor between
-/// re-seeks and at the subterm boundary while positioned.
+/// The cursor is a non-empty stack of [`Column`]s over one held zipper: `col` is the column being
+/// enumerated and `floor_stack` the columns already consumed below it. The current subterm is
+/// `z.path()[col.floor..]` -- the zipper's own path IS the key -- and the walk never ascends above
+/// that floor, so the zipper is left at the floor between re-seeks and at the subterm boundary
+/// while positioned.
 pub struct SubtermCursor<Z> {
     z: Z,
-    /// Absolute length of `z.path()` at the current column's start. The subterm under
-    /// enumeration is `z.path()[floor..]`: the zipper's own path IS the key, and the cursor
-    /// keeps no copy of it -- one integer replaces the byte-for-byte mirror this used to
-    /// maintain (and the join's `bound[f]` mirror above it, which was provably always equal
-    /// to `z.path()[..floor]` by the old drift assertions).
+    col: Column,
+    /// Exhaustion, read as a field: the leapfrog's candidate loop tests it while `seek` takes
+    /// OTHER cursors mutably, which a `key().is_some()` borrow would forbid.
+    pub at_end: bool,
+    /// The columns already descended past, below the zipper's creation focus. `descend_floor`
+    /// locks the current subterm as a column value and lowers the floor into it (so the next
+    /// enumeration is of the following column); `ascend_floor` restores it. This lets one cursor
+    /// walk a factor's successive columns with the zipper HELD -- descended and ascended in
+    /// place, never re-opened from the trie root (which is the join's dominant cost).
+    floor_stack: Vec<Column>,
+}
+
+/// One column of the enumeration: where its key starts, plus the incremental parse of that key.
+/// A column parked by `descend_floor` restores under `ascend_floor` exactly (including the
+/// per-byte record the subsequent `next` retreats through) without replaying the parse. The key
+/// bytes themselves are never saved: they are still on the zipper's path.
+struct Column {
+    /// Absolute length of `z.path()` at this column's start. The subterm under enumeration is
+    /// `z.path()[floor..]`: the zipper's own path IS the key, and the cursor keeps no copy of it
+    /// -- one integer replaces the byte-for-byte mirror this used to maintain (and the join's
+    /// `bound[f]` mirror above it, which was provably always equal to `z.path()[..floor]` by the
+    /// old drift assertions).
     floor: usize,
-    at_end: bool,
     /// Running incremental parse of the key: how many complete subterms and how many raw
-    /// symbol-payload bytes it still owes, i.e. the fold of [`mork_expr::subterm_parse_step`]
-    /// over `z.path()[floor..]` starting from `(1, 0)`. The key spells exactly one complete
-    /// subterm iff both are zero, so the boundary test is O(1) instead of an O(len) replay per
-    /// descent step. An expression is at most `u32::MAX - 1` bytes, which bounds the owed
-    /// subterms; owed payload is one symbol's, <= 63.
+    /// symbol-payload bytes it still owes, i.e. the fold of [`subterm_parse_step`] over
+    /// `z.path()[floor..]` starting from `(1, 0)`. The key spells exactly one complete subterm
+    /// iff both are zero, so the boundary test is O(1) instead of an O(len) replay per descent
+    /// step. An expression is at most `u32::MAX - 1` bytes, which bounds the owed subterms; owed
+    /// payload is one symbol's, <= 63.
     owed_subterms: u32,
     owed_payload: u32,
     /// The `(owed_subterms, owed_payload)` that stood BEFORE each key byte was consumed. SOME
@@ -133,25 +156,36 @@ pub struct SubtermCursor<Z> {
     /// rescan. At most 64 variables exist per expression, so a byte each.
     key_newvars: u8,
     key_vars: u8,
-    /// Floors of the columns already descended past, below the zipper's creation focus.
-    /// `descend_floor` locks the current subterm as a column value and lowers the floor into it
-    /// (so the next enumeration is of the following column); `ascend_floor` restores it. This
-    /// lets one cursor walk a factor's successive columns with the zipper HELD -- descended and
-    /// ascended in place, never re-opened from the trie root (which is the join's dominant cost).
-    floor_stack: Vec<SavedColumn>,
 }
 
-/// A column parked by `descend_floor`: its floor plus the incremental parse state that belongs
-/// to its key, so `ascend_floor` restores the cursor exactly (including the per-byte record the
-/// subsequent `next` retreats through) without replaying the parse. The key bytes themselves
-/// need no saving: they are still on the zipper's path.
-struct SavedColumn {
-    floor: usize,
-    parse_stack: Vec<(u32, u8)>,
-    owed_subterms: u32,
-    owed_payload: u32,
-    key_newvars: u8,
-    key_vars: u8,
+impl Column {
+    fn new(floor: usize) -> Self {
+        Column {
+            floor,
+            owed_subterms: 1,
+            owed_payload: 0,
+            parse_stack: Vec::new(),
+            key_newvars: 0,
+            key_vars: 0,
+        }
+    }
+
+    /// Whether the key is empty, i.e. nothing has been parsed since the floor. The state the
+    /// column is parked in between enumerations, which the raw descend/ascend pair relies on.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    fn is_at_floor(&self) -> bool {
+        self.parse_stack.is_empty() && self.owed_subterms == 1 && self.owed_payload == 0
+    }
+
+    /// Back to an empty key at `floor`, keeping the parse stack's allocation.
+    fn reset_with_floor(&mut self, floor: usize) {
+        self.floor = floor;
+        self.owed_subterms = 1;
+        self.owed_payload = 0;
+        self.key_newvars = 0;
+        self.key_vars = 0;
+        self.parse_stack.clear();
+    }
 }
 
 impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
@@ -160,33 +194,28 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
         let floor = z.path().len();
         SubtermCursor {
             z,
-            floor,
+            col: Column::new(floor),
             at_end: true,
-            owed_subterms: 1,
-            owed_payload: 0,
-            parse_stack: Vec::new(),
-            key_newvars: 0,
-            key_vars: 0,
             floor_stack: Vec::new(),
         }
     }
 
     #[inline]
     fn key_len(&self) -> usize {
-        self.z.path().len() - self.floor
+        self.z.path().len() - self.col.floor
     }
 
     /// `(NewVar count, total variable count)` of the current key, exact.
     #[inline]
     fn key_var_counts(&self) -> (u8, u8) {
-        (self.key_newvars, self.key_vars)
+        (self.col.key_newvars, self.col.key_vars)
     }
 
     /// Everything consumed below the zipper's creation focus and above the current column: the
     /// factor's bound column values, concatenated. What the join's `bound[f]` used to mirror.
     #[inline]
     fn consumed_bytes(&self) -> &[u8] {
-        &self.z.path()[..self.floor]
+        &self.z.path()[..self.col.floor]
     }
 
     /// Whether the key currently spells exactly one complete subterm, read off the incremental
@@ -194,15 +223,15 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
     /// property tests catch any divergence.
     #[inline]
     fn key_is_complete(&self) -> bool {
-        let complete = self.owed_subterms == 0 && self.owed_payload == 0;
+        let complete = self.col.owed_subterms == 0 && self.col.owed_payload == 0;
         debug_assert_eq!(
-            self.parse_stack.len(),
+            self.col.parse_stack.len(),
             self.key_len(),
             "parse stack out of lockstep with key"
         );
         debug_assert_eq!(
             complete,
-            is_complete(&self.z.path()[self.floor..]),
+            is_complete(&self.z.path()[self.col.floor..]),
             "incremental subterm-parse state diverged from the replay"
         );
         complete
@@ -211,17 +240,17 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
     /// Account for one byte the zipper just descended, advancing the incremental parse.
     #[inline]
     fn advance_parse(&mut self, b: u8) {
-        self.parse_stack.push((self.owed_subterms, self.owed_payload as u8));
+        self.col.parse_stack.push((self.col.owed_subterms, self.col.owed_payload as u8));
         // A byte is a tag exactly when no symbol payload is owed; the parse state answers that
         // BEFORE consuming the byte, which is what makes the variable counts exact.
-        if self.owed_payload == 0 {
+        if self.col.owed_payload == 0 {
             match byte_item(b) {
-                Tag::NewVar => { self.key_newvars += 1; self.key_vars += 1; }
-                Tag::VarRef(_) => { self.key_vars += 1; }
+                Tag::NewVar => { self.col.key_newvars += 1; self.col.key_vars += 1; }
+                Tag::VarRef(_) => { self.col.key_vars += 1; }
                 _ => {}
             }
         }
-        subterm_parse_step(b, &mut self.owed_subterms, &mut self.owed_payload);
+        subterm_parse_step(b, &mut self.col.owed_subterms, &mut self.col.owed_payload);
     }
 
     /// Account for the key's last byte `b` leaving (the caller moves the zipper), restoring the
@@ -229,19 +258,20 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
     #[inline]
     fn retreat_parse(&mut self, b: u8) {
         let (pre_subterms, pre_payload) = self
+            .col
             .parse_stack
             .pop()
             .expect("parse stack out of lockstep with key");
-        self.owed_subterms = pre_subterms;
+        self.col.owed_subterms = pre_subterms;
         // The restored state classifies `b`: a tag position mirrors its variable count back out.
         if pre_payload == 0 {
             match byte_item(b) {
-                Tag::NewVar => { self.key_newvars -= 1; self.key_vars -= 1; }
-                Tag::VarRef(_) => { self.key_vars -= 1; }
+                Tag::NewVar => { self.col.key_newvars -= 1; self.col.key_vars -= 1; }
+                Tag::VarRef(_) => { self.col.key_vars -= 1; }
                 _ => {}
             }
         }
-        self.owed_payload = pre_payload as u32;
+        self.col.owed_payload = pre_payload as u32;
     }
 
     /// Ascend back to the floor (column start), clearing the key.
@@ -251,11 +281,7 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
             let ok = self.z.ascend(n);
             debug_assert!(ok, "the floor is above the zipper's root by construction");
         }
-        self.parse_stack.clear();
-        self.owed_subterms = 1;
-        self.owed_payload = 0;
-        self.key_newvars = 0;
-        self.key_vars = 0;
+        self.col.reset_with_floor(self.col.floor);
         self.at_end = false;
     }
 
@@ -263,19 +289,8 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
     /// so subsequent enumeration is of the NEXT column. The zipper stays put (it is already
     /// descended into the key); only the floor bookkeeping moves. Pairs with `ascend_floor`.
     pub fn descend_floor(&mut self) {
-        self.floor_stack.push(SavedColumn {
-            floor: self.floor,
-            parse_stack: std::mem::take(&mut self.parse_stack),
-            owed_subterms: self.owed_subterms,
-            owed_payload: self.owed_payload,
-            key_newvars: self.key_newvars,
-            key_vars: self.key_vars,
-        });
-        self.floor = self.z.path().len();
-        self.owed_subterms = 1;
-        self.owed_payload = 0;
-        self.key_newvars = 0;
-        self.key_vars = 0;
+        let next = Column::new(self.z.path().len());
+        self.floor_stack.push(std::mem::replace(&mut self.col, next));
         self.at_end = false;
     }
 
@@ -285,16 +300,10 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
     /// holds because a fully-exhausted deeper column leaves its cursor at its own floor
     /// (== this value's end).
     pub fn ascend_floor(&mut self) {
-        let saved = self
+        self.col = self
             .floor_stack
             .pop()
             .expect("ascend_floor without a matching descend_floor");
-        self.floor = saved.floor;
-        self.parse_stack = saved.parse_stack;
-        self.owed_subterms = saved.owed_subterms;
-        self.owed_payload = saved.owed_payload;
-        self.key_newvars = saved.key_newvars;
-        self.key_vars = saved.key_vars;
         self.at_end = false;
     }
 
@@ -319,9 +328,9 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
         // The raw fragment is NOT part of the key (it lowers the floor past itself), so the
         // incremental parse state is untouched: an empty key still owes exactly one subterm,
         // now measured from the new, deeper floor.
-        debug_assert!(self.parse_stack.is_empty() && self.owed_subterms == 1 && self.owed_payload == 0);
+        debug_assert!(self.col.is_at_floor());
         self.z.descend_to(bytes);
-        self.floor += bytes.len();
+        self.col.floor += bytes.len();
         self.at_end = false;
     }
 
@@ -333,9 +342,9 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
             self.key_len() == 0,
             "ascend_raw must start at the column floor"
         );
-        debug_assert!(self.parse_stack.is_empty() && self.owed_subterms == 1 && self.owed_payload == 0);
+        debug_assert!(self.col.is_at_floor());
         self.z.ascend(n);
-        self.floor -= n;
+        self.col.floor -= n;
         self.at_end = false;
     }
 
@@ -357,6 +366,7 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
             // 256-bit child mask and scanning it for the least bit, then re-finding that byte
             // with descend_to_byte, re-derived per byte what the zipper answers in one step.
             if !self.z.descend_first_byte() {
+                self.at_end = true;
                 return false;
             }
             let b = *self.z.path().last().expect("descend_first_byte grew the path");
@@ -370,6 +380,7 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
     fn backtrack_then_leftmost(&mut self) -> bool {
         loop {
             if self.key_len() == 0 {
+                self.at_end = true;
                 return false;
             }
             // The byte about to leave must be read BEFORE the zipper moves: with the path as the
@@ -395,9 +406,7 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
     /// Position at the least subterm.
     pub fn first(&mut self) {
         self.reset_to_floor();
-        if !self.complete_leftmost() {
-            self.at_end = true;
-        }
+        self.complete_leftmost();
     }
 
     /// Advance to the next subterm.
@@ -405,9 +414,7 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
         if self.at_end {
             return;
         }
-        if !self.backtrack_then_leftmost() {
-            self.at_end = true;
-        }
+        self.backtrack_then_leftmost();
     }
 
     /// The current subterm bytes, or `None` when exhausted: the enumeration's read API, a view
@@ -416,14 +423,8 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
         if self.at_end {
             None
         } else {
-            Some(&self.z.path()[self.floor..])
+            Some(&self.z.path()[self.col.floor..])
         }
-    }
-
-    /// Exhaustion without borrowing the key: the leapfrog's candidate loop tests this while
-    /// `seek` takes OTHER cursors mutably, which a `key().is_some()` borrow would forbid.
-    pub fn at_end(&self) -> bool {
-        self.at_end
     }
 
     /// Position at the least subterm `>= target`. `target` must itself be a complete subterm (the
@@ -452,22 +453,16 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
                     Some(b) => {
                         self.z.descend_to_byte(b);
                         self.advance_parse(b);
-                        if !self.complete_leftmost() {
-                            self.at_end = true;
-                        }
+                        self.complete_leftmost();
                         return;
                     }
                     None => {
-                        if !self.backtrack_then_leftmost() {
-                            self.at_end = true;
-                        }
+                        self.backtrack_then_leftmost();
                         return;
                     }
                 }
             } else {
-                if !self.complete_leftmost() {
-                    self.at_end = true;
-                }
+                self.complete_leftmost();
                 return;
             }
         }
@@ -654,8 +649,8 @@ pub struct Factor<'a> {
 // ---- unification layer: schematic data (stored variables in facts act as wildcards) ----
 
 #[inline]
-fn is_wildcard_term(k: &[u8]) -> bool {
-    k.len() == 1 && matches!(byte_item(k[0]), Tag::NewVar | Tag::VarRef(_))
+fn is_wildcard_term(k: u8) -> bool {
+    matches!(byte_item(k), Tag::NewVar | Tag::VarRef(_))
 }
 
 /// Whether a stored complete subterm is symbol-headed, hence GROUND and a leaf of the encoding.
@@ -769,7 +764,7 @@ fn columns_to_items(cols: &[&[u8]]) -> Vec<Vec<Item>> {
 fn emit_reordered(items_by_col: &[Vec<Item>], new_order: &[usize]) -> Vec<u8> {
     use std::collections::HashMap;
     let mut out = Vec::new();
-    let mut renum: HashMap<usize, usize> = HashMap::new();
+    let mut renum: HashMap<usize, usize> = HashMap::with_capacity(new_order.len());
     for &c in new_order {
         for item in &items_by_col[c] {
             match item {
@@ -827,7 +822,7 @@ fn reindex_regions(map: &PathMap<()>, factor: &Factor) -> Option<Vec<Vec<u8>>> {
     regions.push(ground);
     let mask = map.read_zipper_at_path(factor.prefix).child_mask();
     for w in mask.iter() {
-        if is_wildcard_term(&[w]) {
+        if is_wildcard_term(w) {
             let mut wild = factor.prefix.to_vec();
             wild.push(w);
             regions.push(wild);
@@ -917,7 +912,7 @@ pub fn unify_join_zipper(
         .into_iter()
         .filter_map(|row| {
             row.into_iter()
-                .map(|component| component.filter(|bytes| first_subterm(bytes).is_some_and(|(_, ground)| ground)))
+                .map(|component| component.filter(|bytes| first_subterm(bytes).is_some_and(|props| props.ground)))
                 .collect::<Option<Vec<Vec<u8>>>>()
         })
         .collect()
@@ -1065,17 +1060,18 @@ fn join_state<'a>(
         free_bufs: Vec::new(),
         free_child_bufs: Vec::new(),
         lead_max: Vec::new(),
+        on_match: None,
+        loc_buf: Vec::new(),
+        stopped: false,
+
         #[cfg(test)]
         out: BTreeSet::new(),
         #[cfg(test)]
         want_coordinated: false,
         #[cfg(test)]
         coordinated: BTreeSet::new(),
-        on_match: None,
-        loc_buf: Vec::new(),
         #[cfg(test)]
         on_tuple: None,
-        stopped: false,
     }
 }
 
@@ -1426,7 +1422,6 @@ struct UnifyJoin<'a> {
     /// Pool of [`CandidateBuf`]s for the lead enumeration, one in flight per active recursion
     /// depth; released buffers return here with their allocations intact.
     free_bufs: Vec<CandidateBuf>,
-    /// Precomputed argument envs for the query-side columns, whose structure is fixed for the whole
     /// Pool of child-env buffers for compounds that must still be walked per candidate (a compound
     /// reached by dereferencing a bound variable). `match_compound_children` recurses while holding
     /// its slice, so one buffer is in flight per active depth; released buffers return here with
@@ -1437,6 +1432,17 @@ struct UnifyJoin<'a> {
     /// live inside that call, which completes before the node recurses, so one buffer serves every
     /// depth.
     lead_max: Vec<u8>,
+    /// When set, each accepted assignment streams the join's OWN bindings (plus factor 0's stored
+    /// fact as the stock contract's `loc`) here instead of collecting rows, and a `false` return
+    /// stops the search. The engine dispatch uses this.
+    on_match: Option<&'a mut dyn FnMut(&Bindings, Expr) -> bool>,
+    /// Scratch for the streamed `loc`: factor 0's stored fact bytes, refilled per accepted
+    /// assignment so the stream costs no allocation per answer.
+    loc_buf: Vec<u8>,
+    /// Set when a stream callback asked to stop; the recursion unwinds without visiting more
+    /// candidates.
+    stopped: bool,
+
     /// Answer rows, one `Option` per query variable: `Some(bytes)` for a resolved term, `None` for
     /// a still-free variable. TEST-ONLY: the live dispatch always streams.
     #[cfg(test)]
@@ -1448,19 +1454,9 @@ struct UnifyJoin<'a> {
     /// answer positions survives. TEST-ONLY.
     #[cfg(test)]
     coordinated: BTreeSet<Vec<u8>>,
-    /// When set, each accepted assignment streams the join's OWN bindings (plus factor 0's stored
-    /// fact as the stock contract's `loc`) here instead of collecting rows, and a `false` return
-    /// stops the search. The engine dispatch uses this.
-    on_match: Option<&'a mut dyn FnMut(&Bindings, Expr) -> bool>,
-    /// Scratch for the streamed `loc`: factor 0's stored fact bytes, refilled per accepted
-    /// assignment so the stream costs no allocation per answer.
-    loc_buf: Vec<u8>,
     /// Test-only tuple stream (see [`run_unify_join_stream`]).
     #[cfg(test)]
     on_tuple: Option<&'a mut dyn FnMut(&[Vec<u8>]) -> bool>,
-    /// Set when a stream callback asked to stop; the recursion unwinds without visiting more
-    /// candidates.
-    stopped: bool,
 }
 
 impl UnifyJoin<'_> {
@@ -1494,7 +1490,7 @@ impl UnifyJoin<'_> {
                 // already agree with the map the stock path builds: query variables live in
                 // `QUERY_NS` = 0 under the body's global first-occurrence numbering (the same
                 // numbering `apply` assigns walking `(, p1 .. pk)` from intro 0), and factor `f`'s
-                // data lives in `factor_namespace(f)` = `1 + f`, which is what
+                // data lives in namespace `1 + f`, which is what
                 // `query_multi_raw` gives the f-th fact (`ExprEnv::new(1, e)`, then `j + 1`). So
                 // there is nothing to re-derive: rebuilding every fact and re-running a full
                 // `mork_expr::unify` over the pattern factors would recompute, per accepted
@@ -1636,7 +1632,7 @@ impl UnifyJoin<'_> {
                     continue;
                 }
                 let cur = &mut self.cursors[row.2];
-                if cur.at_end() {
+                if cur.at_end {
                     row.1 = true;
                     exhausted = true;
                     continue;
@@ -1802,7 +1798,7 @@ impl UnifyJoin<'_> {
             cur.reset_to_floor();
             return confirmed_from;
         }
-        'candidates: while !self.cursors[f].at_end() {
+        'candidates: while !self.cursors[f].at_end {
             // Copy the candidate out once so `seek` can take the cursors mutably below.
             let (lead_max, cursors) = (&mut self.lead_max, &self.cursors);
             lead_max.clear();
@@ -1810,7 +1806,7 @@ impl UnifyJoin<'_> {
             for &r in restrictors {
                 let (cursors, lead_max) = (&mut self.cursors, &self.lead_max);
                 cursors[r].seek(lead_max);
-                if cursors[r].at_end() {
+                if cursors[r].at_end {
                     // Nothing stored at or above the candidate: every remaining candidate is a
                     // ground symbol at least as large, so none of them can match this factor.
                     break 'candidates;
@@ -1866,10 +1862,6 @@ impl UnifyJoin<'_> {
         }
     }
 
-    fn factor_namespace(&self, f: usize) -> u8 {
-        1 + f as u8
-    }
-
     fn query_var_env(&self, v: usize) -> ExprEnv {
         ExprEnv {
             n: QUERY_NS,
@@ -1906,7 +1898,8 @@ impl UnifyJoin<'_> {
     }
 
     fn data_env_for(&mut self, f: usize, bytes: &[u8], vars: (u8, u8)) -> ExprEnv {
-        self.arena_env(self.factor_namespace(f), self.data_intro[f], bytes, vars.1 == 0)
+        // Factor f's data lives in namespace 1 + f; QUERY_NS = 0 is the query's own.
+        self.arena_env(1 + f as u8, self.data_intro[f], bytes, vars.1 == 0)
     }
 
     fn unified_bindings(&self, lhs: ExprEnv, rhs: ExprEnv) -> Option<Bindings> {
@@ -2121,7 +2114,7 @@ impl UnifyJoin<'_> {
                 let data_env = self.data_env_for(f, cand, vars);
                 let previous = self.bindings.insert(free_key, data_env);
                 debug_assert!(previous.is_none(), "deref ended at a bound var");
-                self.with_bound_term(f, cand, 0, &mut cont);
+                self.with_bound_path_bytes(f, cand, 0, &mut cont);
                 self.bindings.remove(&free_key);
                 self.arena.truncate(arena_mark);
             } else {
@@ -2230,7 +2223,7 @@ impl UnifyJoin<'_> {
         }
         if mask_has_wildcard(&mask) {
             for w in mask.iter() {
-                if is_wildcard_term(&[w]) {
+                if is_wildcard_term(w) {
                     self.match_candidate(f, env, &[w], Self::wildcard_counts(w), &mut |this| {
                         this.next_step[f] = s + 1;
                         cont(this);
@@ -2268,7 +2261,7 @@ impl UnifyJoin<'_> {
         let mask = self.cursors[f].floor_child_mask();
         if mask_has_wildcard(&mask) {
             for w in mask.iter() {
-                if is_wildcard_term(&[w]) {
+                if is_wildcard_term(w) {
                     self.match_candidate(f, env, &[w], Self::wildcard_counts(w), &mut |this| {
                         this.next_step[f] = end;
                         cont(this);
@@ -2304,12 +2297,6 @@ impl UnifyJoin<'_> {
         self.data_intro[f] = intro;
     }
 
-    fn with_bound_term(&mut self, f: usize, bytes: &[u8], newvars: u8, cont: &mut dyn FnMut(&mut Self)) {
-        // The introduction delta is the candidate's NewVar count, which the enumeration walk
-        // already counted exactly -- no rescan, no `newvars` item walk.
-        self.with_bound_path_bytes(f, bytes, newvars, cont);
-    }
-
     fn match_candidate(
         &mut self,
         f: usize,
@@ -2326,7 +2313,9 @@ impl UnifyJoin<'_> {
         let data_env = self.data_env_for(f, bytes, vars);
         if let Some(bindings) = self.unified_bindings(pattern, data_env) {
             self.bindings = bindings;
-            self.with_bound_term(f, bytes, vars.0, cont);
+            // The intro delta is the candidate's NewVar count, which the enumeration walk already
+            // counted exactly -- no rescan, no `newvars` item walk.
+            self.with_bound_path_bytes(f, bytes, vars.0, cont);
         }
         self.bindings = saved_bindings;
         self.arena.truncate(arena_mark);
@@ -2368,7 +2357,7 @@ impl UnifyJoin<'_> {
                     let data_env = self.data_env_for(f, &buf.entries[ci], vars);
                     let previous = self.bindings.insert(free_key, data_env);
                     debug_assert!(previous.is_none(), "deref ended at a bound var");
-                    self.with_bound_term(f, &buf.entries[ci], 0, cont);
+                    self.with_bound_path_bytes(f, &buf.entries[ci], 0, cont);
                     self.bindings.remove(&free_key);
                     self.arena.truncate(arena_mark);
                 } else {
@@ -2396,7 +2385,7 @@ impl UnifyJoin<'_> {
                     self.with_bound_path_bytes(f, &bytes, 0, cont);
                 }
                 for w in mask.iter() {
-                    if is_wildcard_term(&[w]) {
+                    if is_wildcard_term(w) {
                         self.match_candidate(f, pattern, &[w], Self::wildcard_counts(w), cont);
                     }
                 }
@@ -2416,7 +2405,7 @@ impl UnifyJoin<'_> {
         // restores `bound[f]`), so the mask is unchanged between them.
         let mask = self.cursors[f].floor_child_mask();
         for w in mask.iter() {
-            if is_wildcard_term(&[w]) {
+            if is_wildcard_term(w) {
                 self.match_candidate(f, pattern, &[w], Self::wildcard_counts(w), cont);
             }
         }
@@ -2528,7 +2517,7 @@ mod tests {
         rows.into_iter()
             .map(|row| {
                 row.into_iter()
-                    .map(|component| component.filter(|bytes| first_subterm(bytes).is_some_and(|(_, ground)| ground)))
+                    .map(|component| component.filter(|bytes| first_subterm(bytes).is_some_and(|props| props.ground)))
                     .collect::<Option<Vec<Vec<u8>>>>()
             })
             .collect()
@@ -2815,7 +2804,7 @@ mod tests {
         // seek past every subterm -> exhausted.
         cur.seek(&sym("zz"));
         assert!(
-            cur.at_end(),
+            cur.at_end,
             "seek past the maximum must exhaust the cursor"
         );
     }
@@ -3128,7 +3117,7 @@ mod tests {
             assert_eq!(symbol, is_symbol_head(&[b]), "byte {b}");
             let variable = matches!(tag, Tag::NewVar | Tag::VarRef(_));
             // A single variable byte is a complete subterm; nothing else one byte long is.
-            assert_eq!(variable, is_wildcard_term(&[b]), "byte {b}");
+            assert_eq!(variable, is_wildcard_term(b), "byte {b}");
             if symbol {
                 // Every non-symbol byte is strictly below every symbol byte.
                 for c in 0u8..=255 {
@@ -3157,10 +3146,10 @@ mod tests {
 
     /// Test-local aliases over the shared walk (the join's own copies are gone).
     fn first_subterm_len(bytes: &[u8]) -> usize {
-        first_subterm(bytes).expect("well-formed test term").0
+        first_subterm(bytes).expect("well-formed test term").length
     }
     fn first_subterm_is_ground(bytes: &[u8]) -> bool {
-        first_subterm(bytes).expect("well-formed test term").1
+        first_subterm(bytes).expect("well-formed test term").ground
     }
 
     #[test]
@@ -3296,7 +3285,7 @@ mod tests {
                     }
                 }
                 let bytes = unsafe { env.subsexpr().span().as_ref().unwrap() }.to_vec();
-                if !first_subterm(&bytes).is_some_and(|(_, ground)| ground) {
+                if !first_subterm(&bytes).is_some_and(|props| props.ground) {
                     return;
                 }
                 row.push(bytes);
