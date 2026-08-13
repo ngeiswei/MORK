@@ -942,7 +942,7 @@ pub fn unify_join_zipper(
         .into_iter()
         .filter_map(|row| {
             row.into_iter()
-                .map(|component| component.filter(|bytes| mork_expr::first_subterm(bytes).is_some_and(|props| props.ground)))
+                .map(|component| component.filter(|bytes| Expr::from_slice(bytes).variables() == 0))
                 .collect::<Option<Vec<Vec<u8>>>>()
         })
         .collect()
@@ -2494,7 +2494,7 @@ mod tests {
         rows.into_iter()
             .map(|row| {
                 row.into_iter()
-                    .map(|component| component.filter(|bytes| mork_expr::first_subterm(bytes).is_some_and(|props| props.ground)))
+                    .map(|component| component.filter(|bytes| Expr::from_slice(bytes).variables() == 0))
                     .collect::<Option<Vec<Vec<u8>>>>()
             })
             .collect()
@@ -3117,49 +3117,6 @@ mod tests {
         ])));
     }
 
-    /// Test-local aliases over the shared walk (the join's own copies are gone).
-    fn first_subterm_len(bytes: &[u8]) -> usize {
-        mork_expr::first_subterm(bytes).expect("well-formed test term").length
-    }
-    fn first_subterm_is_ground(bytes: &[u8]) -> bool {
-        mork_expr::first_subterm(bytes).expect("well-formed test term").ground
-    }
-
-    #[test]
-    fn first_subterm_len_parses_each_shape() {
-        // symbol "ab": SymbolSize(2), 'a', 'b'  -> 3 bytes
-        let sym = [item_byte(Tag::SymbolSize(2)), b'a', b'b'];
-        assert_eq!(first_subterm_len(&sym), 3);
-        assert!(first_subterm_is_ground(&sym));
-
-        // NewVar -> 1 byte, non-ground
-        let nv = [item_byte(Tag::NewVar)];
-        assert_eq!(first_subterm_len(&nv), 1);
-        assert!(!first_subterm_is_ground(&nv));
-
-        // VarRef(0) -> 1 byte, non-ground
-        let vr = [item_byte(Tag::VarRef(0))];
-        assert_eq!(first_subterm_len(&vr), 1);
-        assert!(!first_subterm_is_ground(&vr));
-
-        // (k v0):  Arity(2), Sym("k"), Sym("v0")
-        let k = item_byte(Tag::SymbolSize(1));
-        let v0 = item_byte(Tag::SymbolSize(2));
-        let compound = [item_byte(Tag::Arity(2)), k, b'k', v0, b'v', b'0'];
-        assert_eq!(first_subterm_len(&compound), 6);
-        assert!(first_subterm_is_ground(&compound));
-
-        // (k $x): Arity(2), Sym("k"), NewVar  -> 4 bytes, non-ground
-        let compound_var = [item_byte(Tag::Arity(2)), k, b'k', item_byte(Tag::NewVar)];
-        assert_eq!(first_subterm_len(&compound_var), 4);
-        assert!(!first_subterm_is_ground(&compound_var));
-
-        // trailing bytes after the first subterm are ignored: (e A B) prefix then junk
-        let mut buf = compound.to_vec();
-        buf.extend_from_slice(&[0xFF, 0xFF]);
-        assert_eq!(first_subterm_len(&buf), 6);
-    }
-
     /// A generated fact column: a ground symbol, or a fact variable slot (a slot shared within the
     /// fact encodes as NewVar on first use and VarRef after, so facts can be coreferent).
     enum FCol {
@@ -3253,7 +3210,7 @@ mod tests {
                     }
                 }
                 let bytes = unsafe { env.subsexpr().span().as_ref().unwrap() }.to_vec();
-                if !mork_expr::first_subterm(&bytes).is_some_and(|props| props.ground) {
+                if Expr::from_slice(&bytes).variables() != 0 {
                     return;
                 }
                 row.push(bytes);

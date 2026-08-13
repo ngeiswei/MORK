@@ -1801,9 +1801,9 @@ impl std::hash::Hash for ExprEnv {
     }
 }
 
-// Shared subterm-boundary helpers. `subterm_parse_step` supports resumable byte-wise trie walks;
-// `first_subterm` scans a byte slice and additionally reports groundness. Consumers needing
-// variable identities or rewritten output layer that accounting on the same encoding rules.
+// `subterm_parse_step` supports resumable byte-wise trie walks: one byte at a time, so a cursor can
+// interleave the parse with trie navigation. Consumers needing variable identities or rewritten
+// output layer that accounting on the same encoding rules.
 
 /// One byte of the resumable parse: `subterms` complete terms and `payload` raw bytes are still
 /// owed; a key spells exactly one complete subterm iff both are zero (starting from `(1, 0)`).
@@ -1820,36 +1820,6 @@ pub fn subterm_parse_step(b: u8, subterms: &mut u32, payload: &mut u32) {
             Tag::VarRef(_) | Tag::NewVar => {}
         }
     }
-}
-
-/// The extent of one complete subterm at the front of a byte run.
-pub struct SubtermProps {
-    pub length: usize,
-    pub ground: bool,
-}
-
-/// Batch form: the extent of the first complete subterm at `bytes[0..]`, or `None` on a truncated
-/// term. Groundness here is the same fact [`ExprEnv::ground_skip`] stamps.
-pub fn first_subterm(bytes: &[u8]) -> Option<SubtermProps> {
-    let mut i = 0usize;
-    let mut remaining = 1usize;
-    let mut ground = true;
-    while remaining > 0 {
-        let b = *bytes.get(i)?;
-        i += 1;
-        remaining -= 1;
-        match byte_item(b) {
-            Tag::Arity(arity) => remaining += arity as usize,
-            Tag::VarRef(_) | Tag::NewVar => ground = false,
-            Tag::SymbolSize(size) => {
-                i = i.checked_add(size as usize)?;
-                if i > bytes.len() {
-                    return None;
-                }
-            }
-        }
-    }
-    Some(SubtermProps { length: i, ground })
 }
 
 pub struct TraverseSide { ee: ExprEnv, vars: u32 }
