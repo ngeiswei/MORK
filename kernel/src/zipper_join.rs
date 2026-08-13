@@ -25,6 +25,10 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 const QUERY_NS: u8 = 0;
 
+/// Marks a parse record whose byte may have a sibling in the trie, i.e. a position no bulk move
+/// covered. A symbol payload is at most 63 bytes, so the record's payload field has a spare bit.
+const BRANCH_CANDIDATE: u8 = 0x80;
+
 /// The least byte present in `mask` that is `>= k`, or `None` if every set bit is below `k`. This
 /// is the per-byte leapfrog seek on a trie node's children.
 #[inline]
@@ -240,7 +244,18 @@ impl<Z: Zipper + ZipperMoving + ZipperIteration> SubtermCursor<Z> {
     /// Account for one byte the zipper just descended, advancing the incremental parse.
     #[inline]
     fn advance_parse(&mut self, b: u8) {
-        self.col.parse_stack.push((self.col.owed_subterms, self.col.owed_payload as u8));
+        self.advance_parse_at(b, true)
+    }
+
+    /// [`Self::advance_parse`], recording whether a sibling byte may exist at this position. A bulk
+    /// move only crosses positions with a single child, so the bytes it produces are marked `false`
+    /// and the ascending backtrack skips them without asking the zipper.
+    #[inline]
+    fn advance_parse_at(&mut self, b: u8, branch: bool) {
+        let flag = if branch { BRANCH_CANDIDATE } else { 0 };
+        self.col
+            .parse_stack
+            .push((self.col.owed_subterms, self.col.owed_payload as u8 | flag));
         // A byte is a tag exactly when no symbol payload is owed; the parse state answers that
         // BEFORE consuming the byte, which is what makes the variable counts exact.
         if self.col.owed_payload == 0 {
@@ -262,6 +277,7 @@ impl<Z: Zipper + ZipperMoving + ZipperIteration> SubtermCursor<Z> {
             .parse_stack
             .pop()
             .expect("parse stack out of lockstep with key");
+        let pre_payload = pre_payload & !BRANCH_CANDIDATE;
         self.col.owed_subterms = pre_subterms;
         // The restored state classifies `b`: a tag position mirrors its variable count back out.
         if pre_payload == 0 {
@@ -379,7 +395,7 @@ impl<Z: Zipper + ZipperMoving + ZipperIteration> SubtermCursor<Z> {
                 for i in 0..owed {
                     self.col
                         .parse_stack
-                        .push((self.col.owed_subterms, (owed - i) as u8));
+                        .push((self.col.owed_subterms, (owed - i) as u8 | BRANCH_CANDIDATE));
                 }
                 self.col.owed_payload = 0;
                 continue;
@@ -395,7 +411,7 @@ impl<Z: Zipper + ZipperMoving + ZipperIteration> SubtermCursor<Z> {
                 let mut i = before;
                 while i < end {
                     let b = self.z.path()[i];
-                    self.advance_parse(b);
+                    self.advance_parse_at(b, false);
                     i += 1;
                     if self.col.owed_subterms == 0 && self.col.owed_payload == 0 {
                         break;
@@ -424,9 +440,28 @@ impl<Z: Zipper + ZipperMoving + ZipperIteration> SubtermCursor<Z> {
     /// level offers a larger sibling, take the least such, then complete leftmost. False = exhausted.
     fn backtrack_then_leftmost(&mut self) -> bool {
         loop {
-            if self.key_len() == 0 {
+            // Ascend straight to the deepest position a bulk move did not cover. Everything below
+            // it has a single child by construction, so no sibling can exist there and the probe
+            // this used to make at every depth could only fail. The scan walks the records the
+            // retreat has to walk anyway, so it costs no zipper call and no extra state.
+            let mut n = self.col.parse_stack.len();
+            while n > 0 && self.col.parse_stack[n - 1].1 & BRANCH_CANDIDATE == 0 {
+                n -= 1;
+            }
+            if n == 0 {
                 self.at_end = true;
                 return false;
+            }
+            let cur = self.z.path().len();
+            let target = self.col.floor + n;
+            debug_assert!(target <= cur, "the record stack ran below the focus");
+            if cur > target {
+                for i in (target..cur).rev() {
+                    let b = self.z.path()[i];
+                    self.retreat_parse(b);
+                }
+                let ok = self.z.ascend(cur - target);
+                debug_assert!(ok, "ascending inside the column");
             }
             // The byte about to leave must be read BEFORE the zipper moves: with the path as the
             // only representation, it lives nowhere else.
