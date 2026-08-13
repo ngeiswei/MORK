@@ -188,7 +188,7 @@ impl Column {
     }
 }
 
-impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
+impl<Z: Zipper + ZipperMoving + ZipperIteration> SubtermCursor<Z> {
     /// Build a cursor at the zipper's current focus. Not positioned until `first`/`seek` is called.
     pub fn new(z: Z) -> Self {
         let floor = z.path().len();
@@ -362,6 +362,51 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
     /// if a node runs out of children before completion (malformed/empty branch).
     fn complete_leftmost(&mut self) -> bool {
         while !self.key_is_complete() {
+            // A symbol's payload is a run whose length the parse already knows, and no decision is
+            // taken inside it, so take all of it in ONE zipper move. `descend_first_k_path` walks
+            // the trie a node at a time (it extends the path by a whole node key), where the
+            // per-byte descent below pays a node lookup, a regularize and a key memcmp for every
+            // byte. The records the run owes are the arithmetic sequence the parse would have
+            // produced, and payload bytes are not tags, so no variable count moves.
+            let owed = self.col.owed_payload as usize;
+            if owed > 1 {
+                let before = self.z.path().len();
+                if !self.z.descend_first_k_path(owed) {
+                    self.at_end = true;
+                    return false;
+                }
+                debug_assert_eq!(self.z.path().len(), before + owed);
+                for i in 0..owed {
+                    self.col
+                        .parse_stack
+                        .push((self.col.owed_subterms, (owed - i) as u8));
+                }
+                self.col.owed_payload = 0;
+                continue;
+            }
+            // The trie is path-compressed, so a span with no branching IS one node key: take the
+            // whole span in one move and run the (allocation-free) byte parse over what it
+            // produced, ascending back if it ran past the subterm boundary. `descend_until` would
+            // be wrong to use here -- its ReadZipper override is a per-byte loop, while
+            // `descend_until_max_bytes` extends by whole node keys.
+            let before = self.z.path().len();
+            if self.z.descend_until_max_bytes(64) {
+                let end = self.z.path().len();
+                let mut i = before;
+                while i < end {
+                    let b = self.z.path()[i];
+                    self.advance_parse(b);
+                    i += 1;
+                    if self.col.owed_subterms == 0 && self.col.owed_payload == 0 {
+                        break;
+                    }
+                }
+                if i < end {
+                    let ok = self.z.ascend(end - i);
+                    debug_assert!(ok, "ascending back inside a span we just descended");
+                }
+                continue;
+            }
             // The leftmost child, straight off the node's iterator: materializing a full
             // 256-bit child mask and scanning it for the least bit, then re-finding that byte
             // with descend_to_byte, re-derived per byte what the zipper answers in one step.
