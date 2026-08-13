@@ -53,6 +53,12 @@ Roots scanned by default:
     side, repeated variables, wildcards in the *data*, bare top-level conjuncts.
   - `programs/` — whole programs: CTL model checking, backward chaining, an
     anamorphism, a pi-calculus reduction, proof search.
+  - `wiki/` — every runnable example from the MORK wiki, one file per code block,
+    named `<page>_<block>.mm2` and carrying the page it came from in its `@desc`.
+    The tutorials build a program up over many blocks, so the intermediate versions
+    are here too: each is a program the wiki asks a reader to run, so each is a
+    program that has to keep working. The final version of each tutorial pins an
+    expected space.
 - `kernel/resources/` — the `.mm2` programs that already lived in the repo.
 
 Anything a program needs beyond the two binaries is declared in its own leading
