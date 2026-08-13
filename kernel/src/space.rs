@@ -35,21 +35,6 @@ pub static mut writes: usize = 0;
 pub static ACT_PATH: &'static str = "/dev/shm/";
 // pub static ACT_PATH: &'static str = "/mnt/data/";
 
-/// Whether `atom` is a fact consisting of nothing but a variable.
-///
-/// Such a fact is a top-level wildcard: a conjunct is matched against a whole fact, so it would
-/// unify with EVERY conjunct of every body. The space does not allow it. Beyond being a shape nobody
-/// writes deliberately, supporting it costs the leapfrog join real work in the ordinary case -- a
-/// bare variable is stored at the trie root under no arity prefix, so a factor would have to open at
-/// the root and carry its whole conjunct as an extra seek position, which measured 2-6.7% slower on
-/// spaces that contain no such fact. Prohibiting it keeps that cost at zero and keeps the two
-/// engines in agreement, which they were not while it was allowed: the ProductZipper answered such
-/// facts and the join silently dropped every answer that needed one.
-#[inline]
-pub fn is_bare_variable_atom(atom: &[u8]) -> bool {
-    atom.len() == 1 && matches!(byte_item(atom[0]), Tag::NewVar | Tag::VarRef(_))
-}
-
 pub struct Space {
     pub btm: PathMap<()>,
     pub sm: SharedMappingHandle,
@@ -861,7 +846,9 @@ impl Space {
             match parser.sexpr(&mut it, &mut ez) {
                 Ok(()) => {
                     let data = &stack[..ez.loc];
-                    if is_bare_variable_atom(data) {
+                    // A fact that is nothing but a variable is a top-level wildcard: the engines
+                    // disagree on it (see `warn_top_level_variable`).
+                    if data.len() == 1 && matches!(byte_item(data[0]), Tag::NewVar | Tag::VarRef(_)) {
                         eprintln!(
                             "warning: atom {}: top level variable detected. It unifies with every \
                              conjunct of every query, and the leapfrog join cannot see it, so the \
@@ -919,19 +906,10 @@ impl Space {
         Ok(i)
     }
 
-    /// Warn if the space holds a fact that is nothing but a variable.
-    ///
-    /// Such a fact is a top-level wildcard: a conjunct is matched against a whole fact, so it
-    /// unifies with EVERY conjunct of every body -- and it is stored at the trie root under no arity
-    /// prefix, where a leapfrog factor opened at its relation prefix cannot see it. The two engines
-    /// therefore disagree on such a space: the ProductZipper answers it and the join silently drops
-    /// every answer that needed it. Supporting it would cost the join 2-6.7% on the ordinary case
-    /// (a factor would have to open at the root and carry its whole conjunct as an extra seek
-    /// position), which is a bad trade for a shape that has not come up in practice.
-    ///
-    /// So this is a warning, not enforcement, and it is deliberately NOT on any hot path: it costs
-    /// one O(1) probe when a space is serialized. Wildcard tag bytes are the contiguous range
-    /// `VarRef(0)..=NewVar`, so the least root child at or above `VarRef(0)` settles it.
+    /// Warn if the space holds a fact that is nothing but a variable: it unifies with every
+    /// conjunct of every query, and the leapfrog join cannot see it (such a fact sits at the trie
+    /// root under no arity prefix), so the two engines disagree on the space. One O(1) root probe
+    /// per serialization -- wildcard tags are the contiguous range `VarRef(0)..=NewVar`.
     pub fn warn_top_level_variable(&self) {
         let lo = item_byte(Tag::VarRef(0));
         let mask = self.btm.read_zipper().child_mask();

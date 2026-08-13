@@ -849,15 +849,9 @@ f
     assert!(res.contains("OK\n"));
 }
 
-/// A conjunct that is a bare top-level SYMBOL, the ground counterpart of `top_level_match`'s bare
-/// variable. `query_multi` matches each conjunct against a whole fact, so a symbol conjunct is an
-/// existence check on that atom: the body fires once per match of its other conjuncts when the
-/// symbol is present, and never when it is absent.
-///
-/// It is also the shape the leapfrog join declines. A join factor is a relation of known arity
-/// decomposed into columns it can seek; a bare symbol is an `Arity`-less atom with no columns, so
-/// there is no factor to build and the body stays on the ProductZipper. This test therefore pins
-/// the semantics and covers that fallback, and must hold with or without the `leapfrog` feature.
+/// A bare top-level SYMBOL conjunct is an existence check on that atom: the body fires when the
+/// symbol is present and never when it is absent. It is also a shape the leapfrog join declines
+/// (no arity, so no columns to seek), so this covers the fallback under either feature setting.
 fn top_level_symbol() {
     let mut s = Space::new();
 

@@ -752,42 +752,26 @@ fn is_wildcard_term(k: u8) -> bool {
     matches!(byte_item(k), Tag::NewVar | Tag::VarRef(_))
 }
 
-/// Whether a stored complete subterm is symbol-headed, hence GROUND and a leaf of the encoding.
-///
-/// MORK's tag bytes order the shapes: `Arity(a)` is `0b00aaaaaa` (0x00..=0x3F), `VarRef(i)` is
-/// `0b10iiiiii` (0x80..=0xBF), `NewVar` is 0xC0, and `SymbolSize(s)` is `0b11ssssss` with `s > 0`
-/// (0xC1..=0xFF). So every symbol byte sorts ABOVE every compound and variable byte, and a
-/// cursor's ascending enumeration of a column therefore ends in a contiguous run of ground
-/// symbols. [`UnifyJoin::fill_lead_candidates`] leans on both facts: that run is the part of the
-/// domain an exact-match intersection may prune, because over ground terms unifiability is byte
-/// equality.
+/// Whether a subterm's head byte makes it symbol-headed, hence ground and a leaf of the encoding.
+/// Symbol tags sort above every compound and variable tag, so a column's ascending enumeration ends
+/// in a contiguous run of ground symbols -- which is the run an exact-match intersection may prune,
+/// since over ground terms unifiability is byte equality.
 #[inline]
-fn is_symbol_head(k: &[u8]) -> bool {
-    matches!(byte_item(k[0]), Tag::SymbolSize(_))
+fn is_symbol_head(head: u8) -> bool {
+    matches!(byte_item(head), Tag::SymbolSize(_))
 }
 
-/// Whether a column whose trie children are `mask` can only match a value by EQUALITY: it holds no
-/// stored variable at this position. A stored variable is a complete single-byte subterm, so its
-/// presence is exactly a variable tag byte among the column's children (the same fact
-/// [`UnifyJoin::ground_probe`] and [`UnifyJoin::match_compound_at_current`] use to enumerate the
-/// stored wildcards from one mask read). A column that does offer one unifies with ANYTHING and so
-/// must never restrict an intersection. Reserved bytes (0x40..=0x7F, which no valid encoding
-/// produces) would answer "not equality-only", which is the conservative side.
+/// Whether a position whose trie children are `mask` stores a wildcard, i.e. a variable that
+/// unifies with whatever the query has here -- a complete one-byte subterm, so exactly a variable
+/// tag among the children. A position that has one must never restrict an intersection; one that
+/// has none can only match by equality. Reserved bytes answer "has a wildcard", the conservative
+/// side.
 #[inline]
-fn column_matches_by_equality(mask: &ByteMask) -> bool {
-    !matches!(
+fn mask_has_wildcard(mask: &ByteMask) -> bool {
+    matches!(
         least_ge(mask, item_byte(Tag::VarRef(0))),
         Some(b) if b <= item_byte(Tag::NewVar)
     )
-}
-
-/// Whether a position whose trie children are `mask` offers a stored variable, i.e. a wildcard that
-/// unifies with whatever the query has here. The complement of [`column_matches_by_equality`], read
-/// off the same single mask probe so a position with no wildcard skips the byte-by-byte scan
-/// entirely.
-#[inline]
-fn mask_has_wildcard(mask: &ByteMask) -> bool {
-    !column_matches_by_equality(mask)
 }
 
 /// A factor is inverted when its columns are not in `var_order` order, so the join cannot seek it
@@ -1265,27 +1249,13 @@ pub fn parse_body_factors<'a>(body: &'a Expr) -> Option<(Vec<Factor<'a>>, usize)
             pos += scan.len;
             continue;
         }
-        // A conjunct is matched against a WHOLE stored fact, and there are two ways to spread that
-        // fact over seekable columns.
-        //
-        // A COMPOUND conjunct `(rel arg..)` keeps the shape this parser has always emitted: the
-        // arity byte alone is the seek prefix, and every top-level argument is a column, with the
-        // relation head as column 0 so a variable query head unifies with every stored head and a
-        // wildcard stored head is captured under a ground query head.
-        //
-        // A conjunct that is NOT a compound -- a bare symbol, a bare variable, or the empty
-        // compound `()` -- has no arguments to spread, so it becomes a WHOLE-ATOM factor: an EMPTY
-        // prefix, so its cursor opens at the trie root where complete facts live, and one single
-        // column holding the conjunct itself. Nothing downstream needs a special case. A constant
-        // conjunct takes the ground path in `UnifyJoin::match_expr_at_current`, which offers the
-        // exact atom (one seek) PLUS every wildcard byte in the floor's child mask -- at an empty
-        // prefix that floor is the root, so the wildcards are exactly the facts stored as a bare
-        // variable, which do unify with the constant. That is `query_multi`'s existence check on
-        // the atom. A variable conjunct takes the free path, which enumerates every stored atom and
-        // binds the variable to it -- `query_multi`'s match-anything conjunct -- and because the
-        // column is a plain `Var`, the variable is a first-class join variable that can be shared
-        // with (and seeked in) any other conjunct. A single-column factor is never inverted, so
-        // neither shape ever reaches the re-index path.
+        // Two ways to spread a whole stored fact over seekable columns. A COMPOUND conjunct
+        // `(rel arg..)` seeks under its arity byte with every top-level argument a column, the
+        // relation head being column 0 so query and stored heads unify either way round. Anything
+        // else -- a bare symbol, a bare variable, `()` -- has no arguments to spread and becomes a
+        // WHOLE-ATOM factor: empty prefix, so the cursor opens at the root where complete facts
+        // live, and one column holding the conjunct. Both then take the ordinary paths, and a
+        // single-column factor is never inverted, so neither reaches the re-index.
         let (prefix, ncols): (&'a [u8], usize) = match byte_item(unsafe { *body.ptr.add(pos) }) {
             Tag::Arity(arity) if arity != 0 => {
                 let prefix: &'a [u8] =
@@ -1583,39 +1553,14 @@ impl UnifyJoin<'_> {
                 return;
             }
             if self.on_match.is_some() {
-                // The engine dispatch consumes the join's OWN solved bindings. The namespaces
-                // already agree with the map the stock path builds: query variables live in
-                // `QUERY_NS` = 0 under the body's global first-occurrence numbering (the same
-                // numbering `apply` assigns walking `(, p1 .. pk)` from intro 0), and factor `f`'s
-                // data lives in namespace `1 + f`, which is what
-                // `query_multi_raw` gives the f-th fact (`ExprEnv::new(1, e)`, then `j + 1`). So
-                // there is nothing to re-derive: rebuilding every fact and re-running a full
-                // `mork_expr::unify` over the pattern factors would recompute, per accepted
-                // tuple, the substitution this join just built incrementally.
-                //
-                // Byte identity is by DEREFERENCE, not by map shape: two solved forms of the same
-                // constraint set are the same most-general unifier up to a renaming of the
-                // still-free variables, and `apply` (through
-                // `apply_e_clears_stacks_and_cycles_check!`) only ever observes a binding by
-                // dereferencing it -- a var-var chain is walked transparently, and a free
-                // variable is emitted by its first-occurrence position in `assignments`, which is
-                // fixed by the pattern's own traversal order, not by which end of a var-var
-                // equation the map happened to keep. Path compression and the direction of
-                // var-var links are therefore invisible downstream. The row path already relies
-                // on exactly this: it emits answers with the same `apply` over these same
-                // bindings, and matches MORK's emitted bytes across the corpus and the random
-                // differential.
-                //
-                // A cyclic assignment is still handed over, exactly as the ProductZipper path
-                // hands one over: `mork_expr::unify` checks occurs only per equation, so it
-                // accepts the join-propagated capture, counts it, and lets the engine's
-                // post-apply `cycled` check drop it before any write. Cycles are a property of
-                // the deref closure, so the engine sees this map's cycle where it saw the
-                // re-unified map's, and the counts (`touched`) stay identical -- see
-                // `dispatch_touched_parity_on_transform`.
-                //
-                // `loc` is factor 0's stored fact, as stock passes; refill the scratch buffer
-                // rather than allocating one per answer.
+                // Hand over the bindings this join already solved, in the namespaces the stock
+                // path uses (query variables in `QUERY_NS`, factor `f`'s data in `1 + f`), rather
+                // than rebuilding every fact and re-unifying per tuple. `apply` observes a binding
+                // only by dereferencing it, so map shape -- path compression, which end of a
+                // var-var equation survived -- is invisible downstream, and a cyclic assignment is
+                // handed over exactly as stock hands one over, for the engine's post-apply
+                // `cycled` check to drop (`dispatch_touched_parity_on_transform` pins the counts).
+                // `loc` is factor 0's stored fact; refill the scratch instead of allocating.
                 let mut buf = std::mem::take(&mut self.loc_buf);
                 buf.clear();
                 self.original_fact_bytes_into(0, &mut buf);
@@ -1773,7 +1718,7 @@ impl UnifyJoin<'_> {
         }
         let mut nr = 0usize;
         for j in 1..parts.len() {
-            if column_matches_by_equality(&self.cursors[parts[j]].floor_child_mask()) {
+            if !mask_has_wildcard(&self.cursors[parts[j]].floor_child_mask()) {
                 nr += 1;
                 // Rotate the entry down to the end of the restrictor group, keeping both groups'
                 // relative order.
@@ -1854,7 +1799,7 @@ impl UnifyJoin<'_> {
     /// restrictor to the candidate, and when one answers with a larger value, leap the lead
     /// straight there instead of walking (and then unifying, binding, and unwinding) the values in
     /// between. `restrictors` are the other participating factors whose column matches only by
-    /// equality ([`column_matches_by_equality`]).
+    /// equality (see [`mask_has_wildcard`]).
     ///
     /// Soundness, which is the whole subtlety here, rests on [`is_symbol_head`]: this join UNIFIES,
     /// so a stored value may match a candidate without equalling it, and an exact intersection would
@@ -1876,7 +1821,7 @@ impl UnifyJoin<'_> {
             let cur = &mut self.cursors[f];
             cur.first();
             while let Some(k) = cur.key() {
-                if is_symbol_head(k) {
+                if is_symbol_head(k[0]) {
                     break;
                 }
                 let vars = cur.key_var_counts();
@@ -3205,7 +3150,7 @@ mod tests {
     /// candidates, and it may only skip forward over them, so it needs every symbol byte to sort
     /// above every compound and variable byte -- otherwise the leap could jump a compound the
     /// intersection is not allowed to prune. Pin that property of the tag encoding, and pin
-    /// `column_matches_by_equality`'s mask test against the variable byte range it stands for.
+    /// `mask_has_wildcard`'s mask test against the variable byte range it stands for.
     #[test]
     fn symbol_terms_sort_above_every_other_tag() {
         use mork_expr::maybe_byte_item;
@@ -3213,7 +3158,7 @@ mod tests {
             // Reserved bytes are not a valid encoding and never reach a stored subterm.
             let Ok(tag) = maybe_byte_item(b) else { continue };
             let symbol = matches!(tag, Tag::SymbolSize(_));
-            assert_eq!(symbol, is_symbol_head(&[b]), "byte {b}");
+            assert_eq!(symbol, is_symbol_head(b), "byte {b}");
             let variable = matches!(tag, Tag::NewVar | Tag::VarRef(_));
             // A single variable byte is a complete subterm; nothing else one byte long is.
             assert_eq!(variable, is_wildcard_term(b), "byte {b}");
@@ -3229,14 +3174,10 @@ mod tests {
                 }
             }
             // The mask test sees a variable byte exactly when one is present.
-            assert_eq!(
-                !column_matches_by_equality(&mask_of(&[b])),
-                variable,
-                "byte {b}"
-            );
+            assert_eq!(mask_has_wildcard(&mask_of(&[b])), variable, "byte {b}");
         }
-        assert!(column_matches_by_equality(&mask_of(&[])));
-        assert!(!column_matches_by_equality(&mask_of(&[
+        assert!(!mask_has_wildcard(&mask_of(&[])));
+        assert!(mask_has_wildcard(&mask_of(&[
             item_byte(Tag::Arity(2)),
             item_byte(Tag::NewVar),
             item_byte(Tag::SymbolSize(3)),
