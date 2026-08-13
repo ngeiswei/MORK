@@ -173,11 +173,11 @@ fn coreferential_transition<Z : ZipperMoving + Zipper + ZipperAbsolutePath + Zip
                         trace!(target: "coref trans", "varref {i} {:?}", &loc.path()[references[i as usize] as usize..]);
                         // trace!(target: "coref trans", "varref against {:?}", loc.child_mask());
                         // trace!(target: "coref trans", "varref path {:?}", serialize(loc.origin_path()));
-                        ExprEnv{ n: 254, v: 0, offset: 0, base: Expr{ ptr: loc.path().as_ptr().cast_mut().offset(references[i as usize] as _) } }
+                        ExprEnv{ n: 254, v: 0, offset: 0, ground_skip: 0, base: Expr{ ptr: loc.path().as_ptr().cast_mut().offset(references[i as usize] as _) } }
                     } else {
                         trace!(target: "coref trans", "varref <{},{i}> 'any'", e.n);
                         static nv: u8 = item_byte(Tag::NewVar);
-                        ExprEnv{ n: 255, v: 0, offset: 0, base: Expr{ ptr: ((&nv) as *const u8).cast_mut() } }
+                        ExprEnv{ n: 255, v: 0, offset: 0, ground_skip: 0, base: Expr{ ptr: ((&nv) as *const u8).cast_mut() } }
                     };
                     stack.push(addition);
                     vs!(e, false);
@@ -846,6 +846,17 @@ impl Space {
             match parser.sexpr(&mut it, &mut ez) {
                 Ok(()) => {
                     let data = &stack[..ez.loc];
+                    // A fact that is nothing but a variable is a top-level wildcard: the engines
+                    // disagree on it (see `warn_top_level_variable`).
+                    if data.len() == 1 && matches!(byte_item(data[0]), Tag::NewVar | Tag::VarRef(_)) {
+                        eprintln!(
+                            "warning: atom {}: top level variable detected. It unifies with every \
+                             conjunct of every query, and the leapfrog join cannot see it, so the \
+                             two engines will not agree on this space. Consider wrapping it, e.g. \
+                             `(any $x)`.",
+                            i + 1
+                        );
+                    }
                     if add { self.btm.insert(data, ()); }
                     else { self.btm.remove(data); }
                 }
@@ -895,7 +906,25 @@ impl Space {
         Ok(i)
     }
 
+    /// Warn if the space holds a fact that is nothing but a variable: it unifies with every
+    /// conjunct of every query, and the leapfrog join cannot see it (such a fact sits at the trie
+    /// root under no arity prefix), so the two engines disagree on the space. One O(1) root probe
+    /// per serialization -- wildcard tags are the contiguous range `VarRef(0)..=NewVar`.
+    pub fn warn_top_level_variable(&self) {
+        let lo = item_byte(Tag::VarRef(0));
+        let mask = self.btm.read_zipper().child_mask();
+        let found = if mask.test_bit(lo) { Some(lo) } else { mask.next_bit(lo) };
+        if found.is_some_and(|b| matches!(byte_item(b), Tag::NewVar | Tag::VarRef(_))) {
+            eprintln!(
+                "warning: top level variable detected in the space. It unifies with every conjunct \
+                 of every query, and the leapfrog join cannot see it, so the two engines will not \
+                 agree on this space."
+            );
+        }
+    }
+
     pub fn dump_all_sexpr<W : Write>(&self, w: &mut W) -> Result<usize, String> {
+        self.warn_top_level_variable();
         let mut rz = self.btm.read_zipper();
         let mut i = 0usize;
         while rz.to_next_val() {
@@ -1008,6 +1037,33 @@ impl Space {
     pub fn restore_paths<OutDirPath : AsRef<std::path::Path>>(&mut self, path: OutDirPath) -> Result<pathmap::paths_serialization::DeserializationStats, std::io::Error> {
         let mut file = File::open(path).unwrap();
         pathmap::paths_serialization::deserialize_paths(self.btm.write_zipper(), &mut file, ())
+    }
+
+    /// [`Space::query_multi`] behind the leapfrog dispatch: with the `leapfrog` feature a
+    /// conjunction body routes to the worst-case-optimal join in [`crate::leapfrog`], which
+    /// streams the same matches through `effect`; every build without the feature takes the
+    /// ProductZipper path below. Only the space-to-space transform dispatches: interpreted sources
+    /// and sinks and the pattern-directed dumps keep the stock path and its enumeration order.
+    ///
+    /// The join owns every CONJUNCT shape -- compounds, bare symbols, bare variables -- and the
+    /// bare `(,)` with no conjunct, so there is no shape test here. The remaining fallback is for
+    /// a body that is not a conjunction at all: a non-compound body or the arity-0 body `()`,
+    /// which `query_multi` handles (or fails on) exactly as it always has, plus the encoding
+    /// pathologies `parse_body_factors` rejects (a `VarRef` naming a variable the body never
+    /// introduced, or more than `u8::MAX` variables).
+    pub fn query_multi_dispatch<F : FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(btm: &PathMap<()>, pat_expr: Expr, mut effect: F) -> usize {
+        // Which engine answers the space-to-space transform is a compile-time choice and nothing
+        // more: with the `leapfrog` feature the join owns every body, and without it the module
+        // does not exist. `query_multi` stays reachable for the paths that are not dispatched --
+        // the pattern-directed dumps and the interpreted source/sink transforms.
+        #[cfg(feature = "leapfrog")]
+        {
+            crate::leapfrog::query_multi_leapfrog(btm, pat_expr, effect)
+        }
+        #[cfg(not(feature = "leapfrog"))]
+        {
+            Self::query_multi(btm, pat_expr, effect)
+        }
     }
 
     pub fn query_multi<F : FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(btm: &PathMap<()>, pat_expr: Expr, mut effect: F) -> usize {
@@ -1181,7 +1237,7 @@ impl Space {
 
             // pairs.iter().for_each(|(x, y)| println!("pair {} {}", x.show(), y.show()));
 
-            let bindings = unify(pairs);
+            let bindings = unify(&mut pairs);
 
             match bindings {
                 Ok(bs) => {
@@ -1364,7 +1420,7 @@ impl Space {
         let mut astack = Vec::with_capacity(64);
 
         let mut any_new = false;
-        let touched = Self::query_multi(&read_copy, pat_expr, |refs_bindings, loc| 'query:{
+        let touched = Self::query_multi_dispatch(&read_copy, pat_expr, |refs_bindings, loc| 'query:{
             trace!(target: "transform", "data {}", serialize(unsafe { loc.span().as_ref().unwrap()}));
             unsafe { writes += template_prefixes.len(); }
             match refs_bindings {

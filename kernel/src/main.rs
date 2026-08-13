@@ -264,7 +264,7 @@ fn process_calculus_bench(steps: usize, x: usize, y: usize) {
 
     println!("{x}+{y} ({} steps) in {} µs result: {res}", steps, elapsed.as_micros());
     assert_eq!(res, format!("{}\n", peano(x+y)));
-    println!("unifications {}, instructions {}", unsafe { unifications }, unsafe { transitions });
+    println!("unifications {}, instructions {}, max unify {}", unsafe { unifications }, unsafe { transitions }, unsafe { mork_expr::max_unify_iterations });
     // (badbad)
     // 200+200 (1000 steps) in 42716559 µs
 }
@@ -311,7 +311,7 @@ fn process_calculus_source_sink_bench(steps: usize, x: usize, y: usize) {
 
     println!("{x}+{y} ({} steps) in {} µs result: {res}", steps, elapsed.as_micros());
     assert_eq!(res, format!("{}\n", peano(x+y)));
-    println!("unifications {}, instructions {}", unsafe { unifications }, unsafe { transitions });
+    println!("unifications {}, instructions {}, max unify {}", unsafe { unifications }, unsafe { transitions }, unsafe { mork_expr::max_unify_iterations });
     // (badbad)
     // 200+200 (1000 steps) in 42716559 µs
 }
@@ -847,6 +847,38 @@ f
 
     println!("result: {res}");
     assert!(res.contains("OK\n"));
+}
+
+/// A bare top-level SYMBOL conjunct is an existence check on that atom: the body fires when the
+/// symbol is present and never when it is absent. It is also a shape the leapfrog join declines
+/// (no arity, so no columns to seek), so this covers the fallback under either feature setting.
+fn top_level_symbol() {
+    let mut s = Space::new();
+
+    const SPACE_EXPRS: &str = r#"
+(e a b)
+(e b c)
+present
+(exec 0 (, (e $x $y) present) (, (yes $x $y)))
+(exec 1 (, (e $x $y) absent) (, (no $x $y)))
+    "#;
+
+    s.add_all_sexpr(SPACE_EXPRS.as_bytes()).unwrap();
+
+    let t0 = Instant::now();
+    let steps = s.metta_calculus(1000000000000000);
+    println!("elapsed {} steps {} size {}", t0.elapsed().as_millis(), steps, s.btm.val_count());
+
+    let mut v = vec![];
+    s.dump_all_sexpr(&mut v).unwrap();
+    let res = String::from_utf8_lossy_owned(v);
+
+    println!("result: {res}");
+    // `present` is in the space, so the conjunct holds and every edge fires.
+    assert!(res.contains("(yes a b)\n"), "present symbol must let the body fire");
+    assert!(res.contains("(yes b c)\n"), "present symbol must let the body fire");
+    // `absent` is not, so that body never fires despite its other conjunct matching.
+    assert!(!res.contains("(no "), "absent symbol must block the body");
 }
 
 fn bench_lr() {
@@ -5540,7 +5572,7 @@ fn mm1_forward() {
         ticks += 1;
         let t1 = Instant::now();
         let n = s.metta_calculus(1);
-        println!("executing step {} took {} ms (unifications {}, writes {}, transitions {})", ticks, t1.elapsed().as_millis(), unsafe { unifications }, unsafe { writes }, unsafe { transitions });
+        println!("executing step {} took {} ms (unifications {}, writes {}, transitions {}, max unify {})", ticks, t1.elapsed().as_millis(), unsafe { unifications }, unsafe { writes }, unsafe { transitions }, unsafe { mork_expr::max_unify_iterations });
 
         if n == 1 { continue } // comment out if you want the analysis at every step
 
@@ -5706,7 +5738,7 @@ fn mm2_bc() {
         ticks += 1;
         let t1 = Instant::now();
         let n = s.metta_calculus(1);
-        println!("executing step {} ({}) took {} ms (unifications {}, writes {}, transitions {})", ticks, n, t1.elapsed().as_millis(), unsafe { unifications }, unsafe { writes }, unsafe { transitions });
+        println!("executing step {} ({}) took {} ms (unifications {}, writes {}, transitions {}, max unify {})", ticks, n, t1.elapsed().as_millis(), unsafe { unifications }, unsafe { writes }, unsafe { transitions }, unsafe { mork_expr::max_unify_iterations });
 
         // if n == 1 { continue } // comment out if you want the analysis at every step
 
@@ -5872,9 +5904,9 @@ fn mm2_bc_v3() {
         ticks += multiplier;
         let t1 = Instant::now();
         let n = s.metta_calculus(multiplier);
-        println!("executing step {} ({}) took {} ms (unifications {}, writes {}, transitions {})",
+        println!("executing step {} ({}) took {} ms (unifications {}, writes {}, transitions {}, max unify {})",
                  ticks, n, t1.elapsed().as_millis(),
-                 unsafe { unifications }, unsafe { writes }, unsafe { transitions });
+                 unsafe { unifications }, unsafe { writes }, unsafe { transitions }, unsafe { mork_expr::max_unify_iterations });
 
         println!("space size {}", s.btm.val_count());
 
@@ -6209,6 +6241,7 @@ fn main() {
             coref_absorbed_by_data_varref();
             data_varref_absorbs_query_compound_newvars();
             top_level_match();
+            top_level_symbol();
             large_statement();
 
             process_calculus_reverse();
@@ -6286,17 +6319,25 @@ fn main() {
             s.timing = timing;
             let f = std::fs::File::open(&input_path).unwrap();
             let mmapf = unsafe { memmap2::Mmap::map(&f).unwrap() };
-            s.add_all_sexpr(&*mmapf);
+            // Surface a load failure instead of running on a silently truncated space: the loader
+            // stops at the offending atom, so ignoring this reported success over a partial space.
+            if let Err(e) = s.add_all_sexpr(&*mmapf) {
+                eprintln!("{input_path}: {e}");
+                std::process::exit(1);
+            }
             for repeated_aux_path in &aux_path {
                 let f = std::fs::File::open(&repeated_aux_path).unwrap();
                 let mmapf = unsafe { memmap2::Mmap::map(&f).unwrap() };
-                s.add_all_sexpr(&*mmapf);
+                if let Err(e) = s.add_all_sexpr(&*mmapf) {
+                    eprintln!("{repeated_aux_path}: {e}");
+                    std::process::exit(1);
+                }
             }
             if instrumentation > 0 { println!("loaded {} expressions", s.btm.val_count()) }
             println!("loaded {:?} ; running and outputing to {:?}", &input_path, output_path.as_ref().or(Some(&"stdout".to_string())));
             let t0 = Instant::now();
             let mut performed = s.metta_calculus(steps);
-            println!("executing {performed} steps took {} ms (unifications {}, writes {}, transitions {})", t0.elapsed().as_millis(), unsafe { unifications }, unsafe { writes }, unsafe { transitions });
+            println!("executing {performed} steps took {} ms (unifications {}, writes {}, transitions {}, max unify {})", t0.elapsed().as_millis(), unsafe { unifications }, unsafe { writes }, unsafe { transitions }, unsafe { mork_expr::max_unify_iterations });
             if instrumentation > 0 { println!("dumping {} expressions", s.btm.val_count()) }
             if output_path.is_none() {
                 let mut v = vec![];

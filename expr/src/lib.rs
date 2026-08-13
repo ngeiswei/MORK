@@ -113,6 +113,11 @@ pub enum Tag {
 // - stay shared as long as possible
 // - bring shared information to the front (bulk)
 
+/// The one-byte encoding of a lone new variable, `$`: the expression every fresh, unconstrained
+/// variable position denotes. Callers that need "an expression that is just a variable" (variable
+///-to-variable binding links, placeholder envs) point at this instead of re-deriving the byte.
+pub const NEW_VAR_EXPR_BYTES: [u8; 1] = [item_byte(Tag::NewVar)];
+
 #[inline(always)]
 pub const fn item_byte(b: Tag) -> u8 {
     match b {
@@ -293,6 +298,12 @@ impl Expr {
             if let Tag::Arity(n) = byte_item(*self.ptr) { Some(n) }
             else { None }
         }
+    }
+
+    /// View encoded bytes as an expression. The pointer is stored mutably for historical reasons,
+    /// but every read-side consumer treats it as immutable; the caller keeps the bytes alive.
+    pub fn from_slice(bytes: &[u8]) -> Expr {
+        Expr { ptr: bytes.as_ptr().cast_mut() }
     }
 
     pub fn span(self) -> *const [u8] {
@@ -1711,15 +1722,40 @@ pub fn serialize(bytes: &[u8]) -> String {
 unsafe impl Sync for Expr {}
 unsafe impl Send for Expr {}
 
-type ExprVar = (u8, u8);
+/// A variable's identity in a multi-expression unification: `(namespace, introduction index)`.
+/// Public so consumers of [`unify`]'s bindings (the kernel's joins) name the key type instead of
+/// re-declaring the tuple.
+pub type ExprVar = (u8, u8);
+/// What [`unify`] solves to: each variable's binding, an [`ExprEnv`] view into one of the unified
+/// expressions.
+pub type Bindings = BTreeMap<ExprVar, ExprEnv>;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ExprEnv {
     pub n: u8,
     pub v: u8,
     pub offset: u32,
+    /// Skip stamp: the byte distance from `subsexpr()` to the first location after the grounded
+    /// subterm starting there, or 0 when no such subterm is known.
+    ///
+    /// A nonzero stamp certifies two facts at once -- the subterm's extent AND that it contains
+    /// no variable -- which is exactly the license every walk needs to jump it: a walker may
+    /// treat the whole span as one opaque item, an emitter may copy it verbatim (a ground
+    /// subterm re-encodes to exactly its own bytes), a comparer may judge it by `memcmp` (the
+    /// encoding is prefix-free, so byte equality of complete terms is term equality), and
+    /// anything hunting variables may ignore it entirely. 0 is always safe: it means "walk it",
+    /// never "has variables".
+    ///
+    /// Stamps come from whoever already holds the facts -- the join's arena scans nothing to
+    /// mint one, its enumerating cursor counts variable tags as a byproduct of the walk it does
+    /// anyway. Every derivation that changes what span the env denotes (a shifted
+    /// [`ExprEnv::offset`]) clears it: the stamp describes one exact span. Sits in what was
+    /// padding, so the struct stays 16 bytes.
+    pub ground_skip: u16,
     pub base: Expr
 }
+
+const _: () = assert!(size_of::<ExprEnv>() == 16, "ExprEnv must not grow: it is copied per binding per answer");
 
 impl PartialEq<Self> for ExprEnv {
     fn eq(&self, other: &Self) -> bool {
@@ -1758,6 +1794,7 @@ impl ExprEnv {
             n: i,
             v: 0,
             offset: 0,
+            ground_skip: 0,
             base: e,
         }
     }
@@ -1767,7 +1804,7 @@ impl ExprEnv {
     }
 
     pub fn offset(&self, offset: u32) -> ExprEnv {
-        ExprEnv{ n: self.n, v: self.v, offset: self.offset + offset, base: self.base }
+        ExprEnv{ n: self.n, v: self.v, offset: self.offset + offset, ground_skip: 0, base: self.base }
     }
 
     pub fn subsexpr(&self) -> Expr {
@@ -1823,9 +1860,21 @@ impl ExprEnv {
                     n: self.n,
                     v: self.v,
                     offset: self.offset + 1,
+                    ground_skip: 0,
                     base: self.base,
                 };
                 for sk in 0..k {
+                    let ne = env.clone();
+                    dest.push(ne);
+                    // The traversal below exists only to advance `env` past this child to reach
+                    // the NEXT one, so after the last child it is pure waste -- and it costs
+                    // O(child span). On a right-nested pattern, where each level's last child is
+                    // the whole remaining term, paying it at every level made a descent that
+                    // calls `args` per node (`Space::coreferential_transition`) quadratic in the
+                    // pattern's size. Skipping it makes such a descent linear.
+                    if sk + 1 == k {
+                        break;
+                    }
                     let (se_c, _, se_offset) = traverseh!((), (), u8, env.subsexpr(), 0,
                         |c: &mut u8, o| { *c += 1; },
                         |_, o, r| {},
@@ -1834,8 +1883,6 @@ impl ExprEnv {
                         |_, o, x, y| {},
                         |_, _, _| {});
 
-                    let ne = env.clone();
-                    dest.push(ne);
                     env.offset += se_offset as u32;
                     env.v += se_c;
                 }
@@ -1849,11 +1896,20 @@ impl ExprEnv {
 pub enum UnificationFailure {
     Occurs(ExprVar, ExprEnv),
     Difference(ExprEnv, ExprEnv),
+    /// No longer produced: the iteration budget that raised this is now the
+    /// [`max_unify_iterations`] statistic. Kept so existing matches stay exhaustive.
     MaxIter(u32)
 }
 
 const APPLY_DEPTH: u32 = 64;
-const MAX_UNIFY_ITER: u32 = 1000;
+
+/// The deepest per-call iteration count [`unify`] has reached in this process, in the style of the
+/// kernel's `transitions`/`unifications` counters. This replaces the former `MAX_UNIFY_ITER = 1000`
+/// abort, which was a debugging guard that had become an answer-dropping cutoff: a conjunctive body
+/// whose total structure exceeded it (roughly one iteration per pattern node -- reachable at ~55
+/// conjuncts of depth 16, or one conjunct nested ~1200 deep) lost real matches with no diagnostic.
+/// Reported by the CLI so the figure that used to be a silent limit is now visible.
+pub static mut max_unify_iterations: u32 = 0;
 const PRINT_DEBUG: bool = false;
 #[deprecated]
 #[inline(never)]
@@ -1970,7 +2026,22 @@ pub fn apply(n: u8, mut original_intros: u8, mut new_intros: u8, ez: &mut ExprZi
 #[inline(never)]
 pub fn unify(mut stack: &mut Vec<(ExprEnv, ExprEnv)>) -> Result<BTreeMap<ExprVar, ExprEnv>, UnificationFailure> {
     let mut bindings: BTreeMap<ExprVar, ExprEnv> = BTreeMap::new();
-    let mut iterations = 0;
+    // Counts this call's iterations locally and folds the result into
+    // [`max_unify_iterations`] exactly once, on the way out. A `Drop` guard rather than an
+    // update at each `return`, so every exit path (Occurs, Difference, Ok) is covered and
+    // the loop itself stays a plain increment.
+    struct IterationHighWater(u32);
+    impl Drop for IterationHighWater {
+        fn drop(&mut self) {
+            unsafe {
+                if self.0 > max_unify_iterations {
+                    max_unify_iterations = self.0;
+                }
+            }
+        }
+    }
+    let mut iter_stat = IterationHighWater(0);
+    let iterations = &mut iter_stat.0;
     let mut encountered: gxhash::HashSet<(ExprEnv, ExprEnv)> = gxhash::HashSet::new();
 
     macro_rules! step {
@@ -2053,10 +2124,13 @@ pub fn unify(mut stack: &mut Vec<(ExprEnv, ExprEnv)>) -> Result<BTreeMap<ExprVar
             println!();
         }
 
-        if iterations > MAX_UNIFY_ITER { 
-            return Err(UnificationFailure::MaxIter(iterations))
-        }
-        iterations += 1;
+        // No budget check here any more: the former `MAX_UNIFY_ITER` abort silently dropped
+        // genuine matches, since unification is only reached on a candidate the search has
+        // already accepted, so a pattern whose total structure exceeded it lost real answers
+        // size-dependently and without any diagnostic. Termination never rested on it -- the
+        // occurs check and the `encountered` set bound the search -- so the budget only hid
+        // how far unification had to go. The guard above records that instead.
+        *iterations += 1;
         if PRINT_DEBUG {
             println!("popping");
             // println!("x: {}, sx : {:?}", xpop.show(), sx.len());
@@ -2769,8 +2843,8 @@ mod tests {
             // (F $_ ($x $x) ($x $x))
             let mut ev = parse!(r"[4] F $ [2] $ _2 [2] _2 _2");
             let e = Expr { ptr: ev.as_mut_ptr() };
-            let lhs = RelExprEnv(ExprEnv{ n: 0, v: 1, offset:  1 + 2 + 1, base: e});
-            let rhs = RelExprEnv(ExprEnv{ n: 0, v: 2, offset:  1 + 2 + 1 + 1 + 1 + 1, base: e});
+            let lhs = RelExprEnv(ExprEnv{ n: 0, v: 1, offset:  1 + 2 + 1, ground_skip: 0, base: e});
+            let rhs = RelExprEnv(ExprEnv{ n: 0, v: 2, offset:  1 + 2 + 1 + 1 + 1 + 1, ground_skip: 0, base: e});
             println!("lhs {}", lhs.0.show());
             println!("rhs {}", rhs.0.show());
             assert_eq!(lhs, rhs);
@@ -2782,8 +2856,8 @@ mod tests {
             // (F $_ ($x $x) ($y $x))
             let mut ev = parse!(r"[4] F $ [2] $ _2 [2] $ _2");
             let e = Expr { ptr: ev.as_mut_ptr() };
-            let lhs = RelExprEnv(ExprEnv{ n: 0, v: 1, offset:  1 + 2 + 1, base: e});
-            let rhs = RelExprEnv(ExprEnv{ n: 0, v: 2, offset:  1 + 2 + 1 + 1 + 1 + 1, base: e});
+            let lhs = RelExprEnv(ExprEnv{ n: 0, v: 1, offset:  1 + 2 + 1, ground_skip: 0, base: e});
+            let rhs = RelExprEnv(ExprEnv{ n: 0, v: 2, offset:  1 + 2 + 1 + 1 + 1 + 1, ground_skip: 0, base: e});
             println!("lhs {}", lhs.0.show());
             println!("rhs {}", rhs.0.show());
             assert_ne!(lhs, rhs);
@@ -2795,8 +2869,8 @@ mod tests {
             // ($x $x)
             let mut ev = parse!(r"[2] $ _1");
             let e = Expr { ptr: ev.as_mut_ptr() };
-            let lhs = RelExprEnv(ExprEnv{ n: 0, v: 0, offset: 1, base: e});
-            let rhs = RelExprEnv(ExprEnv{ n: 0, v: 1, offset: 2, base: e});
+            let lhs = RelExprEnv(ExprEnv{ n: 0, v: 0, offset: 1, ground_skip: 0, base: e});
+            let rhs = RelExprEnv(ExprEnv{ n: 0, v: 1, offset: 2, ground_skip: 0, base: e});
             println!("lhs {}", lhs.0.show());
             println!("rhs {}", rhs.0.show());
             assert_eq!(lhs, rhs);
