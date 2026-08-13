@@ -1763,23 +1763,18 @@ pub struct ExprEnv {
     pub n: u8,
     pub v: u8,
     pub offset: u32,
-    /// Skip stamp: the byte distance from `subsexpr()` to the first location after the grounded
-    /// subterm starting there, or 0 when no such subterm is known.
+    /// Byte length of this subterm when it is known to be ground.
     ///
-    /// A nonzero stamp certifies two facts at once -- the subterm's extent AND that it contains
-    /// no variable -- which is exactly the license every walk needs to jump it: a walker may
-    /// treat the whole span as one opaque item (`owed -= 1; at += ground_skip`), an emitter may
-    /// copy it verbatim (a ground subterm re-encodes to exactly its own bytes), a comparer may
-    /// judge it by `memcmp` (the encoding is prefix-free, so byte equality of complete terms is
-    /// term equality), and anything hunting variables (occurs checks, `newvars`, cycle cuts) may
-    /// ignore it entirely. 0 is always safe: it means "walk it", never "has variables".
+    /// Zero means unknown, including ground spans larger than `u16::MAX`. A nonzero value permits
+    /// callers to compare or copy the span without walking it, and to skip variable hunts (occurs
+    /// checks, cycle cuts) over it. Any operation that changes `offset` must clear the stamp.
     ///
-    /// Stamps come from whoever already holds the facts: the join's arena scans the bytes it
-    /// copies anyway, and `unify` stamps the subterms `match2` walks past when pairing them with
-    /// variables -- extent and groundness both fall out of that walk for free. Every derivation
-    /// that changes what span the env denotes (a shifted [`ExprEnv::offset`]) clears it: the
-    /// stamp describes one exact span. Sits in what was padding, so the struct stays 16 bytes.
-    pub ground_skip: u16,
+    /// SAFETY: a false stamp -- nonzero for a span shorter than it says, or one containing a
+    /// variable -- makes consumers read `ground_skip` bytes from `subsexpr()`, so it can cause an
+    /// out-of-bounds read. Private for that reason: the only way to set one from outside this crate
+    /// is [`ExprEnv::stamp_ground`], which is `unsafe` and states the obligation. Tests: `mod
+    /// ground_stamp`.
+    ground_skip: u16,
     pub base: Expr
 }
 
@@ -1806,21 +1801,9 @@ impl std::hash::Hash for ExprEnv {
     }
 }
 
-// ---- The subterm walk, in its three canonical forms. ----
-//
-// The encoding is prefix-free and self-delimiting: an `Arity(k)` owes the next `k` complete
-// subterms, a `SymbolSize(s)` owes `s` raw payload bytes, a variable is one byte. Everything that
-// walks an expression is an instance of that one recurrence, and the facts a walk yields --
-// byte length, groundness, variable introductions -- are exactly what [`ExprEnv`] carries
-// (`ground_skip`, `v`), so walks should produce them once and stamp them, never be repeated.
-// The three forms below differ only in how the walk is driven:
-//  - [`subterm_parse_step`]: byte-at-a-time, resumable -- for cursors that interleave the parse
-//    with trie navigation and must know mid-descent whether a subterm has completed;
-//  - [`first_subterm`]: batch over raw bytes -- length and groundness of the first complete
-//    subterm, tolerant of `VarRef`s that point outside the span (a subterm cut from the middle
-//    of a fact may reference variables introduced before it);
-//  - [`apply_e`]'s item loop and the `traverse!`/`traverseh!` folds: item-at-a-time -- symbols
-//    consumed whole, so only the subterm counter is live (no payload state).
+// Shared subterm-boundary helpers. `subterm_parse_step` supports resumable byte-wise trie walks;
+// `first_subterm` scans a byte slice and additionally reports groundness. Consumers needing
+// variable identities or rewritten output layer that accounting on the same encoding rules.
 
 /// One byte of the resumable parse: `subterms` complete terms and `payload` raw bytes are still
 /// owed; a key spells exactly one complete subterm iff both are zero (starting from `(1, 0)`).
@@ -1889,6 +1872,28 @@ impl ExprEnv {
             ground_skip: 0,
             base: e,
         }
+    }
+
+    /// An env at `base`'s root in namespace `n`, whose variables are numbered from `v`.
+    pub fn with_intro(n: u8, v: u8, e: Expr) -> Self {
+        Self { n, v, offset: 0, ground_skip: 0, base: e }
+    }
+
+    /// This subterm's ground stamp, or 0 when unknown. See [`ExprEnv::ground_skip`].
+    #[inline]
+    pub fn ground_stamp(&self) -> u16 {
+        self.ground_skip
+    }
+
+    /// Record that the subterm at `subsexpr()` is ground and exactly `len` bytes long.
+    ///
+    /// SAFETY: `len` must be that subterm's exact byte length, and the subterm must contain no
+    /// variable. Consumers read `len` bytes from `subsexpr()` and skip variable hunts over them, so
+    /// a wrong value is an out-of-bounds read or a wrong unification. A `len` of 0 always means
+    /// "unknown" and is safe.
+    #[inline]
+    pub unsafe fn stamp_ground(&mut self, len: u16) {
+        self.ground_skip = len;
     }
 
     pub fn v_incr_traversal(&self) -> TraverseSide {

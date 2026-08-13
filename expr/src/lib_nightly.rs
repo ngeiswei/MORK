@@ -67,22 +67,14 @@ impl Debug for OwnedSourceItem {
     }
 }
 
-/// Consumer of the item stream [`apply_e`] produces.
-///
-/// This replaces the former `item_sink` coroutine. The coroutine had to be resumed once per item
-/// -- a state save/restore and an indirect branch for what is a byte push -- and it carried an
-/// arity stack purely to compute a `Return` byte count that every production caller discarded.
-/// A trait with `#[inline(always)]` implementations puts the write at the call site instead, and
-/// lets the caller pick [`NullSink`] when it wants `apply_e`'s variable counts but not its bytes.
+/// Receives the encoded items produced by [`apply_e`].
 pub trait ItemSink {
     fn tag(&mut self, tag: Tag);
     fn symbol(&mut self, bytes: &[u8]);
-    /// Append an already-encoded, variable-free expression whole.
+    /// Receives a complete, already-encoded ground subterm, and may append it in bulk.
     ///
-    /// A ground subterm re-encodes to exactly its own bytes, so the item walk over it is the
-    /// identity; this lets [`apply_e`] replace that walk with one bulk copy when a binding
-    /// carries a ground stamp ([`crate::ExprEnv::ground_skip`]). Item-for-item equivalent to
-    /// feeding the span through `tag`/`symbol`.
+    /// Item-for-item equivalent to feeding the span through `tag`/`symbol`, which is what licenses
+    /// the bulk copy: a ground subterm re-encodes to exactly its own bytes.
     fn ground(&mut self, bytes: &[u8]);
 }
 
@@ -101,10 +93,8 @@ impl<T: ItemSink + ?Sized> ItemSink for &mut T {
     }
 }
 
-/// Discards the stream. For callers that only want `(original_intros, new_intros, no_cycles)`.
-///
-/// Unlike writing into [`std::io::sink`], this costs nothing at all: there is no stream to drive,
-/// so the item walk keeps only the accounting the caller actually reads.
+/// Discards emitted items while preserving [`apply_e`]'s traversal and accounting: the walk still
+/// follows bindings, counts intros and does cycle bookkeeping, and only the output storage is gone.
 pub struct NullSink;
 
 impl ItemSink for NullSink {

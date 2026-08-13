@@ -412,22 +412,11 @@ macro_rules! construct_impl {
     (@write, $label:lifetime, $cursor:ident, ) => { };
 }
 
-/// This macro implements that final "occurs check" __after__ application.<br>
-/// This is a macro, as a function risks not being inlined.<br>
-/// The following is based on the apply_e and item_sink
-/// ```ignore
-/// pub fn apply_e_clears_and_cycles_check<'o, W: std::io::Write>(
-///     n                  : u8,                          // :expr
-///     mut original_intros: u8,                          // :expr
-///     mut new_intros     : u8,                          // :expr
-///     e                  : Expr,                        // :expr
-///     bindings           : &BTreeMap<ExprVar, ExprEnv>, // :expr
-///     es                 : &mut S,                      // :ident, an `ItemSink`
-///     stack              : &mut Vec<ExprVar>,           // :ident, This gets cleared before application
-///     assignments        : &mut Vec<ExprVar>            // :ident, This gets cleared before application
-/// ) -> (u8,u8,no_cycles:bool)
-/// ```
-/// The important pattern here is that mutable values are taken by name (ident) and others by expression (expr). This lowers syntactic noise by letting the implementation add the references itself.
+/// Clears reusable application state, instantiates an expression, and reports whether expansion
+/// encountered a binding cycle.
+///
+/// A macro rather than a function so the body inlines. Mutable arguments are taken by name
+/// (`:ident`) so the implementation can add the references itself.
 #[macro_export]
 macro_rules! apply_e_clears_stacks_and_cycles_check {
     ($n:expr, $original_intros:expr, $new_intros:expr, $pat_expr:expr, $bindings:expr, $es:ident, $stack:ident, $assignments:ident) => {{
@@ -440,10 +429,8 @@ macro_rules! apply_e_clears_stacks_and_cycles_check {
     }};
 }
 
-/// [`apply_e_clears_stacks_and_cycles_check`] for callers that want only the variable counts and
-/// the occurs check, not the instantiated bytes -- the "does this pattern apply" pass.
-///
-/// Takes no sink: it applies into [`NullSink`], so the walk carries no output machinery at all.
+/// Runs the same traversal and cycle accounting as
+/// [`apply_e_clears_stacks_and_cycles_check`] while discarding emitted bytes.
 #[macro_export]
 macro_rules! apply_e_cycles_only {
     ($n:expr, $original_intros:expr, $new_intros:expr, $pat_expr:expr, $bindings:expr, $stack:ident, $assignments:ident) => {{

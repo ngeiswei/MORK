@@ -614,13 +614,7 @@ fn push_steps<'a>(
     // The body is engine-produced and already validated by the factor parse; the encoding is
     // trusted, so this walk reads it raw.
     let b = unsafe { *base.ptr.add(offset) };
-    let env = ExprEnv {
-        n: QUERY_NS,
-        v: intro,
-        offset: offset as u32,
-        ground_skip: 0,
-        base,
-    };
+    let env = ExprEnv::with_intro(QUERY_NS, intro, base).offset(offset as u32);
     match byte_item(b) {
         Tag::NewVar => {
             out.push(Step::Var(intro as usize));
@@ -1857,23 +1851,11 @@ impl UnifyJoin<'_> {
     }
 
     fn query_var_env(&self, v: usize) -> ExprEnv {
-        ExprEnv {
-            n: QUERY_NS,
-            v: v as u8,
-            offset: 0,
-            ground_skip: 0,
-            base: Expr::from_slice(&NEW_VAR_EXPR_BYTES),
-        }
+        ExprEnv::with_intro(QUERY_NS, v as u8, Expr::from_slice(&NEW_VAR_EXPR_BYTES))
     }
 
     fn var_env(&self, (n, v): ExprVar) -> ExprEnv {
-        ExprEnv {
-            n,
-            v,
-            offset: 0,
-            ground_skip: 0,
-            base: Expr::from_slice(&NEW_VAR_EXPR_BYTES),
-        }
+        ExprEnv::with_intro(n, v, Expr::from_slice(&NEW_VAR_EXPR_BYTES))
     }
 
     /// An env viewing `bytes` where they already are. The candidate's bytes always live in memory
@@ -1889,14 +1871,13 @@ impl UnifyJoin<'_> {
     fn env_over(&mut self, namespace: u8, intro: u8, bytes: &[u8], ground: bool) -> ExprEnv {
         // Groundness arrives from whoever walked the bytes (the enumerating cursor's exact tag
         // counts, or a wildcard branch that knows it descended a variable) -- never from a rescan.
-        let ground_skip = if ground && bytes.len() <= u16::MAX as usize { bytes.len() as u16 } else { 0 };
-        ExprEnv {
-            n: namespace,
-            v: intro,
-            offset: 0,
-            ground_skip,
-            base: Expr::from_slice(bytes),
+        let mut env = ExprEnv::with_intro(namespace, intro, Expr::from_slice(bytes));
+        if ground && bytes.len() <= u16::MAX as usize {
+            // SAFETY: `bytes` IS the subterm (the enumeration copied exactly one complete value),
+            // and `ground` came from the walk that produced it, not from a guess.
+            unsafe { env.stamp_ground(bytes.len() as u16) };
         }
+        env
     }
 
     fn data_env_for(&mut self, f: usize, bytes: &[u8], vars: (u8, u8)) -> ExprEnv {
@@ -3262,13 +3243,8 @@ mod tests {
         if fi == query_exprs.len() {
             let mut row = Vec::with_capacity(nvars);
             for v in 0..nvars {
-                let mut env = ExprEnv {
-                    n: QUERY_NS,
-                    v: v as u8,
-                    offset: 0,
-                    ground_skip: 0,
-                    base: Expr::from_slice(&NEW_VAR_EXPR_BYTES),
-                };
+                let mut env =
+                    ExprEnv::with_intro(QUERY_NS, v as u8, Expr::from_slice(&NEW_VAR_EXPR_BYTES));
                 loop {
                     let Some(var) = env.var_opt() else { break };
                     match bindings.get(&var) {
@@ -3516,13 +3492,8 @@ mod tests {
         v: usize,
         cycled: &mut BTreeMap<ExprVar, u8>,
     ) -> Option<Vec<u8>> {
-        let mut env = ExprEnv {
-            n: QUERY_NS,
-            v: v as u8,
-            offset: 0,
-            ground_skip: 0,
-            base: Expr::from_slice(&NEW_VAR_EXPR_BYTES),
-        };
+        let mut env =
+            ExprEnv::with_intro(QUERY_NS, v as u8, Expr::from_slice(&NEW_VAR_EXPR_BYTES));
         loop {
             match env.var_opt() {
                 Some(var) => match bindings.get(&var) {

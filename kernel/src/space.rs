@@ -198,11 +198,11 @@ fn coreferential_transition<Z : ZipperProduct, F: FnMut(&mut Z, u64) -> ()>(
                         trace!(target: "coref trans", "varref {i} {:?}", &loc.path()[references[i as usize] as usize..]);
                         // trace!(target: "coref trans", "varref against {:?}", loc.child_mask());
                         // trace!(target: "coref trans", "varref path {:?}", serialize(loc.origin_path()));
-                        ExprEnv{ n: 254, v: 0, offset: 0, ground_skip: 0, base: Expr{ ptr: loc.path().as_ptr().cast_mut().offset(references[i as usize] as _) } }
+                        ExprEnv::new(254, Expr{ ptr: loc.path().as_ptr().cast_mut().offset(references[i as usize] as _) })
                     } else {
                         trace!(target: "coref trans", "varref <{},{i}> 'any'", e.n);
                         static nv: u8 = item_byte(Tag::NewVar);
-                        ExprEnv{ n: 255, v: 0, offset: 0, ground_skip: 0, base: Expr{ ptr: ((&nv) as *const u8).cast_mut() } }
+                        ExprEnv::new(255, Expr{ ptr: ((&nv) as *const u8).cast_mut() })
                     };
                     stack.push(addition);
                     vs!(e, false);
@@ -1355,14 +1355,16 @@ impl Space {
                         };
 
                         let mut root = ExprEnv::new(1, e);
-                        root.ground_skip = span_stamp(0, 0, fact_end(0));
+                        // SAFETY: `span_stamp` returns the walked extent, or 0.
+                        unsafe { root.stamp_ground(span_stamp(0, 0, fact_end(0))) };
                         pairs.clear();
                         pairs.push((sources[0], root));
 
                         for (&pa, &other_i) in sources[1..].iter().zip(loc.path_indices()) {
                             let mut fe = ExprEnv::new((pairs.len() + 1) as u8,
                                                   Expr { ptr: unsafe { opath.as_ptr().cast_mut().add(other_i) } });
-                            fe.ground_skip = span_stamp(pairs.len(), other_i, fact_end(pairs.len()));
+                            // SAFETY: as above -- the extent comes from the scan of these bytes.
+                            unsafe { fe.stamp_ground(span_stamp(pairs.len(), other_i, fact_end(pairs.len()))) };
                             pairs.push((pa, fe))
                         }
 
