@@ -35,32 +35,10 @@ pub static mut writes: usize = 0;
 pub static ACT_PATH: &'static str = "/dev/shm/";
 // pub static ACT_PATH: &'static str = "/mnt/data/";
 
-/// The intro counts the template pass needs, and whether the bindings can hold a cycle at all.
-///
-/// Applying the pattern's variables through `apply_e` produces all three, and that walk was 8.8% of
-/// self time on `bfc`. Two of the three are arithmetic when every value in the map is GROUND: `oi`
-/// is the pattern's own variable count, and `ni` counts the pattern variables the answer left
-/// unbound, because walking a ground binding emits no fresh variable. The third, the cycle check,
-/// is then vacuous for the same reason a ground value emits nothing: a cycle is a variable
-/// reachable from itself through the bindings, and a stamped value contains no variable, so a map
-/// whose every value is stamped has no edges to form one.
-///
-/// When some value is NOT stamped, none of that holds -- a binding whose value is itself an unbound
-/// variable emits a fresh intro, so `ni` needs the walk -- and the caller must run it.
-fn ground_only_intros(
-    bindings: &BTreeMap<(u8, u8), ExprEnv>,
-    pat_var_count: usize,
-) -> Option<(u8, u8)> {
-    if bindings.values().any(|e| e.ground_stamp() == 0) {
-        return None;
-    }
-    let unbound = (0..pat_var_count)
-        .filter(|&i| !bindings.contains_key(&(0, i as u8)))
-        .count();
-    Some((pat_var_count as u8, unbound as u8))
-}
-
-/// The pattern's distinct variables as a synthetic expression of `n` `NewVar`s.
+/// The pattern's distinct variables as a synthetic expression of `n` `NewVar`s. Only the debug
+/// cross-check of [`mork_expr::pattern_cycles_and_intros`] applies it now; the live path needs no
+/// expression at all, so it has no arity byte to overflow.
+#[cfg(debug_assertions)]
 ///
 /// Applying this in place of the pattern visits exactly the variables `(0,0)..(0,n-1)` -- which is
 /// what the pattern's own variables are, by construction -- with the same arms, stack and `cycled`
@@ -1011,10 +989,10 @@ impl Space {
         // only to be cleared, so apply the synthetic all-variables expression instead (see the
         // comment there for why this is exact).
         let pat_var_count = pattern.newvars();
+        #[cfg(debug_assertions)]
         let mut pat_vars_buf = [0u8; 64];
-        // More variables than an arity byte can count: apply the pattern itself.
-        let pat_vars_expr = pattern_variables_expr(pattern, &mut pat_vars_buf)
-            .unwrap_or(pattern);
+        #[cfg(debug_assertions)]
+        let pat_vars_expr = pattern_variables_expr(pattern, &mut pat_vars_buf).unwrap_or(pattern);
         Self::query_multi(&self.btm, Expr{ ptr: pat.leak().as_mut_ptr() }, |refs_bindings, loc| 'query : {
             let mut oz = ExprZipper::new(Expr { ptr: buffer.as_mut_ptr() });
 
@@ -1023,9 +1001,18 @@ impl Space {
                     assert!(false)
                 }
                 Err(bindings) => {
-                    let (oi, ni, true) =
-                        mork_expr::apply_e_cycles_only!(0,0,0, pat_vars_expr, bindings, stack, assignments)
-                    else { break 'query true};
+                    let counts = mork_expr::pattern_cycles_and_intros(
+                        pat_var_count as u8, bindings, &mut stack, &mut assignments);
+                    #[cfg(debug_assertions)]
+                    {
+                        let mut dstack = Vec::new();
+                        let mut dass = Vec::new();
+                        let w = mork_expr::apply_e_cycles_only!(0,0,0, pat_vars_expr, bindings, dstack, dass);
+                        debug_assert_eq!(counts.map(|(o, n)| (o, n, true)),
+                            Some((w.0, w.1, w.2)).filter(|w| w.2),
+                            "the specialized pattern pass disagreed with the general one");
+                    }
+                    let Some((oi, ni)) = counts else { break 'query true };
 
                     buffer.clear();
 
@@ -1526,10 +1513,10 @@ impl Space {
         // an answer is only accepted when no cycle was cut, so its value cannot reach an accepted
         // output.)
         let pat_var_count = pat_expr.newvars();
+        #[cfg(debug_assertions)]
         let mut pat_vars_buf = [0u8; 64];
-        // More variables than an arity byte can count: apply the pattern itself.
-        let pat_vars_expr = pattern_variables_expr(pat_expr, &mut pat_vars_buf)
-            .unwrap_or(pat_expr);
+        #[cfg(debug_assertions)]
+        let pat_vars_expr = pattern_variables_expr(pat_expr, &mut pat_vars_buf).unwrap_or(pat_expr);
 
 
         let mut any_new = false;
@@ -1544,25 +1531,18 @@ impl Space {
                     #[cfg(debug_assertions)]
                     bindings.iter().for_each(|(v, ee)| trace!(target: "transform", "binding {:?} {}", *v, ee.show()));
 
-                    // All-ground bindings: the counts are arithmetic and no cycle can exist, so
-                    // the pattern walk is skipped. Debug builds still run it and check the claim.
-                    let (mut oi, ni) = match ground_only_intros(bindings, pat_var_count) {
-                        Some(counts) => {
-                            #[cfg(debug_assertions)]
-                            {
-                                let walked = mork_expr::apply_e_cycles_only!(0,0,0,pat_vars_expr,bindings,trace,assignments);
-                                debug_assert_eq!((walked.0, walked.1, walked.2), (counts.0, counts.1, true),
-                                    "the all-ground shortcut disagreed with the pattern walk");
-                            }
-                            counts
-                        }
-                        None => {
-                            let (oi, ni, true) =
-                                mork_expr::apply_e_cycles_only!(0,0,0,pat_vars_expr,bindings,trace,assignments)
-                            else {break 'query true;};
-                            (oi, ni)
-                        }
-                    };
+                    let counts = mork_expr::pattern_cycles_and_intros(
+                        pat_var_count as u8, bindings, &mut trace, &mut assignments);
+                    #[cfg(debug_assertions)]
+                    {
+                        let mut dtrace = Vec::new();
+                        let mut dass = Vec::new();
+                        let w = mork_expr::apply_e_cycles_only!(0,0,0,pat_vars_expr,bindings,dtrace,dass);
+                        debug_assert_eq!(counts.map(|(o, n)| (o, n, true)),
+                            Some((w.0, w.1, w.2)).filter(|w| w.2),
+                            "the specialized pattern pass disagreed with the general one");
+                    }
+                    let Some((mut oi, ni)) = counts else { break 'query true; };
 
                     'writes : for (i, template) in templates.iter().enumerate() {
                         let wz = &mut template_wzs[subsumption[i]];
@@ -1635,10 +1615,10 @@ impl Space {
         // an answer is only accepted when no cycle was cut, so its value cannot reach an accepted
         // output.)
         let pat_var_count = pat_expr.newvars();
+        #[cfg(debug_assertions)]
         let mut pat_vars_buf = [0u8; 64];
-        // More variables than an arity byte can count: apply the pattern itself.
-        let pat_vars_expr = pattern_variables_expr(pat_expr, &mut pat_vars_buf)
-            .unwrap_or(pat_expr);
+        #[cfg(debug_assertions)]
+        let pat_vars_expr = pattern_variables_expr(pat_expr, &mut pat_vars_buf).unwrap_or(pat_expr);
 
 
         let mut any_new = false;
@@ -1653,25 +1633,18 @@ impl Space {
                     #[cfg(debug_assertions)]
                     bindings.iter().for_each(|(v, ee)| trace!(target: "transform", "binding {:?} {}", *v, ee.show()));
 
-                    // All-ground bindings: the counts are arithmetic and no cycle can exist, so
-                    // the pattern walk is skipped. Debug builds still run it and check the claim.
-                    let (mut oi, ni) = match ground_only_intros(bindings, pat_var_count) {
-                        Some(counts) => {
-                            #[cfg(debug_assertions)]
-                            {
-                                let walked = mork_expr::apply_e_cycles_only!(0,0,0,pat_vars_expr,bindings,trace,assignments);
-                                debug_assert_eq!((walked.0, walked.1, walked.2), (counts.0, counts.1, true),
-                                    "the all-ground shortcut disagreed with the pattern walk");
-                            }
-                            counts
-                        }
-                        None => {
-                            let (oi, ni, true) =
-                                mork_expr::apply_e_cycles_only!(0,0,0,pat_vars_expr,bindings,trace,assignments)
-                            else {break 'query true;};
-                            (oi, ni)
-                        }
-                    };
+                    let counts = mork_expr::pattern_cycles_and_intros(
+                        pat_var_count as u8, bindings, &mut trace, &mut assignments);
+                    #[cfg(debug_assertions)]
+                    {
+                        let mut dtrace = Vec::new();
+                        let mut dass = Vec::new();
+                        let w = mork_expr::apply_e_cycles_only!(0,0,0,pat_vars_expr,bindings,dtrace,dass);
+                        debug_assert_eq!(counts.map(|(o, n)| (o, n, true)),
+                            Some((w.0, w.1, w.2)).filter(|w| w.2),
+                            "the specialized pattern pass disagreed with the general one");
+                    }
+                    let Some((mut oi, ni)) = counts else { break 'query true; };
 
                     'writes : for (i, template) in templates.iter().enumerate() {
                         let wz = &mut template_wzs[subsumption[i]];
@@ -1752,10 +1725,10 @@ impl Space {
         // an answer is only accepted when no cycle was cut, so its value cannot reach an accepted
         // output.)
         let pat_var_count = pat_expr.newvars();
+        #[cfg(debug_assertions)]
         let mut pat_vars_buf = [0u8; 64];
-        // More variables than an arity byte can count: apply the pattern itself.
-        let pat_vars_expr = pattern_variables_expr(pat_expr, &mut pat_vars_buf)
-            .unwrap_or(pat_expr);
+        #[cfg(debug_assertions)]
+        let pat_vars_expr = pattern_variables_expr(pat_expr, &mut pat_vars_buf).unwrap_or(pat_expr);
 
 
         let mut any_new = false;
@@ -1770,25 +1743,18 @@ impl Space {
                     #[cfg(debug_assertions)]
                     bindings.iter().for_each(|(v, ee)| trace!(target: "transform", "binding {:?} {}", *v, ee.show()));
 
-                    // All-ground bindings: the counts are arithmetic and no cycle can exist, so
-                    // the pattern walk is skipped. Debug builds still run it and check the claim.
-                    let (mut oi, ni) = match ground_only_intros(bindings, pat_var_count) {
-                        Some(counts) => {
-                            #[cfg(debug_assertions)]
-                            {
-                                let walked = mork_expr::apply_e_cycles_only!(0,0,0,pat_vars_expr,bindings,trace,assignments);
-                                debug_assert_eq!((walked.0, walked.1, walked.2), (counts.0, counts.1, true),
-                                    "the all-ground shortcut disagreed with the pattern walk");
-                            }
-                            counts
-                        }
-                        None => {
-                            let (oi, ni, true) =
-                                mork_expr::apply_e_cycles_only!(0,0,0,pat_vars_expr,bindings,trace,assignments)
-                            else {break 'query true;};
-                            (oi, ni)
-                        }
-                    };
+                    let counts = mork_expr::pattern_cycles_and_intros(
+                        pat_var_count as u8, bindings, &mut trace, &mut assignments);
+                    #[cfg(debug_assertions)]
+                    {
+                        let mut dtrace = Vec::new();
+                        let mut dass = Vec::new();
+                        let w = mork_expr::apply_e_cycles_only!(0,0,0,pat_vars_expr,bindings,dtrace,dass);
+                        debug_assert_eq!(counts.map(|(o, n)| (o, n, true)),
+                            Some((w.0, w.1, w.2)).filter(|w| w.2),
+                            "the specialized pattern pass disagreed with the general one");
+                    }
+                    let Some((mut oi, ni)) = counts else { break 'query true; };
 
                     'writes : for (i, template) in templates.iter().enumerate() {
                         let wz = unsafe { std::ptr::read(&template_resources[subsumption[i]]) };
@@ -1872,10 +1838,10 @@ impl Space {
         // an answer is only accepted when no cycle was cut, so its value cannot reach an accepted
         // output.)
         let pat_var_count = pat_expr.newvars();
+        #[cfg(debug_assertions)]
         let mut pat_vars_buf = [0u8; 64];
-        // More variables than an arity byte can count: apply the pattern itself.
-        let pat_vars_expr = pattern_variables_expr(pat_expr, &mut pat_vars_buf)
-            .unwrap_or(pat_expr);
+        #[cfg(debug_assertions)]
+        let pat_vars_expr = pattern_variables_expr(pat_expr, &mut pat_vars_buf).unwrap_or(pat_expr);
 
 
         let mut any_new = false;
@@ -1890,25 +1856,18 @@ impl Space {
                     #[cfg(debug_assertions)]
                     bindings.iter().for_each(|(v, ee)| trace!(target: "transform", "binding {:?} {}", *v, ee.show()));
 
-                    // All-ground bindings: the counts are arithmetic and no cycle can exist, so
-                    // the pattern walk is skipped. Debug builds still run it and check the claim.
-                    let (mut oi, ni) = match ground_only_intros(bindings, pat_var_count) {
-                        Some(counts) => {
-                            #[cfg(debug_assertions)]
-                            {
-                                let walked = mork_expr::apply_e_cycles_only!(0,0,0,pat_vars_expr,bindings,trace,assignments);
-                                debug_assert_eq!((walked.0, walked.1, walked.2), (counts.0, counts.1, true),
-                                    "the all-ground shortcut disagreed with the pattern walk");
-                            }
-                            counts
-                        }
-                        None => {
-                            let (oi, ni, true) =
-                                mork_expr::apply_e_cycles_only!(0,0,0,pat_vars_expr,bindings,trace,assignments)
-                            else {break 'query true;};
-                            (oi, ni)
-                        }
-                    };
+                    let counts = mork_expr::pattern_cycles_and_intros(
+                        pat_var_count as u8, bindings, &mut trace, &mut assignments);
+                    #[cfg(debug_assertions)]
+                    {
+                        let mut dtrace = Vec::new();
+                        let mut dass = Vec::new();
+                        let w = mork_expr::apply_e_cycles_only!(0,0,0,pat_vars_expr,bindings,dtrace,dass);
+                        debug_assert_eq!(counts.map(|(o, n)| (o, n, true)),
+                            Some((w.0, w.1, w.2)).filter(|w| w.2),
+                            "the specialized pattern pass disagreed with the general one");
+                    }
+                    let Some((mut oi, ni)) = counts else { break 'query true; };
 
                     'writes : for (i, template) in templates.iter().enumerate() {
                         let wz = unsafe { std::ptr::read(&template_resources[subsumption[i]]) };

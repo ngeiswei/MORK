@@ -226,6 +226,70 @@ pub fn item_source<'a>(e: Expr) -> impl Coroutine<(), Yield=SourceItem<'a>, Retu
 /// stops at exactly the end of `e`, so a subterm pointer into a larger buffer stays in bounds --
 /// the same guarantee the stack gave, in a register instead of a `SmallVec`.
 #[inline(never)]
+/// [`apply_e`] specialized to the shape the pattern pass applies: the pattern's own distinct
+/// variables, in order, into a null sink -- returning `(oi, ni)`, or `None` when a cycle was cut.
+///
+/// Written out, that call was applying a synthetic expression of `oi` `NewVar`s, and every part of it
+/// is decidable from the bindings except one:
+///
+///   - an UNBOUND variable emits one fresh intro. Arithmetic: it is the first sight of a distinct
+///     key, so no dedup scan is needed, only the record that later references find.
+///   - a variable bound to a GROUND value contributes nothing whatsoever. A stamped value holds no
+///     variable ([`ExprEnv::ground_skip`]), so it introduces no intro, it cannot lie on the
+///     expansion stack, and it cannot close a cycle -- a cycle needs a variable to lead back
+///     through. Nothing to walk.
+///   - a variable bound to a NON-ground value is the residual work, and it is handed to `apply_e`
+///     itself, one variable at a time, so the arms, stack and cycle bookkeeping are the same code
+///     the general pass used rather than a reimplementation of it.
+///
+/// So what is left computationally is exactly: one map lookup and one stamp read per pattern
+/// variable, plus `apply_e` over the values that actually contain variables. There is no synthetic
+/// expression -- which also means no arity byte, so a pattern with more than 63 variables needs no
+/// special case.
+pub fn pattern_cycles_and_intros(
+    pat_var_count: u8,
+    bindings: &BTreeMap<ExprVar, ExprEnv>,
+    stack: &mut Vec<ExprVar>,
+    assignments: &mut Vec<ExprVar>,
+) -> Option<(u8, u8)> {
+    stack.clear();
+    assignments.clear();
+    let mut cycled: BTreeMap<ExprVar, u8> = BTreeMap::new();
+    let mut new_intros = 0u8;
+    for v in 0..pat_var_count {
+        match bindings.get(&(0, v)) {
+            None => {
+                // First sight of this key, so it emits a fresh intro; the record is what makes a
+                // later reference to it emit a back-reference instead of another intro.
+                assignments.push((0, v));
+                new_intros += 1;
+            }
+            Some(value) if value.ground_stamp() != 0 => {}
+            Some(_) => {
+                let one_newvar = Expr {
+                    ptr: crate::NEW_VAR_EXPR_BYTES.as_ptr().cast_mut(),
+                };
+                let (_, ni) = apply_e(
+                    0,
+                    v,
+                    new_intros,
+                    one_newvar,
+                    bindings,
+                    &mut NullSink,
+                    &mut cycled,
+                    stack,
+                    assignments,
+                );
+                new_intros = ni;
+                if !cycled.is_empty() {
+                    return None;
+                }
+            }
+        }
+    }
+    Some((pat_var_count, new_intros))
+}
+
 pub fn apply_e<S: ItemSink>(n: u8, mut original_intros: u8, mut new_intros: u8, e: Expr, bindings: &BTreeMap<ExprVar, ExprEnv>, sink: &mut S, cycled: &mut BTreeMap<ExprVar, u8>, stack: &mut Vec<ExprVar>, assignments: &mut Vec<ExprVar>) -> (u8, u8) {
     let depth = stack.len();
     if stack.len() > APPLY_DEPTH as usize { panic!("apply depth > {APPLY_DEPTH}: {n} {original_intros} {new_intros}"); }
