@@ -1,7 +1,7 @@
 # Differential tests
 
 The MORK kernel has two query engines. The ProductZipper (`Space::query_multi`) is
-the reference; the worst-case-optimal leapfrog join (`zipper_join::query_multi_leapfrog`)
+the reference; the worst-case-optimal leapfrog join (`leapfrog::query_multi_leapfrog`)
 is a compile-time alternative selected by the `leapfrog` cargo feature and only used
 for bodies it can handle, everything else falling back to the ProductZipper.
 

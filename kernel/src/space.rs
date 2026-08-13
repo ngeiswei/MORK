@@ -1062,7 +1062,7 @@ impl Space {
     }
 
     /// [`Space::query_multi`] behind the leapfrog dispatch: with the `leapfrog` feature a
-    /// conjunction body routes to the worst-case-optimal join in [`crate::zipper_join`], which
+    /// conjunction body routes to the worst-case-optimal join in [`crate::leapfrog`], which
     /// streams the same matches through `effect`; every build without the feature takes the
     /// ProductZipper path below. Only the space-to-space transform dispatches: interpreted sources
     /// and sinks and the pattern-directed dumps keep the stock path and its enumeration order.
@@ -1080,7 +1080,7 @@ impl Space {
         // the pattern-directed dumps and the interpreted source/sink transforms.
         #[cfg(feature = "leapfrog")]
         {
-            crate::zipper_join::query_multi_leapfrog(btm, pat_expr, effect)
+            crate::leapfrog::query_multi_leapfrog(btm, pat_expr, effect)
         }
         #[cfg(not(feature = "leapfrog"))]
         {
