@@ -29,6 +29,25 @@ const QUERY_NS: u8 = 0;
 /// covered. A symbol payload is at most 63 bytes, so the record's payload field has a spare bit.
 const BRANCH_CANDIDATE: u8 = 0x80;
 
+/// Every byte value, so that `single_byte` can hand out a `'static` one-byte slice.
+static BYTE_VALUES: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut i = 0;
+    while i < 256 {
+        t[i] = i as u8;
+        i += 1;
+    }
+    t
+};
+
+/// The one-byte term `b` as a slice with `'static` lifetime. A stored wildcard is a complete
+/// one-byte subterm, and the env built over it outlives the expression that produced it, so the
+/// bytes cannot be a caller's temporary.
+#[inline]
+fn single_byte(b: u8) -> &'static [u8] {
+    &BYTE_VALUES[b as usize..b as usize + 1]
+}
+
 /// The least byte present in `mask` that is `>= k`, or `None` if every set bit is below `k`. This
 /// is the per-byte leapfrog seek on a trie node's children.
 #[inline]
@@ -1136,7 +1155,6 @@ fn join_state<'a>(
         next_step: vec![0; nf],
         data_intro: vec![0; nf],
         bindings: BTreeMap::new(),
-        arena: Vec::new(),
         free_bufs: Vec::new(),
         free_child_bufs: Vec::new(),
         lead_max: Vec::new(),
@@ -1498,7 +1516,6 @@ struct UnifyJoin<'a> {
     next_step: Vec<usize>,
     data_intro: Vec<u8>,
     bindings: Bindings,
-    arena: Vec<Box<[u8]>>,
     /// Pool of [`CandidateBuf`]s for the lead enumeration, one in flight per active recursion
     /// depth; released buffers return here with their allocations intact.
     free_bufs: Vec<CandidateBuf>,
@@ -1962,12 +1979,20 @@ impl UnifyJoin<'_> {
         }
     }
 
-    fn arena_env(&mut self, namespace: u8, intro: u8, bytes: &[u8], ground: bool) -> ExprEnv {
+    /// An env viewing `bytes` where they already are. The candidate's bytes always live in memory
+    /// that outlives the env: a pooled [`CandidateBuf`] entry, held by the enumerating frame for
+    /// the whole subtree that can observe the binding, or a `'static` one-byte wildcard (see
+    /// [`single_byte`]). So this used to copy each candidate into an arena of boxed slices -- one
+    /// allocation per candidate, and a drop per entry when the arena unwound -- to buy a lifetime
+    /// it already had.
+    ///
+    /// The requirement is on the CALLER, and `ExprEnv` holds a raw `Expr`, so the compiler will not
+    /// state it: the bytes must outlive every use of the returned env, including the answer emit
+    /// that reads it out of `bindings`.
+    fn env_over(&mut self, namespace: u8, intro: u8, bytes: &[u8], ground: bool) -> ExprEnv {
         // Groundness arrives from whoever walked the bytes (the enumerating cursor's exact tag
         // counts, or a wildcard branch that knows it descended a variable) -- never from a rescan.
         let ground_skip = if ground && bytes.len() <= u16::MAX as usize { bytes.len() as u16 } else { 0 };
-        self.arena.push(bytes.to_vec().into_boxed_slice());
-        let bytes = self.arena.last().unwrap();
         ExprEnv {
             n: namespace,
             v: intro,
@@ -1979,7 +2004,7 @@ impl UnifyJoin<'_> {
 
     fn data_env_for(&mut self, f: usize, bytes: &[u8], vars: (u8, u8)) -> ExprEnv {
         // Factor f's data lives in namespace 1 + f; QUERY_NS = 0 is the query's own.
-        self.arena_env(1 + f as u8, self.data_intro[f], bytes, vars.1 == 0)
+        self.env_over(1 + f as u8, self.data_intro[f], bytes, vars.1 == 0)
     }
 
     fn unified_bindings(&self, lhs: ExprEnv, rhs: ExprEnv) -> Option<Bindings> {
@@ -2190,13 +2215,11 @@ impl UnifyJoin<'_> {
                 // The ground fast bind, with the same precondition and reasoning as the general
                 // free-variable branch in `match_expr_at_current`. Groundness is the cursor's
                 // exact count, not a rescan of the candidate.
-                let arena_mark = self.arena.len();
                 let data_env = self.data_env_for(f, cand, vars);
                 let previous = self.bindings.insert(free_key, data_env);
                 debug_assert!(previous.is_none(), "deref ended at a bound var");
                 self.with_bound_path_bytes(f, cand, 0, &mut cont);
                 self.bindings.remove(&free_key);
-                self.arena.truncate(arena_mark);
             } else {
                 self.match_candidate(f, pattern, cand, vars, &mut cont);
             }
@@ -2304,7 +2327,7 @@ impl UnifyJoin<'_> {
         if mask_has_wildcard(&mask) {
             for w in mask.iter() {
                 if is_wildcard_term(w) {
-                    self.match_candidate(f, env, &[w], Self::wildcard_counts(w), &mut |this| {
+                    self.match_candidate(f, env, single_byte(w), Self::wildcard_counts(w), &mut |this| {
                         this.next_step[f] = s + 1;
                         cont(this);
                         this.next_step[f] = s;
@@ -2342,7 +2365,7 @@ impl UnifyJoin<'_> {
         if mask_has_wildcard(&mask) {
             for w in mask.iter() {
                 if is_wildcard_term(w) {
-                    self.match_candidate(f, env, &[w], Self::wildcard_counts(w), &mut |this| {
+                    self.match_candidate(f, env, single_byte(w), Self::wildcard_counts(w), &mut |this| {
                         this.next_step[f] = end;
                         cont(this);
                         this.next_step[f] = s;
@@ -2389,7 +2412,6 @@ impl UnifyJoin<'_> {
             return;
         }
         let saved_bindings = self.bindings.clone();
-        let arena_mark = self.arena.len();
         let data_env = self.data_env_for(f, bytes, vars);
         if let Some(bindings) = self.unified_bindings(pattern, data_env) {
             self.bindings = bindings;
@@ -2398,7 +2420,6 @@ impl UnifyJoin<'_> {
             self.with_bound_path_bytes(f, bytes, vars.0, cont);
         }
         self.bindings = saved_bindings;
-        self.arena.truncate(arena_mark);
     }
 
     fn match_expr_at_current(
@@ -2433,13 +2454,11 @@ impl UnifyJoin<'_> {
                     // bytes are unchanged; like the ground-symbol direct bind below, we keep the
                     // uncompressed (deref-equivalent) map shape. Non-ground candidates (stored
                     // wildcards, schematic compounds) keep the general path.
-                    let arena_mark = self.arena.len();
                     let data_env = self.data_env_for(f, &buf.entries[ci], vars);
                     let previous = self.bindings.insert(free_key, data_env);
                     debug_assert!(previous.is_none(), "deref ended at a bound var");
                     self.with_bound_path_bytes(f, &buf.entries[ci], 0, cont);
                     self.bindings.remove(&free_key);
-                    self.arena.truncate(arena_mark);
                 } else {
                     self.match_candidate(f, pattern, &buf.entries[ci], vars, cont);
                 }
@@ -2466,7 +2485,7 @@ impl UnifyJoin<'_> {
                 }
                 for w in mask.iter() {
                     if is_wildcard_term(w) {
-                        self.match_candidate(f, pattern, &[w], Self::wildcard_counts(w), cont);
+                        self.match_candidate(f, pattern, single_byte(w), Self::wildcard_counts(w), cont);
                     }
                 }
             }
@@ -2486,7 +2505,7 @@ impl UnifyJoin<'_> {
         let mask = self.cursors[f].floor_child_mask();
         for w in mask.iter() {
             if is_wildcard_term(w) {
-                self.match_candidate(f, pattern, &[w], Self::wildcard_counts(w), cont);
+                self.match_candidate(f, pattern, single_byte(w), Self::wildcard_counts(w), cont);
             }
         }
         let Some(arity) = resolved.subsexpr().arity() else {
