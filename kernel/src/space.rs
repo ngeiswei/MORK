@@ -35,6 +35,23 @@ pub static mut writes: usize = 0;
 pub static ACT_PATH: &'static str = "/dev/shm/";
 // pub static ACT_PATH: &'static str = "/mnt/data/";
 
+/// The pattern's distinct variables as a synthetic expression of `n` `NewVar`s.
+///
+/// Applying this in place of the pattern visits exactly the variables `(0,0)..(0,n-1)` -- which is
+/// what the pattern's own variables are, by construction -- with the same arms, stack and `cycled`
+/// bookkeeping, and without walking the pattern's structure. Returns `None` when the pattern has
+/// more variables than an arity byte can count, in which case the caller must apply the pattern
+/// itself: `NewVar` is not arity-limited, so a pattern CAN carry more than 63 distinct variables.
+fn pattern_variables_expr(pat_expr: Expr, buf: &mut [u8; 64]) -> Option<Expr> {
+    let n = pat_expr.newvars();
+    if n > 63 {
+        return None;
+    }
+    buf[0] = item_byte(Tag::Arity(n as u8));
+    buf[1..1 + n].fill(item_byte(Tag::NewVar));
+    Some(Expr { ptr: buf.as_ptr().cast_mut() })
+}
+
 pub struct Space {
     pub btm: PathMap<()>,
     pub sm: SharedMappingHandle,
@@ -968,12 +985,10 @@ impl Space {
         // Same replacement as in the transform variants: the pattern's instantiation was built
         // only to be cleared, so apply the synthetic all-variables expression instead (see the
         // comment there for why this is exact).
-        let pat_var_count = pattern.newvars();
-        debug_assert!(pat_var_count <= 63, "the parser caps variables at 63");
         let mut pat_vars_buf = [0u8; 64];
-        pat_vars_buf[0] = item_byte(Tag::Arity(pat_var_count as u8));
-        for vi in 0..pat_var_count { pat_vars_buf[1 + vi] = item_byte(Tag::NewVar); }
-        let pat_vars_expr = Expr { ptr: pat_vars_buf.as_ptr().cast_mut() };
+        // More variables than an arity byte can count: apply the pattern itself.
+        let pat_vars_expr = pattern_variables_expr(pattern, &mut pat_vars_buf)
+            .unwrap_or(pattern);
         Self::query_multi(&self.btm, Expr{ ptr: pat.leak().as_mut_ptr() }, |refs_bindings, loc| 'query : {
             let mut oz = ExprZipper::new(Expr { ptr: buffer.as_mut_ptr() });
 
@@ -1482,12 +1497,10 @@ impl Space {
         // walk over the pattern's structure. (`ni` seeds only cycle back-reference numbering, and
         // an answer is only accepted when no cycle was cut, so its value cannot reach an accepted
         // output.)
-        let pat_var_count = pat_expr.newvars();
-        debug_assert!(pat_var_count <= 63, "the parser caps variables at 63");
         let mut pat_vars_buf = [0u8; 64];
-        pat_vars_buf[0] = item_byte(Tag::Arity(pat_var_count as u8));
-        for vi in 0..pat_var_count { pat_vars_buf[1 + vi] = item_byte(Tag::NewVar); }
-        let pat_vars_expr = Expr { ptr: pat_vars_buf.as_ptr().cast_mut() };
+        // More variables than an arity byte can count: apply the pattern itself.
+        let pat_vars_expr = pattern_variables_expr(pat_expr, &mut pat_vars_buf)
+            .unwrap_or(pat_expr);
 
 
         let mut any_new = false;
@@ -1576,12 +1589,10 @@ impl Space {
         // walk over the pattern's structure. (`ni` seeds only cycle back-reference numbering, and
         // an answer is only accepted when no cycle was cut, so its value cannot reach an accepted
         // output.)
-        let pat_var_count = pat_expr.newvars();
-        debug_assert!(pat_var_count <= 63, "the parser caps variables at 63");
         let mut pat_vars_buf = [0u8; 64];
-        pat_vars_buf[0] = item_byte(Tag::Arity(pat_var_count as u8));
-        for vi in 0..pat_var_count { pat_vars_buf[1 + vi] = item_byte(Tag::NewVar); }
-        let pat_vars_expr = Expr { ptr: pat_vars_buf.as_ptr().cast_mut() };
+        // More variables than an arity byte can count: apply the pattern itself.
+        let pat_vars_expr = pattern_variables_expr(pat_expr, &mut pat_vars_buf)
+            .unwrap_or(pat_expr);
 
 
         let mut any_new = false;
@@ -1678,12 +1689,10 @@ impl Space {
         // walk over the pattern's structure. (`ni` seeds only cycle back-reference numbering, and
         // an answer is only accepted when no cycle was cut, so its value cannot reach an accepted
         // output.)
-        let pat_var_count = pat_expr.newvars();
-        debug_assert!(pat_var_count <= 63, "the parser caps variables at 63");
         let mut pat_vars_buf = [0u8; 64];
-        pat_vars_buf[0] = item_byte(Tag::Arity(pat_var_count as u8));
-        for vi in 0..pat_var_count { pat_vars_buf[1 + vi] = item_byte(Tag::NewVar); }
-        let pat_vars_expr = Expr { ptr: pat_vars_buf.as_ptr().cast_mut() };
+        // More variables than an arity byte can count: apply the pattern itself.
+        let pat_vars_expr = pattern_variables_expr(pat_expr, &mut pat_vars_buf)
+            .unwrap_or(pat_expr);
 
 
         let mut any_new = false;
@@ -1783,12 +1792,10 @@ impl Space {
         // walk over the pattern's structure. (`ni` seeds only cycle back-reference numbering, and
         // an answer is only accepted when no cycle was cut, so its value cannot reach an accepted
         // output.)
-        let pat_var_count = pat_expr.newvars();
-        debug_assert!(pat_var_count <= 63, "the parser caps variables at 63");
         let mut pat_vars_buf = [0u8; 64];
-        pat_vars_buf[0] = item_byte(Tag::Arity(pat_var_count as u8));
-        for vi in 0..pat_var_count { pat_vars_buf[1 + vi] = item_byte(Tag::NewVar); }
-        let pat_vars_expr = Expr { ptr: pat_vars_buf.as_ptr().cast_mut() };
+        // More variables than an arity byte can count: apply the pattern itself.
+        let pat_vars_expr = pattern_variables_expr(pat_expr, &mut pat_vars_buf)
+            .unwrap_or(pat_expr);
 
 
         let mut any_new = false;

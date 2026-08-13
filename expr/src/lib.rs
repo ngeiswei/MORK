@@ -2560,6 +2560,253 @@ fn anti_unify_apply(
     Ok(())
 }
 
+/// Tests for the ground stamp ([`ExprEnv::ground_skip`]) and the shortcuts it licenses: settling a
+/// pair by byte comparison, skipping the occurs walk, copying a binding without walking it, and the
+/// `u16` bound on what may be stamped.
+///
+/// The differential corpus and the Prolog-oracle cross-check in
+/// `experiments/unification_test_laws` do NOT cover most of this. Mutating the both-stamped byte
+/// comparison to accept unconditionally, or disabling the occurs check outright, leaves 2*10^7
+/// oracle-checked axiom pairs still in agreement; only a false stamp is caught there. These cases
+/// have to be written by hand.
+#[cfg(test)]
+mod ground_stamp {
+    use super::*;
+
+    fn unify_exprs(l: &[u8], r: &[u8]) -> Result<BTreeMap<ExprVar, ExprEnv>, UnificationFailure> {
+        let le = Expr { ptr: l.as_ptr().cast_mut() };
+        let re = Expr { ptr: r.as_ptr().cast_mut() };
+        let mut stack = vec![(ExprEnv::new(0, le), ExprEnv::new(1, re))];
+        unify(&mut stack)
+    }
+
+    fn applied(l: &[u8], r: &[u8]) -> Option<Vec<u8>> {
+        let le = Expr { ptr: l.as_ptr().cast_mut() };
+        let re = Expr { ptr: r.as_ptr().cast_mut() };
+        let out = vec![0u8; 1 << 20];
+        let to = Expr { ptr: out.leak().as_mut_ptr() };
+        let mut ez = ExprZipper::new(to);
+        #[allow(deprecated)]
+        le._unify(re, &mut ez).ok()?;
+        Some(unsafe { to.span().as_ref().unwrap() }.to_vec())
+    }
+
+    /// A ground BALANCED tree of exactly `total` bytes: `L - 1` binary nodes over `L` one-byte
+    /// symbols, with one leaf widened to land on the exact size. Balanced on purpose -- a
+    /// right-nested chain of the same size is ~21k levels deep and overflows the walk's stack,
+    /// which is a fact about nesting depth and not about the stamp boundary under test here.
+    fn ground_tree(total: usize) -> Vec<u8> {
+        // size = 3L - 2 + m, for L leaves and a final leaf of m payload bytes.
+        let mut l = 2usize;
+        let mut m;
+        loop {
+            let base = 3 * l - 2;
+            if base < total && total - base <= 63 {
+                m = total - base;
+                break;
+            }
+            l += 1;
+            assert!(l < total, "no leaf count reaches {total}");
+        }
+        fn emit(leaves: usize, out: &mut Vec<u8>, last: &mut Option<usize>) {
+            if leaves == 1 {
+                let m = last.take().unwrap_or(1);
+                out.push(item_byte(Tag::SymbolSize(m as u8)));
+                out.extend(std::iter::repeat(b'z').take(m));
+                return;
+            }
+            out.push(item_byte(Tag::Arity(2)));
+            let right = leaves / 2;
+            emit(leaves - right, out, last);
+            emit(right, out, last);
+        }
+        let mut v = Vec::with_capacity(total);
+        let mut last = Some(m);
+        emit(l, &mut v, &mut last);
+        assert_eq!(v.len(), total, "wanted {total} bytes with {l} leaves");
+        v
+    }
+
+    /// Both sides of a coreference pop ground and stamped: equal bytes unify, different bytes are a
+    /// genuine difference. Kills a both-stamped path that accepts without comparing.
+    #[test]
+    fn both_stamped_equality_and_difference() {
+        let pattern = parse!(r"[3] f $ _1"); // (f $x $x)
+        let same = parse!(r"[3] f [2] g a [2] g a");
+        let diff = parse!(r"[3] f [2] g a [2] g b");
+        assert!(unify_exprs(&pattern, &same).is_ok(), "identical ground values must unify");
+        assert!(
+            matches!(unify_exprs(&pattern, &diff), Err(UnificationFailure::Difference(_, _))),
+            "different ground values must be a Difference, not an acceptance"
+        );
+        // Same length, differing only in the last byte: the length test cannot stand in for the
+        // byte comparison.
+        let diff_tail = parse!(r"[3] f [2] g aa [2] g ab");
+        assert!(matches!(
+            unify_exprs(&pattern, &diff_tail),
+            Err(UnificationFailure::Difference(_, _))
+        ));
+    }
+
+    /// One side stamped, the other holding a variable at the first differing byte: the pair must
+    /// fall through to the structural walk and bind it, not be settled by the byte comparison.
+    #[test]
+    fn one_stamped_mismatch_binds_the_variable() {
+        let pattern = parse!(r"[3] f $ _1"); // (f $x $x)
+        let data = parse!(r"[3] f [2] g a [2] g $"); // (f (g a) (g $y))
+        let bindings = unify_exprs(&pattern, &data).expect("must unify by binding $y = a");
+        assert!(
+            bindings.keys().any(|&(n, _)| n == 1),
+            "the unstamped side's variable must be bound, got {:?}",
+            bindings.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            applied(&pattern, &data).as_deref(),
+            Some(&parse!(r"[3] f [2] g a [2] g a")[..]),
+            "the instantiated result must carry the bound value"
+        );
+    }
+
+    /// The occurs walk may be skipped only because a stamped subterm holds no variable. A cyclic
+    /// binding must still be rejected; a ground one must still be accepted.
+    #[test]
+    fn occurs_rejects_cycles_and_ground_bypasses_it() {
+        // ($x $x) against ($y (f $y)): $x binds to $y, then $y to a term containing itself.
+        let cyclic_l = parse!(r"[2] $ _1");
+        let cyclic_r = parse!(r"[2] $ [2] f _1");
+        let le = Expr { ptr: cyclic_l.as_ptr().cast_mut() };
+        let re = Expr { ptr: cyclic_r.as_ptr().cast_mut() };
+        let out = vec![0u8; 4096];
+        let to = Expr { ptr: out.leak().as_mut_ptr() };
+        #[allow(deprecated)]
+        let res = le._unify(re, &mut ExprZipper::new(to));
+        assert!(
+            matches!(res, Err(UnificationFailure::Occurs(_, _))),
+            "a variable bound into a term containing itself must be rejected, got {res:?}"
+        );
+
+        // The same shape with a ground right-hand side is not a cycle and must be accepted.
+        assert!(
+            unify_exprs(&parse!(r"[2] $ _1"), &parse!(r"[2] $ [2] f a")).is_ok(),
+            "a ground binding must not be rejected by the occurs check"
+        );
+    }
+
+    /// The occurs walk inside `unify` itself. `Expr::unify` layers a post-apply cycle check on top,
+    /// which is what the existing `Occurs` assertions actually exercise -- disabling BOTH occurs
+    /// branches in `unify` leaves every other test in this crate and the kernel passing. The stamp
+    /// shortcut lives on this path, so it needs a test that reaches it directly.
+    #[test]
+    fn unify_itself_rejects_self_reference() {
+        // (F $x (f $x)): pair the env at $x with the env at (f $x), both in namespace 0, so the
+        // VarRef inside the right side denotes the very variable being bound.
+        let mut ev = parse!(r"[3] F $ [2] f _1");
+        let e = Expr { ptr: ev.as_mut_ptr() };
+        let var = ExprEnv { n: 0, v: 0, offset: 3, ground_skip: 0, base: e };
+        let containing = ExprEnv { n: 0, v: 1, offset: 4, ground_skip: 0, base: e };
+        assert_eq!(var.var_opt(), Some((0, 0)), "left side must be the variable itself");
+        let mut stack = vec![(var, containing)];
+        let res = unify(&mut stack);
+        assert!(
+            matches!(res, Err(UnificationFailure::Occurs((0, 0), _))),
+            "binding $x to (f $x) must fail the occurs check in unify, got {res:?}"
+        );
+
+        // The mirrored orientation goes through the other arm, which needs its own case: the
+        // variable on the right, the containing term on the left.
+        let mut stack = vec![(containing, var)];
+        let res = unify(&mut stack);
+        assert!(
+            matches!(res, Err(UnificationFailure::Occurs((0, 0), _))),
+            "the same cycle must be rejected with the sides swapped, got {res:?}"
+        );
+
+        // The same shape with a GROUND right-hand side is what the stamp lets us skip the walk for,
+        // and it must still be accepted.
+        let mut gv = parse!(r"[3] F $ [2] f a");
+        let ge = Expr { ptr: gv.as_mut_ptr() };
+        let gvar = ExprEnv { n: 0, v: 0, offset: 3, ground_skip: 0, base: ge };
+        let ground = ExprEnv { n: 0, v: 1, offset: 4, ground_skip: 3, base: ge };
+        let mut stack = vec![(gvar, ground)];
+        assert!(
+            unify(&mut stack).is_ok(),
+            "a stamped ground term carries no variable, so the skip must not change the outcome"
+        );
+    }
+
+    /// A stamped binding is copied whole instead of walked, including when the value is a bare
+    /// `NewVar` or a `VarRef`. That must be byte-for-byte what the walk produces, so clearing every
+    /// stamp cannot change the emitted bytes.
+    #[test]
+    fn stamped_and_unstamped_application_agree() {
+        let cases: [(&[u8], &[u8]); 4] = [
+            (&parse!(r"[3] f $ _1"), &parse!(r"[3] f [2] g a [2] g a")),
+            (&parse!(r"[3] f $ $"), &parse!(r"[3] f [2] g [2] h a b")),
+            (&parse!(r"[3] f $ _1"), &parse!(r"[3] f $ _1")),
+            (&parse!(r"[2] f $"), &parse!(r"[2] f $")),
+        ];
+        for (pattern, data) in cases {
+            let le = Expr { ptr: pattern.as_ptr().cast_mut() };
+            let re = Expr { ptr: data.as_ptr().cast_mut() };
+            let mut stack = vec![(ExprEnv::new(0, le), ExprEnv::new(1, re))];
+            let stamped = unify(&mut stack).expect("unifies");
+
+            let mut cleared = stamped.clone();
+            for env in cleared.values_mut() {
+                env.ground_skip = 0;
+            }
+
+            let emit = |bindings: &BTreeMap<ExprVar, ExprEnv>| -> Vec<u8> {
+                let mut buf = Vec::new();
+                let mut cycled = BTreeMap::new();
+                let mut st: Vec<ExprVar> = vec![];
+                let mut asg: Vec<ExprVar> = vec![];
+                let mut sink = crate::VecSink(&mut buf);
+                crate::apply_e(0, 0, 0, le, bindings, &mut sink, &mut cycled, &mut st, &mut asg);
+                buf
+            };
+            assert_eq!(
+                emit(&stamped),
+                emit(&cleared),
+                "the bulk copy must emit exactly what the item walk emits"
+            );
+        }
+    }
+
+    /// The stamp is a `u16`, so a ground span of `u16::MAX` bytes may carry one and `u16::MAX + 1`
+    /// must not. Both have to unify correctly either way, and a one-byte difference at that size
+    /// must still be seen.
+    #[test]
+    fn spans_at_the_u16_boundary() {
+        let pattern = parse!(r"[3] g $ _1"); // (g $x $x), so the second pop is stamp-eligible
+        for total in [u16::MAX as usize, u16::MAX as usize + 1] {
+            let big = ground_tree(total);
+            let mut data = vec![item_byte(Tag::Arity(3)), item_byte(Tag::SymbolSize(1)), b'g'];
+            data.extend_from_slice(&big);
+            data.extend_from_slice(&big);
+            let bindings = unify_exprs(&pattern, &data)
+                .unwrap_or_else(|e| panic!("{total}-byte ground term must unify: {e:?}"));
+            let stamps: Vec<u16> = bindings.values().map(|e| e.ground_skip).collect();
+            if total > u16::MAX as usize {
+                assert!(
+                    stamps.iter().all(|&s| s == 0),
+                    "a span longer than u16::MAX must stay unstamped, got {stamps:?}"
+                );
+            }
+
+            let mut other = big.clone();
+            *other.last_mut().unwrap() = b'y';
+            let mut data2 = vec![item_byte(Tag::Arity(3)), item_byte(Tag::SymbolSize(1)), b'g'];
+            data2.extend_from_slice(&big);
+            data2.extend_from_slice(&other);
+            assert!(
+                matches!(unify_exprs(&pattern, &data2), Err(UnificationFailure::Difference(_, _))),
+                "a one-byte difference at {total} bytes must still be a Difference"
+            );
+        }
+    }
+}
+
 mod tests {
     use crate::gxhash::GxHasher;
     use super::*;
