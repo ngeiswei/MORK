@@ -23,7 +23,7 @@ use smallvec::SmallVec;
 
 pub mod macros;
 
-#[cfg(gxhash)]
+#[cfg(feature = "gxhash")]
 use gxhash;
 
 #[cfg(feature="nightly")]
@@ -32,7 +32,7 @@ mod lib_nightly;
 #[cfg(feature="nightly")]
 pub use lib_nightly::*;
 
-#[cfg(not(gxhash))]
+#[cfg(not(feature = "gxhash"))]
 mod gxhash {
     // fallback
     // pub use xxhash_rust::xxh64::{Xxh64 as GxHasher};
@@ -2124,7 +2124,7 @@ pub fn unify(mut stack: &mut Vec<(ExprEnv, ExprEnv)>) -> Result<BTreeMap<ExprVar
     }
     let mut iter_stat = IterationHighWater(0);
     let iterations = &mut iter_stat.0;
-    let mut encountered: gxhash::HashSet<(ExprEnv, ExprEnv)> = gxhash::HashSet::new();
+    let mut encountered: gxhash::HashSet<(ExprEnv, ExprEnv)> = Default::default();
 
     macro_rules! step {
         (occurs $x:expr, $e:expr) => {{
