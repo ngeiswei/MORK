@@ -14,7 +14,7 @@ use std::task::Poll;
 use std::time::Instant;
 use futures::StreamExt;
 use pathmap::ring::{AlgebraicStatus, Lattice};
-use mork_expr::{byte_item, Expr, ExprZipper, ExtractFailure, item_byte, parse, serialize, Tag, traverseh, ExprEnv, unify, UnificationFailure, apply, destruct, OwnedSourceItem};
+use mork_expr::{byte_item, Expr, ExprZipper, ExtractFailure, item_byte, parse, serialize, Tag, traverseh, ExprEnv, unify, UnificationFailure, apply, destruct, OwnedSourceItem, Bindings};
 use mork_frontend::bytestring_parser::{Parser, ParserError, Context};
 use mork_interning::{WritePermit, SharedMapping, SharedMappingHandle};
 use pathmap::utils::{BitMask, ByteMask};
@@ -1098,7 +1098,7 @@ impl Space {
     /// which `query_multi` handles (or fails on) exactly as it always has, plus the encoding
     /// pathologies `parse_body_factors` rejects (a `VarRef` naming a variable the body never
     /// introduced, or more than `u8::MAX` variables).
-    pub fn query_multi_dispatch<F : FnMut(Result<&[u32], &BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(btm: &PathMap<()>, pat_expr: Expr, mut effect: F) -> usize {
+    pub fn query_multi_dispatch<F : FnMut(Result<&[u32], &Bindings>, Expr) -> bool>(btm: &PathMap<()>, pat_expr: Expr, mut effect: F) -> usize {
         // Which engine answers the space-to-space transform is a compile-time choice and nothing
         // more: with the `leapfrog` feature the join owns every body, and without it the module
         // does not exist. `query_multi` stays reachable for the paths that are not dispatched --
@@ -1113,13 +1113,13 @@ impl Space {
         }
     }
 
-    pub fn query_multi<F : FnMut(Result<&[u32], &BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(btm: &PathMap<()>, pat_expr: Expr, mut effect: F) -> usize {
+    pub fn query_multi<F : FnMut(Result<&[u32], &Bindings>, Expr) -> bool>(btm: &PathMap<()>, pat_expr: Expr, mut effect: F) -> usize {
         let pat_newvars = pat_expr.newvars();
         trace!(target: "query_multi", "pattern (newvars={}) {:?}", pat_newvars, serialize(unsafe { pat_expr.span().as_ref().unwrap() }));
         let n_factors = pat_expr.arity().unwrap() as usize;
         debug_assert!(n_factors > 0);
         if n_factors == 1 {
-            effect(Err(&BTreeMap::new()), pat_expr);
+            effect(Err(&Bindings::new()), pat_expr);
             return 1;
         }
         let mut pat_args = Vec::with_capacity(n_factors);
@@ -1216,7 +1216,7 @@ impl Space {
         }
     }
 
-    pub fn query_multi_i<F : FnMut(Result<&[u32], &BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(no_source: bool,
+    pub fn query_multi_i<F : FnMut(Result<&[u32], &Bindings>, Expr) -> bool>(no_source: bool,
             mmaps: &mut HashMap<OwnedSourceItem, ArenaCompactTree<memmap2::Mmap>>,
             z3s: &mut HashMap<OwnedSourceItem, Box<Popen>>,
             btm: &PathMap<()>, pat_expr: Expr, mut effect: F) -> usize {
@@ -1227,7 +1227,7 @@ impl Space {
         let n_factors = pat_expr.arity().unwrap() as usize;
         debug_assert!(n_factors > 0);
         if n_factors == 1 {
-            effect(Err(&BTreeMap::new()), pat_expr);
+            effect(Err(&Bindings::new()), pat_expr);
             return 1;
         }
         let mut pat_args = Vec::with_capacity(n_factors);
@@ -1259,7 +1259,7 @@ impl Space {
 
     #[cfg(feature="no_search")]
     #[inline(always)]
-    pub fn query_multi_raw<PZ : ZipperProduct, F : FnMut(Result<&[u32], &BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(mut prz: &mut PZ, sources: &[ExprEnv], mut effect: F) -> usize {
+    pub fn query_multi_raw<PZ : ZipperProduct, F : FnMut(Result<&[u32], &Bindings>, Expr) -> bool>(mut prz: &mut PZ, sources: &[ExprEnv], mut effect: F) -> usize {
         let mut candidate = 0;
         // One pair buffer for the whole enumeration: `unify` drains it, so a `clear` per
         // candidate makes it allocation-free after warmup.
@@ -1324,7 +1324,7 @@ impl Space {
 
     #[cfg(not(feature="no_search"))]
     #[inline(always)]
-    pub fn query_multi_raw<PZ : ZipperProduct, F : FnMut(Result<&[u32], &BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(mut prz: &mut PZ, sources: &[ExprEnv], mut effect: F) -> usize {
+    pub fn query_multi_raw<PZ : ZipperProduct, F : FnMut(Result<&[u32], &Bindings>, Expr) -> bool>(mut prz: &mut PZ, sources: &[ExprEnv], mut effect: F) -> usize {
         let mut stack = sources[0..].iter().rev().cloned().collect::<Vec<_>>();
 
         let mut references: Vec<u32> = vec![];

@@ -5,7 +5,7 @@ use std::hash::Hasher;
 use std::io::Write;
 use std::ops::{Coroutine, CoroutineState};
 use std::ptr::slice_from_raw_parts;
-use crate::{byte_item, item_byte, traverseh, Expr, ExprEnv, ExprVar, ExprZipper, Tag, APPLY_DEPTH, PRINT_DEBUG};
+use crate::{byte_item, item_byte, traverseh, Expr, ExprEnv, ExprVar, ExprZipper, Tag, APPLY_DEPTH, PRINT_DEBUG, Bindings};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum SourceItem<'a> {
@@ -248,7 +248,7 @@ pub fn item_source<'a>(e: Expr) -> impl Coroutine<(), Yield=SourceItem<'a>, Retu
 /// special case.
 pub fn pattern_cycles_and_intros(
     pat_var_count: u8,
-    bindings: &BTreeMap<ExprVar, ExprEnv>,
+    bindings: &Bindings,
     stack: &mut Vec<ExprVar>,
     assignments: &mut Vec<ExprVar>,
 ) -> Option<(u8, u8)> {
@@ -290,7 +290,7 @@ pub fn pattern_cycles_and_intros(
     Some((pat_var_count, new_intros))
 }
 
-pub fn apply_e<S: ItemSink>(n: u8, mut original_intros: u8, mut new_intros: u8, e: Expr, bindings: &BTreeMap<ExprVar, ExprEnv>, sink: &mut S, cycled: &mut BTreeMap<ExprVar, u8>, stack: &mut Vec<ExprVar>, assignments: &mut Vec<ExprVar>) -> (u8, u8) {
+pub fn apply_e<S: ItemSink>(n: u8, mut original_intros: u8, mut new_intros: u8, e: Expr, bindings: &Bindings, sink: &mut S, cycled: &mut BTreeMap<ExprVar, u8>, stack: &mut Vec<ExprVar>, assignments: &mut Vec<ExprVar>) -> (u8, u8) {
     let depth = stack.len();
     if stack.len() > APPLY_DEPTH as usize { panic!("apply depth > {APPLY_DEPTH}: {n} {original_intros} {new_intros}"); }
     if PRINT_DEBUG { println!("{}@ n={} original={} new={} ez={:?}", "  ".repeat(depth), n, original_intros, new_intros, e); }
@@ -440,7 +440,7 @@ mod tests {
     /// Instantiate under no bindings. With nothing bound, `apply_e` is the identity on a
     /// well-formed expression, which makes it a byte-exact check on the walk and the sinks.
     fn identity(e: Expr, out: &mut Vec<u8>) -> (u8, u8) {
-        let bindings = BTreeMap::new();
+        let bindings = crate::Bindings::new();
         let mut cycled = BTreeMap::new();
         let (mut stack, mut assignments) = (Vec::new(), Vec::new());
         let mut sink = VecSink(out);
@@ -483,7 +483,7 @@ mod tests {
         let mut out = Vec::new();
         let with_bytes = identity(x, &mut out);
 
-        let bindings = BTreeMap::new();
+        let bindings = crate::Bindings::new();
         let mut cycled = BTreeMap::new();
         let (mut stack, mut assignments) = (Vec::new(), Vec::new());
         let without = apply_e(0, 0, 0, x, &bindings, &mut NullSink, &mut cycled, &mut stack, &mut assignments);
@@ -497,7 +497,7 @@ mod tests {
         let x = Expr { ptr: xv.as_mut_ptr() };
 
         let mut room = [0u8; 64];
-        let bindings = BTreeMap::new();
+        let bindings = crate::Bindings::new();
         let mut cycled = BTreeMap::new();
         let (mut stack, mut assignments) = (Vec::new(), Vec::new());
         let mut sink = SliceSink::new(&mut room);

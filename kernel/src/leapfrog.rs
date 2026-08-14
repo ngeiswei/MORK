@@ -1085,7 +1085,7 @@ fn join_state<'a>(
         nvars,
         next_step: vec![0; nf],
         data_intro: vec![0; nf],
-        bindings: BTreeMap::new(),
+        bindings: Bindings::new(),
         trail: Vec::new(),
         unify_stack: Vec::new(),
         free_bufs: Vec::new(),
@@ -1316,7 +1316,7 @@ fn scan_subterm(body: Expr, at: usize, intro: &mut u8) -> Option<SubtermScan> {
 /// not a well-formed conjunction at all -- see [`parse_body_factors`] -- which the caller sends
 /// down the ProductZipper path. Every CONJUNCT shape is handled here, including the degenerate
 /// body with no conjunct. A `false` from `effect` stops the search, as it stops the stock scan.
-pub fn query_multi_leapfrog<F: FnMut(Result<&[u32], &BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(
+pub fn query_multi_leapfrog<F: FnMut(Result<&[u32], &Bindings>, Expr) -> bool>(
     map: &PathMap<()>,
     pat_expr: Expr,
     mut effect: F,
@@ -1334,7 +1334,7 @@ pub fn query_multi_leapfrog<F: FnMut(Result<&[u32], &BTreeMap<(u8, u8), ExprEnv>
         // bindings. This mirrors `Space::query_multi`'s `n_factors == 1` arm byte for byte,
         // including that it calls `effect` once, ignores the answer, and returns 1 -- and that it
         // does NOT bump the `unifications` counter, so the printed statistics stay identical.
-        effect(Err(&BTreeMap::new()), pat_expr);
+        effect(Err(&Bindings::new()), pat_expr);
         return 1;
     }
     let var_order: Vec<usize> = (0..nvars).collect();

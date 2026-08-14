@@ -1756,7 +1756,61 @@ unsafe impl Send for Expr {}
 pub type ExprVar = (u8, u8);
 /// What [`unify`] solves to: each variable's binding, an [`ExprEnv`] view into one of the unified
 /// expressions.
-pub type Bindings = BTreeMap<ExprVar, ExprEnv>;
+/// The solved substitution: variable key to value env. A flat SORTED vec, not a `BTreeMap`: the
+/// traces put the map at 0-8 entries on every workload (big.metta included), where a linear probe
+/// beats tree-node chasing, insert is a short memmove, iteration order stays the map's, and --
+/// what the join pays per candidate -- `clone` is one allocation and one memcpy instead of a node
+/// tree. The API is the `BTreeMap` subset the engine used.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Bindings {
+    entries: Vec<(ExprVar, ExprEnv)>,
+}
+
+impl Bindings {
+    pub fn new() -> Self { Bindings { entries: Vec::new() } }
+    #[inline]
+    fn pos(&self, k: &ExprVar) -> Result<usize, usize> {
+        self.entries.binary_search_by_key(k, |e| e.0)
+    }
+    #[inline]
+    pub fn get(&self, k: &ExprVar) -> Option<&ExprEnv> {
+        // Linear: the map is a handful of entries, and one cache line of (key, env) pairs is
+        // cheaper to scan than to bisect.
+        self.entries.iter().find(|e| e.0 == *k).map(|e| &e.1)
+    }
+    #[inline]
+    pub fn contains_key(&self, k: &ExprVar) -> bool { self.get(k).is_some() }
+    pub fn insert(&mut self, k: ExprVar, v: ExprEnv) -> Option<ExprEnv> {
+        match self.pos(&k) {
+            Ok(i) => Some(std::mem::replace(&mut self.entries[i].1, v)),
+            Err(i) => { self.entries.insert(i, (k, v)); None }
+        }
+    }
+    pub fn remove(&mut self, k: &ExprVar) -> Option<ExprEnv> {
+        match self.pos(k) { Ok(i) => Some(self.entries.remove(i).1), Err(_) => None }
+    }
+    pub fn len(&self) -> usize { self.entries.len() }
+    pub fn is_empty(&self) -> bool { self.entries.is_empty() }
+    pub fn iter(&self) -> impl Iterator<Item = (&ExprVar, &ExprEnv)> {
+        self.entries.iter().map(|(k, v)| (k, v))
+    }
+    pub fn keys(&self) -> impl Iterator<Item = &ExprVar> { self.entries.iter().map(|(k, _)| k) }
+    pub fn values(&self) -> impl Iterator<Item = &ExprEnv> { self.entries.iter().map(|(_, v)| v) }
+    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut ExprEnv> {
+        self.entries.iter_mut().map(|(_, v)| v)
+    }
+}
+
+impl<'a> IntoIterator for &'a Bindings {
+    type Item = (&'a ExprVar, &'a ExprEnv);
+    type IntoIter = std::iter::Map<
+        std::slice::Iter<'a, (ExprVar, ExprEnv)>,
+        fn(&'a (ExprVar, ExprEnv)) -> (&'a ExprVar, &'a ExprEnv),
+    >;
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter().map(|(k, v)| (k, v))
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct ExprEnv {
@@ -1995,7 +2049,7 @@ pub static mut max_unify_iterations: u32 = 0;
 const PRINT_DEBUG: bool = false;
 #[deprecated]
 #[inline(never)]
-pub fn apply(n: u8, mut original_intros: u8, mut new_intros: u8, ez: &mut ExprZipper, bindings: &BTreeMap<ExprVar, ExprEnv>, oz: &mut ExprZipper, cycled: &mut BTreeMap<ExprVar, u8>, stack: &mut Vec<ExprVar>, assignments: &mut Vec<ExprVar>) -> (u8, u8) {
+pub fn apply(n: u8, mut original_intros: u8, mut new_intros: u8, ez: &mut ExprZipper, bindings: &Bindings, oz: &mut ExprZipper, cycled: &mut BTreeMap<ExprVar, u8>, stack: &mut Vec<ExprVar>, assignments: &mut Vec<ExprVar>) -> (u8, u8) {
     let depth = stack.len();
     if stack.len() > APPLY_DEPTH as usize { panic!("apply depth > {APPLY_DEPTH}: {n} {original_intros} {new_intros}"); }
     if PRINT_DEBUG { println!("{}@ n={} original={} new={} ez={:?}", "  ".repeat(depth), n, original_intros, new_intros, ez.subexpr()); }
@@ -2106,8 +2160,8 @@ pub fn apply(n: u8, mut original_intros: u8, mut new_intros: u8, ez: &mut ExprZi
 
 
 #[inline(never)]
-pub fn unify(stack: &mut Vec<(ExprEnv, ExprEnv)>) -> Result<BTreeMap<ExprVar, ExprEnv>, UnificationFailure> {
-    let mut bindings: BTreeMap<ExprVar, ExprEnv> = BTreeMap::new();
+pub fn unify(stack: &mut Vec<(ExprEnv, ExprEnv)>) -> Result<Bindings, UnificationFailure> {
+    let mut bindings: Bindings = Bindings::new();
     let mut trail = Vec::new();
     unify_into(&mut bindings, stack, &mut trail)?;
     Ok(bindings)
@@ -2121,7 +2175,7 @@ pub fn unify(stack: &mut Vec<(ExprEnv, ExprEnv)>) -> Result<BTreeMap<ExprVar, Ex
 /// entry (an insert target is always a previously-unbound key, so removal restores the map).
 /// The solved form's SHAPE may differ from a from-scratch solve (path compression, var-var
 /// direction); downstream only ever observes bindings by dereference, which is unchanged.
-pub fn unify_into(bindings: &mut BTreeMap<ExprVar, ExprEnv>, mut stack: &mut Vec<(ExprEnv, ExprEnv)>, trail: &mut Vec<ExprVar>) -> Result<(), UnificationFailure> {
+pub fn unify_into(bindings: &mut Bindings, mut stack: &mut Vec<(ExprEnv, ExprEnv)>, trail: &mut Vec<ExprVar>) -> Result<(), UnificationFailure> {
     let bindings = &mut *bindings;
     // Counts this call's iterations locally and folds the result into
     // [`max_unify_iterations`] exactly once, on the way out. A `Drop` guard rather than an
@@ -2565,7 +2619,7 @@ fn anti_unify_apply(
 mod ground_stamp {
     use super::*;
 
-    fn unify_exprs(l: &[u8], r: &[u8]) -> Result<BTreeMap<ExprVar, ExprEnv>, UnificationFailure> {
+    fn unify_exprs(l: &[u8], r: &[u8]) -> Result<Bindings, UnificationFailure> {
         let le = Expr { ptr: l.as_ptr().cast_mut() };
         let re = Expr { ptr: r.as_ptr().cast_mut() };
         let mut stack = vec![(ExprEnv::new(0, le), ExprEnv::new(1, re))];
@@ -2748,7 +2802,7 @@ mod ground_stamp {
                 env.ground_skip = 0;
             }
 
-            let emit = |bindings: &BTreeMap<ExprVar, ExprEnv>| -> Vec<u8> {
+            let emit = |bindings: &Bindings| -> Vec<u8> {
                 let mut buf = Vec::new();
                 let mut cycled = BTreeMap::new();
                 let mut st: Vec<ExprVar> = vec![];
