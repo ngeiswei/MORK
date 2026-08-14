@@ -2106,8 +2106,23 @@ pub fn apply(n: u8, mut original_intros: u8, mut new_intros: u8, ez: &mut ExprZi
 
 
 #[inline(never)]
-pub fn unify(mut stack: &mut Vec<(ExprEnv, ExprEnv)>) -> Result<BTreeMap<ExprVar, ExprEnv>, UnificationFailure> {
+pub fn unify(stack: &mut Vec<(ExprEnv, ExprEnv)>) -> Result<BTreeMap<ExprVar, ExprEnv>, UnificationFailure> {
     let mut bindings: BTreeMap<ExprVar, ExprEnv> = BTreeMap::new();
+    let mut trail = Vec::new();
+    unify_into(&mut bindings, stack, &mut trail)?;
+    Ok(bindings)
+}
+
+/// [`unify`] against a LIVE map: solve the equations on `stack` with `bindings` already holding a
+/// solved form, recording every key inserted on `trail` so the caller can unwind to a mark. This is
+/// what lets the join bind one candidate INCREMENTALLY instead of cloning the map and re-solving
+/// every prior equation per candidate: the derefs consult the live map, so an earlier binding
+/// constrains exactly as if its equation were re-asserted, and unwinding is `remove` per trail
+/// entry (an insert target is always a previously-unbound key, so removal restores the map).
+/// The solved form's SHAPE may differ from a from-scratch solve (path compression, var-var
+/// direction); downstream only ever observes bindings by dereference, which is unchanged.
+pub fn unify_into(bindings: &mut BTreeMap<ExprVar, ExprEnv>, mut stack: &mut Vec<(ExprEnv, ExprEnv)>, trail: &mut Vec<ExprVar>) -> Result<(), UnificationFailure> {
+    let bindings = &mut *bindings;
     // Counts this call's iterations locally and folds the result into
     // [`max_unify_iterations`] exactly once, on the way out. A `Drop` guard rather than an
     // update at each `return`, so every exit path (Occurs, Difference, Ok) is covered and
@@ -2304,18 +2319,20 @@ pub fn unify(mut stack: &mut Vec<(ExprEnv, ExprEnv)>) -> Result<BTreeMap<ExprVar
                 if let Some(sv) = ov { if vx == sv { continue 'popping } }
                 // A stamped subterm contains no variable, so the occurs walk is a guaranteed miss.
                 if dt2.ground_skip == 0 && step!(occurs vx, dt2)  { return Err(UnificationFailure::Occurs(vx, dt2)) }
+                trail.push(vx);
                 bindings.insert(vx, dt2.clone());
             }
             (ov, Some(vy)) => {
                 if let Some(sv) = ov { if vy == sv { continue 'popping } }
                 if dt1.ground_skip == 0 && step!(occurs vy, dt1)  { return Err(UnificationFailure::Occurs(vy, dt1)) }
+                trail.push(vy);
                 bindings.insert(vy, dt1.clone());
             }
         }
     }
 
     if stack.is_empty() {
-        Ok(bindings)
+        Ok(())
     } else {
         unreachable!()
     }

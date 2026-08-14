@@ -13,7 +13,7 @@
 //! here, then the zipper subterm cursor, then the unification leapfrog, gated against the
 //! ProductZipper.
 
-use mork_expr::{byte_item, item_byte, unify, Expr, ExprEnv, ExprZipper, Tag};
+use mork_expr::{byte_item, item_byte, unify, unify_into, Expr, ExprEnv, ExprZipper, Tag};
 use pathmap::utils::{BitMask, ByteMask};
 use pathmap::zipper::{
     ReadZipperUntracked, Zipper, ZipperAbsolutePath, ZipperIteration, ZipperMoving, ZipperValues,
@@ -1086,6 +1086,8 @@ fn join_state<'a>(
         next_step: vec![0; nf],
         data_intro: vec![0; nf],
         bindings: BTreeMap::new(),
+        trail: Vec::new(),
+        unify_stack: Vec::new(),
         free_bufs: Vec::new(),
         free_child_bufs: Vec::new(),
         lead_max: Vec::new(),
@@ -1432,6 +1434,11 @@ struct UnifyJoin<'a> {
     next_step: Vec<usize>,
     data_intro: Vec<u8>,
     bindings: Bindings,
+    /// Keys inserted into `bindings` by incremental unification, in order; `match_candidate`
+    /// unwinds to its mark on backtrack. See [`mork_expr::unify_into`].
+    trail: Vec<ExprVar>,
+    /// Scratch equation stack for [`mork_expr::unify_into`], reused across candidates.
+    unify_stack: Vec<(ExprEnv, ExprEnv)>,
     /// Pool of [`CandidateBuf`]s for the lead enumeration, one in flight per active recursion
     /// depth; released buffers return here with their allocations intact.
     free_bufs: Vec<CandidateBuf>,
@@ -1854,6 +1861,7 @@ impl UnifyJoin<'_> {
         ExprEnv::with_intro(QUERY_NS, v as u8, Expr::from_slice(&NEW_VAR_EXPR_BYTES))
     }
 
+    #[allow(dead_code)]
     fn var_env(&self, (n, v): ExprVar) -> ExprEnv {
         ExprEnv::with_intro(n, v, Expr::from_slice(&NEW_VAR_EXPR_BYTES))
     }
@@ -1883,15 +1891,6 @@ impl UnifyJoin<'_> {
     fn data_env_for(&mut self, f: usize, bytes: &[u8], vars: (u8, u8)) -> ExprEnv {
         // Factor f's data lives in namespace 1 + f; QUERY_NS = 0 is the query's own.
         self.env_over(1 + f as u8, self.data_intro[f], bytes, vars.1 == 0)
-    }
-
-    fn unified_bindings(&self, lhs: ExprEnv, rhs: ExprEnv) -> Option<Bindings> {
-        let mut pairs = Vec::with_capacity(self.bindings.len() + 1);
-        for (&var, &env) in &self.bindings {
-            pairs.push((self.var_env(var), env));
-        }
-        pairs.push((lhs, rhs));
-        unify(&mut pairs).ok()
     }
 
     fn deref_env(&self, env: ExprEnv) -> ExprEnv {
@@ -2289,15 +2288,29 @@ impl UnifyJoin<'_> {
         if self.stopped {
             return;
         }
-        let saved_bindings = self.bindings.clone();
+        // Bind the ONE new equation against the live map, and unwind by trail instead of cloning
+        // the whole map and re-solving every prior equation per candidate. The 3-axiom step trace
+        // showed the same binding re-derived up to 18x per answer under the old scheme, and on the
+        // big.metta self-join the re-solving cost 11.6x the ProductZipper's unification work.
         let data_env = self.data_env_for(f, bytes, vars);
-        if let Some(bindings) = self.unified_bindings(pattern, data_env) {
-            self.bindings = bindings;
+        let mark = self.trail.len();
+        self.unify_stack.clear();
+        self.unify_stack.push((pattern, data_env));
+        let mut stack = std::mem::take(&mut self.unify_stack);
+        let mut trail = std::mem::take(&mut self.trail);
+        let ok = unify_into(&mut self.bindings, &mut stack, &mut trail).is_ok();
+        self.unify_stack = stack;
+        self.trail = trail;
+        if ok {
             // The intro delta is the candidate's NewVar count, which the enumeration walk already
             // counted exactly -- no rescan, no `newvars` item walk.
             self.with_bound_path_bytes(f, bytes, vars.0, cont);
         }
-        self.bindings = saved_bindings;
+        // A failed unify may have inserted before failing; unwind either way. An insert target is
+        // always a previously-unbound key, so removal restores the map exactly.
+        for k in self.trail.split_off(mark) {
+            self.bindings.remove(&k);
+        }
     }
 
     fn match_expr_at_current(
