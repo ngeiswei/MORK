@@ -1126,6 +1126,43 @@ fn sink_pure_dynamic_subformula() {
     assert_eq!(res, "(result 0 128.7723)\n(result 1 430.3821000000001)\n");
 }
 
+fn sink_pure_quoted_variable_identity() {
+    let mut s = Space::new();
+
+    // #135. Quotation is not the culprit: `item_source` yields `VarRef(r)` verbatim and
+    // `ExprSink::write` writes the byte back verbatim. What went wrong is that eval
+    // preserves the numbering of the expression it was handed, so a variable introduced
+    // inside the call comes back carrying its index in the sink expression's namespace
+    // rather than one relative to the result. Splicing that as if it were standalone
+    // left the repeated reference pointing past the end, and a dangling reference prints
+    // as a fresh variable -- `($a $a)` came out as `($a $b)`.
+    //
+    // exec 0 is the issue's own program. exec 1 puts two more binders ahead of the call,
+    // so a base wrong by any amount other than exactly two reads differently from exec 0.
+    const SPACE_EXPRS: &str = r#"
+(exec 0 (,) (O (pure $r $r (tuple R (' ($a $a))))))
+(exec 1 (,) (O (pure (K $x $y $r) $r (tuple T (' ($a $a))))))
+    "#;
+
+    s.add_all_sexpr(SPACE_EXPRS.as_bytes()).unwrap();
+
+    let mut t0 = Instant::now();
+    let steps = s.metta_calculus(1000000000000000);
+    println!("elapsed {} steps {} size {}", t0.elapsed().as_millis(), steps, s.btm.val_count());
+
+    // The execs are consumed, so the whole space is the emitted set. Sorted, because the
+    // space is a set and dump order is not what this pins down.
+    let mut v = vec![];
+    s.dump_sexpr(expr!(s, "$"), expr!(s, "_1"), &mut v);
+    let dumped = String::from_utf8_lossy_owned(v);
+    let mut lines: Vec<&str> = dumped.lines().filter(|l| !l.is_empty()).collect();
+    lines.sort();
+    let res = lines.join("\n");
+
+    println!("result: {res}");
+    assert_eq!(res, "(K $a $b (T ($c $c)))\n(R ($a $a))");
+}
+
 fn sink_pure_quote_collapse_symbol() {
     let mut s = Space::new();
 
@@ -6288,6 +6325,7 @@ fn main() {
             sink_pure_basic_nested();
             sink_pure_roman_validation();
             sink_pure_dynamic_subformula();
+            sink_pure_quoted_variable_identity();
             sink_pure_quote_collapse_symbol();
             sink_pure_explode_collapse_ident();
             sink_pure_ignored_guard_addressing();

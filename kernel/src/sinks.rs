@@ -1190,7 +1190,11 @@ impl Sink for PureSink {
                         let ie = Expr { ptr: (&varref[0] as *const u8).cast_mut() };
                         let mut oz = ExprZipper::new(Expr{ ptr: buffer.as_mut_ptr() });
                         trace!(target: "sink", "ref guard '{}' var {:?} with '{}'", serialize(varref), k, serialize(&res[..]));
-                        let os = ie.substitute_one_de_bruijn(k, Expr{ ptr: res.as_mut_ptr() }, &mut oz);
+                        // eval returns the result still numbered in the sink expression's
+                        // namespace, so it splices at that base (#135). The pattern is a bare
+                        // var-ref and introduces nothing, hence the template's own count.
+                        let base = ie.newvars() as u8;
+                        let os = ie.substitute_one_de_bruijn_at(k, base, Expr{ ptr: res.as_mut_ptr() }, &mut oz);
                         unsafe { buffer.set_len(oz.loc) }
                         trace!(target: "sink", "ref guard subs '{:?}'", serialize(&buffer[..oz.loc]));
                         wz.move_to_path(&buffer[wz.root_prefix_path().len()..oz.loc]);

@@ -547,12 +547,10 @@ impl Expr {
         }
     }
 
+    /// [`Expr::substitute_one_de_bruijn_at`] for a standalone `substitution`, i.e. one
+    /// whose own variables start at 0.
     pub fn substitute_one_de_bruijn(self, idx: u8, substitution: Expr, oz: &mut ExprZipper) -> *const [u8] {
-        let mut var: u8 = item_byte(Tag::NewVar);
-        let nvs = self.newvars();
-        let mut vars = vec![Expr{ ptr: &mut var }; nvs];
-        vars[idx as usize] = substitution;
-        self.substitute_de_bruijn(&vars[..], oz)
+        self.substitute_one_de_bruijn_at(idx, 0, substitution, oz)
     }
 
     pub fn substitute_de_bruijn_ivc(self, substitutions: &[Expr], oz: &mut ExprZipper, var_count: &mut usize, additions: &mut [u8]) -> *const [u8] {
@@ -579,6 +577,49 @@ impl Expr {
         }
     }
     
+    /// `substitute_one_de_bruijn` for a substitution that is a *subexpression* of some
+    /// larger expression rather than a standalone one, and whose var-refs are therefore
+    /// numbered in that larger expression's namespace.
+    ///
+    /// `base` is the number of variables introduced ahead of the substitution there, so
+    /// its own introductions start at `base`. Refs at or above `base` point at those and
+    /// get rebased onto wherever the substitution lands; refs below `base` point at
+    /// binders of the expression being substituted into and keep their index.
+    ///
+    /// Passing `base == 0` is exactly `substitute_one_de_bruijn`.
+    ///
+    /// Replacing a single variable needs no substitution table: every slot other than
+    /// `idx` is the identity, so the output offsets are closed-form. Introductions before
+    /// `idx` keep their index, `idx` itself becomes the substitution's `m` introductions,
+    /// and everything after shifts by `m - 1`. A ref can only occur below its own
+    /// introduction, so by the time one at or above `idx` is reached `m` is known.
+    pub fn substitute_one_de_bruijn_at(self, idx: u8, base: u8, substitution: Expr, oz: &mut ExprZipper) -> *const [u8] {
+        let mut ez = ExprZipper::new(self);
+        let mut var_count = 0u8;
+        let mut m = 0u8;
+        loop {
+            match ez.tag() {
+                Tag::NewVar => {
+                    if var_count == idx { m = substitution.shift_from(base, idx, oz); }
+                    else { oz.write_new_var(); oz.loc += 1; }
+                    var_count += 1;
+                }
+                Tag::VarRef(r) => {
+                    if r == idx { substitution.bind_from(base, idx, oz); }
+                    else if r < idx { oz.write_var_ref(r); oz.loc += 1; }
+                    else { oz.write_var_ref(r - 1 + m); oz.loc += 1; }
+                }
+                Tag::SymbolSize(s) => { oz.write_move(unsafe { slice_from_raw_parts(ez.root.ptr.byte_add(ez.loc), s as usize + 1).as_ref().unwrap() }); }
+                Tag::Arity(_) => { unsafe { *oz.root.ptr.byte_add(oz.loc) = *ez.root.ptr.byte_add(ez.loc); oz.loc += 1; }; }
+            }
+
+            if !ez.next() {
+                debug_assert!(idx < var_count, "substituting variable {} of an expression that introduces {}", idx, var_count);
+                return ez.finish_span()
+            }
+        }
+    }
+
     pub fn substitute_de_bruijn(self, substitutions: &[Expr], oz: &mut ExprZipper) -> *const [u8] {
         let mut ez = ExprZipper::new(self);
         let mut additions = vec![0u8; substitutions.len()];
@@ -606,8 +647,17 @@ impl Expr {
     }
 
 
+    /// [`Expr::bind_from`] for an expression whose own variables start at 0.
+    // this.foldMap(i => Var(if i == 0 then {index += 1; -index - n} else if i > 0 then i else i - n), App(_, _))
     fn bind(self, n: u8, oz: &mut ExprZipper) -> *const [u8] {
-        // this.foldMap(i => Var(if i == 0 then {index += 1; -index - n} else if i > 0 then i else i - n), App(_, _))
+        self.bind_from(0, n, oz)
+    }
+
+    /// `bind` for an expression numbered against an enclosing namespace: its own
+    /// introductions start at `base`, so refs at or above `base` are its own and get
+    /// rebased onto `n`, while refs below `base` belong to the enclosing expression and
+    /// keep their index. See [`Expr::substitute_one_de_bruijn_at`].
+    fn bind_from(self, base: u8, n: u8, oz: &mut ExprZipper) -> *const [u8] {
         let mut ez = ExprZipper::new(self);
         let mut var_count = 0;
         loop {
@@ -616,7 +666,7 @@ impl Expr {
                     oz.write_var_ref(n + var_count); oz.loc += 1; var_count += 1;
                 }
                 Tag::VarRef(i) => {
-                    oz.write_var_ref(n + i); oz.loc += 1; // good
+                    oz.write_var_ref(if i >= base { n + (i - base) } else { i }); oz.loc += 1;
                 }
                 Tag::SymbolSize(s) => { oz.write_move(unsafe { slice_from_raw_parts(ez.root.ptr.byte_add(ez.loc), s as usize + 1).as_ref().unwrap() }); }
                 Tag::Arity(_) => { unsafe { *oz.root.ptr.byte_add(oz.loc) = *ez.root.ptr.byte_add(ez.loc); oz.loc += 1; }; }
@@ -628,28 +678,31 @@ impl Expr {
         }
     }
 
-    pub fn shift(self, n: u8, oz: &mut ExprZipper) -> u8 {
-        // this.foldMap(i => Var(if i >= 0 then i else i - n), App(_, _))
+    /// `shift` for an expression numbered against an enclosing namespace: its own
+    /// introductions start at `base`, so refs at or above `base` are its own and get
+    /// rebased onto `n`, while refs below `base` belong to the enclosing expression and
+    /// keep their index. See [`Expr::substitute_one_de_bruijn_at`].
+    pub fn shift_from(self, base: u8, n: u8, oz: &mut ExprZipper) -> u8 {
         let mut ez = ExprZipper::new(self);
         let mut new_var = 0u8;
         loop {
             match ez.tag() {
                 Tag::NewVar => { oz.write_new_var(); oz.loc += 1; new_var += 1; }
-                Tag::VarRef(i) => { oz.write_var_ref(i + n); oz.loc += 1; }
+                Tag::VarRef(i) => { oz.write_var_ref(if i >= base { i - base + n } else { i }); oz.loc += 1; }
                 Tag::SymbolSize(s) => { oz.write_move(unsafe { slice_from_raw_parts(ez.root.ptr.byte_add(ez.loc), s as usize + 1).as_ref().unwrap() }); }
                 Tag::Arity(_) => { unsafe { *oz.root.ptr.byte_add(oz.loc) = *ez.root.ptr.byte_add(ez.loc); oz.loc += 1; }; }
             }
 
             if !ez.next() {
-                // return self.loc + match self.tag() {
-                //     Tag::NewVar => { 1 }
-                //     Tag::VarRef(r) => { 1 }
-                //     Tag::SymbolSize(s) => { 1 + (s as usize) }
-                //     Tag::Arity(a) => { unreachable!() /* expression can't end in arity */ }
-                // }
                 return new_var;
             }
         }
+    }
+
+    /// [`Expr::shift_from`] for an expression whose own variables start at 0.
+    // this.foldMap(i => Var(if i >= 0 then i else i - n), App(_, _))
+    pub fn shift(self, n: u8, oz: &mut ExprZipper) -> u8 {
+        self.shift_from(0, n, oz)
     }
 
     pub fn unbind(self, oz: &mut ExprZipper) -> *const [u8] {
@@ -2404,6 +2457,58 @@ fn anti_unify_apply(
 mod tests {
     use crate::gxhash::GxHasher;
     use super::*;
+
+    /// `substitute_one_de_bruijn_at` drops the substitution table that the general
+    /// `substitute_de_bruijn` needs, so at `base == 0` the two have to agree byte for byte
+    /// over every shape: substituting the first, middle and last introduction, with ground
+    /// and non-ground substitutions, and with refs on both sides of the substituted index
+    /// as well as at it. The table-driven side is spelled out here because
+    /// `substitute_one_de_bruijn` now delegates to the function under test.
+    #[cfg(test)]
+    #[test]
+    fn test_substitute_one_de_bruijn_at_base_zero_matches() {
+        let templates: [(Vec<u8>, u8); 8] = [
+            (parse!(r"$").to_vec(), 0),                        // $x
+            (parse!(r"[3] K $ $").to_vec(), 0),                // (K $x $y), first
+            (parse!(r"[3] K $ $").to_vec(), 1),                // (K $x $y), last
+            (parse!(r"[4] K $ $ $").to_vec(), 1),              // (K $x $y $z), middle
+            (parse!(r"[3] K $ _1").to_vec(), 0),               // (K $x $x), ref at the index
+            (parse!(r"[4] K $ $ _1").to_vec(), 1),             // ref below the index
+            (parse!(r"[4] K $ $ _2").to_vec(), 0),             // ref above the index
+            (parse!(r"[5] K $ $ _2 _1").to_vec(), 0),          // refs on both sides
+        ];
+        let subs: [Vec<u8>; 3] = [
+            parse!(r"[2] T 9").to_vec(),                       // ground, introduces nothing
+            parse!(r"[2] T $").to_vec(),                       // introduces one
+            parse!(r"[3] T $ _1").to_vec(),                    // introduces one, refers to it
+        ];
+
+        for (tv, idx) in templates.iter() {
+            for sv in subs.iter() {
+                let mut tb = tv.clone(); let mut sb = sv.clone();
+                let t = Expr { ptr: tb.as_mut_ptr() };
+                let sub = Expr { ptr: sb.as_mut_ptr() };
+
+                let mut nv: u8 = item_byte(Tag::NewVar);
+                let mut table = vec![Expr { ptr: &mut nv }; t.newvars()];
+                table[*idx as usize] = sub;
+
+                let mut oldv = vec![0u8; 512];
+                let mut oldz = ExprZipper::new(Expr { ptr: oldv.as_mut_ptr() });
+                t.substitute_de_bruijn(&table[..], &mut oldz);
+
+                let mut newv = vec![0u8; 512];
+                let mut newz = ExprZipper::new(Expr { ptr: newv.as_mut_ptr() });
+                t.substitute_one_de_bruijn_at(*idx, 0, sub, &mut newz);
+
+                assert_eq!(oldz.loc, newz.loc, "length for idx {} tpl {} sub {}",
+                           idx, serialize(&tv[..]), serialize(&sv[..]));
+                assert_eq!(&oldv[..oldz.loc], &newv[..newz.loc], "bytes for idx {} tpl {} sub {}",
+                           idx, serialize(&tv[..]), serialize(&sv[..]));
+            }
+        }
+    }
+
     #[cfg(test)]
     #[test]
     fn test_unify() {
