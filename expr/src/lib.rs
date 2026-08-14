@@ -1756,59 +1756,72 @@ unsafe impl Send for Expr {}
 pub type ExprVar = (u8, u8);
 /// What [`unify`] solves to: each variable's binding, an [`ExprEnv`] view into one of the unified
 /// expressions.
-/// The solved substitution: variable key to value env. A flat SORTED vec, not a `BTreeMap`: the
-/// traces put the map at 0-8 entries on every workload (big.metta included), where a linear probe
-/// beats tree-node chasing, insert is a short memmove, iteration order stays the map's, and --
-/// what the join pays per candidate -- `clone` is one allocation and one memcpy instead of a node
-/// tree. The API is the `BTreeMap` subset the engine used.
+/// The solved substitution: variable key to value env, as a DIRECT-INDEXED slab. The key domain is
+/// tiny and bounded -- a body has at most 64 conjuncts (an arity byte), each namespace at most 64
+/// variables (the parser's cap) -- so `(n, v)` IS an index: `n << 6 | v`. A probe is one load with
+/// no comparisons, no ordering, no hashing; insert is one store plus a touched-list push; and the
+/// join never clones it at all (the trail unwinds it), so the slab's size costs one allocation per
+/// join, not per candidate. `touched` carries the occupied indices for iteration and O(touched)
+/// clearing; iteration order is insertion order, which no consumer depends on (bindings are only
+/// ever observed by key lookup or order-free scans).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Bindings {
-    entries: Vec<(ExprVar, ExprEnv)>,
+    slots: Vec<Option<ExprEnv>>,
+    touched: Vec<u16>,
 }
 
 impl Bindings {
-    pub fn new() -> Self { Bindings { entries: Vec::new() } }
-    #[inline]
-    fn pos(&self, k: &ExprVar) -> Result<usize, usize> {
-        self.entries.binary_search_by_key(k, |e| e.0)
+    pub fn new() -> Self { Bindings { slots: Vec::new(), touched: Vec::new() } }
+    #[inline(always)]
+    fn idx(k: &ExprVar) -> usize {
+        debug_assert!(k.1 < 64, "the parser caps variables at 63");
+        ((k.0 as usize) << 6) | (k.1 as usize & 63)
     }
-    #[inline]
+    #[inline(always)]
     pub fn get(&self, k: &ExprVar) -> Option<&ExprEnv> {
-        // Linear: the map is a handful of entries, and one cache line of (key, env) pairs is
-        // cheaper to scan than to bisect.
-        self.entries.iter().find(|e| e.0 == *k).map(|e| &e.1)
+        self.slots.get(Self::idx(k)).and_then(|s| s.as_ref())
     }
-    #[inline]
+    #[inline(always)]
     pub fn contains_key(&self, k: &ExprVar) -> bool { self.get(k).is_some() }
     pub fn insert(&mut self, k: ExprVar, v: ExprEnv) -> Option<ExprEnv> {
-        match self.pos(&k) {
-            Ok(i) => Some(std::mem::replace(&mut self.entries[i].1, v)),
-            Err(i) => { self.entries.insert(i, (k, v)); None }
+        let i = Self::idx(&k);
+        if i >= self.slots.len() {
+            self.slots.resize(i + 64, None);
         }
+        let prev = self.slots[i].replace(v);
+        if prev.is_none() {
+            self.touched.push(i as u16);
+        }
+        prev
     }
     pub fn remove(&mut self, k: &ExprVar) -> Option<ExprEnv> {
-        match self.pos(k) { Ok(i) => Some(self.entries.remove(i).1), Err(_) => None }
+        let i = Self::idx(k);
+        let prev = self.slots.get_mut(i).and_then(|s| s.take());
+        if prev.is_some() {
+            // The join removes by trail unwinding, newest first, so the scan from the back is
+            // usually one step.
+            if let Some(pos) = self.touched.iter().rposition(|&t| t as usize == i) {
+                self.touched.swap_remove(pos);
+            }
+        }
+        prev
     }
-    pub fn len(&self) -> usize { self.entries.len() }
-    pub fn is_empty(&self) -> bool { self.entries.is_empty() }
-    pub fn iter(&self) -> impl Iterator<Item = (&ExprVar, &ExprEnv)> {
-        self.entries.iter().map(|(k, v)| (k, v))
+    pub fn len(&self) -> usize { self.touched.len() }
+    pub fn is_empty(&self) -> bool { self.touched.is_empty() }
+    pub fn iter(&self) -> impl Iterator<Item = (ExprVar, &ExprEnv)> {
+        self.touched.iter().map(|&i| {
+            (((i >> 6) as u8, (i & 63) as u8), self.slots[i as usize].as_ref().unwrap())
+        })
     }
-    pub fn keys(&self) -> impl Iterator<Item = &ExprVar> { self.entries.iter().map(|(k, _)| k) }
-    pub fn values(&self) -> impl Iterator<Item = &ExprEnv> { self.entries.iter().map(|(_, v)| v) }
+    pub fn keys(&self) -> impl Iterator<Item = ExprVar> + '_ {
+        self.touched.iter().map(|&i| ((i >> 6) as u8, (i & 63) as u8))
+    }
+    pub fn values(&self) -> impl Iterator<Item = &ExprEnv> {
+        self.touched.iter().map(|&i| self.slots[i as usize].as_ref().unwrap())
+    }
     pub fn values_mut(&mut self) -> impl Iterator<Item = &mut ExprEnv> {
-        self.entries.iter_mut().map(|(_, v)| v)
-    }
-}
-
-impl<'a> IntoIterator for &'a Bindings {
-    type Item = (&'a ExprVar, &'a ExprEnv);
-    type IntoIter = std::iter::Map<
-        std::slice::Iter<'a, (ExprVar, ExprEnv)>,
-        fn(&'a (ExprVar, ExprEnv)) -> (&'a ExprVar, &'a ExprEnv),
-    >;
-    fn into_iter(self) -> Self::IntoIter {
-        self.entries.iter().map(|(k, v)| (k, v))
+        let slots = self.slots.as_mut_ptr();
+        self.touched.iter().map(move |&i| unsafe { (*slots.add(i as usize)).as_mut().unwrap() })
     }
 }
 
@@ -2270,7 +2283,7 @@ pub fn unify_into(bindings: &mut Bindings, mut stack: &mut Vec<(ExprEnv, ExprEnv
                 // let ov = vec![0u8; 512];
                 // let o = Expr{ ptr: ov.leak().as_mut_ptr() };
                 // apply(v.n, v.v, 0, &mut ExprZipper::new(v.subsexpr()), &bindings, &mut ExprZipper::new(o), 0);
-                println!("  binding {:?} +{} {}", *k, v.v, v.show());
+                println!("  binding {:?} +{} {}", k, v.v, v.show());
                 // println!("output {:?}", o);
 
             });
@@ -2702,7 +2715,7 @@ mod ground_stamp {
         let data = parse!(r"[3] f [2] g a [2] g $"); // (f (g a) (g $y))
         let bindings = unify_exprs(&pattern, &data).expect("must unify by binding $y = a");
         assert!(
-            bindings.keys().any(|&(n, _)| n == 1),
+            bindings.keys().any(|(n, _)| n == 1),
             "the unstamped side's variable must be bound, got {:?}",
             bindings.keys().collect::<Vec<_>>()
         );

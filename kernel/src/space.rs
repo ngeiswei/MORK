@@ -1529,7 +1529,7 @@ impl Space {
                 }
                 Err(bindings) => {
                     #[cfg(debug_assertions)]
-                    bindings.iter().for_each(|(v, ee)| trace!(target: "transform", "binding {:?} {}", *v, ee.show()));
+                    bindings.iter().for_each(|(v, ee)| trace!(target: "transform", "binding {:?} {}", v, ee.show()));
 
                     let counts = mork_expr::pattern_cycles_and_intros(
                         pat_var_count as u8, bindings, &mut trace, &mut assignments);
@@ -1631,7 +1631,7 @@ impl Space {
                 }
                 Err(bindings) => {
                     #[cfg(debug_assertions)]
-                    bindings.iter().for_each(|(v, ee)| trace!(target: "transform", "binding {:?} {}", *v, ee.show()));
+                    bindings.iter().for_each(|(v, ee)| trace!(target: "transform", "binding {:?} {}", v, ee.show()));
 
                     let counts = mork_expr::pattern_cycles_and_intros(
                         pat_var_count as u8, bindings, &mut trace, &mut assignments);
@@ -1741,7 +1741,7 @@ impl Space {
                 }
                 Err(bindings) => {
                     #[cfg(debug_assertions)]
-                    bindings.iter().for_each(|(v, ee)| trace!(target: "transform", "binding {:?} {}", *v, ee.show()));
+                    bindings.iter().for_each(|(v, ee)| trace!(target: "transform", "binding {:?} {}", v, ee.show()));
 
                     let counts = mork_expr::pattern_cycles_and_intros(
                         pat_var_count as u8, bindings, &mut trace, &mut assignments);
@@ -1854,7 +1854,7 @@ impl Space {
                 }
                 Err(bindings) => {
                     #[cfg(debug_assertions)]
-                    bindings.iter().for_each(|(v, ee)| trace!(target: "transform", "binding {:?} {}", *v, ee.show()));
+                    bindings.iter().for_each(|(v, ee)| trace!(target: "transform", "binding {:?} {}", v, ee.show()));
 
                     let counts = mork_expr::pattern_cycles_and_intros(
                         pat_var_count as u8, bindings, &mut trace, &mut assignments);
