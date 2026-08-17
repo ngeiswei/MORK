@@ -13,7 +13,7 @@
 //! here, then the zipper subterm cursor, then the unification leapfrog, gated against the
 //! ProductZipper.
 
-use mork_expr::{byte_item, item_byte, unify, Expr, ExprEnv, ExprZipper, Tag};
+use mork_expr::{byte_item, item_byte, unify, unify_into, Expr, ExprEnv, ExprZipper, Tag};
 use pathmap::utils::{BitMask, ByteMask};
 use pathmap::zipper::{
     ReadZipperUntracked, Zipper, ZipperAbsolutePath, ZipperIteration, ZipperMoving, ZipperValues,
@@ -60,53 +60,6 @@ pub fn least_ge(mask: &ByteMask, k: u8) -> Option<u8> {
     }
 }
 
-/// One byte of the resumable subterm parse: `subterms` complete terms and `payload` raw bytes
-/// are still owed; a key spells exactly one complete subterm iff both are zero (starting from
-/// `(1, 0)`). An expression is at most `u32::MAX - 1` bytes, which bounds both.
-#[inline]
-fn subterm_parse_step(b: u8, subterms: &mut u32, payload: &mut u32) {
-    if *payload > 0 {
-        *payload -= 1;
-    } else {
-        *subterms -= 1;
-        match byte_item(b) {
-            Tag::Arity(arity) => *subterms += arity as u32,
-            Tag::SymbolSize(size) => *payload += size as u32,
-            Tag::VarRef(_) | Tag::NewVar => {}
-        }
-    }
-}
-
-/// The extent of one complete subterm at the front of a byte run.
-struct SubtermProps {
-    length: usize,
-    ground: bool,
-}
-
-/// Batch form of the parse: the first complete subterm at `bytes[0..]`, or `None` on a truncated
-/// term.
-fn first_subterm(bytes: &[u8]) -> Option<SubtermProps> {
-    let mut i = 0usize;
-    let mut remaining = 1usize;
-    let mut ground = true;
-    while remaining > 0 {
-        let b = *bytes.get(i)?;
-        i += 1;
-        remaining -= 1;
-        match byte_item(b) {
-            Tag::Arity(arity) => remaining += arity as usize,
-            Tag::VarRef(_) | Tag::NewVar => ground = false,
-            Tag::SymbolSize(size) => {
-                i = i.checked_add(size as usize)?;
-                if i > bytes.len() {
-                    return None;
-                }
-            }
-        }
-    }
-    Some(SubtermProps { length: i, ground })
-}
-
 /// Whether `bytes` (from the column-start focus) spell exactly one complete subterm, by replaying
 /// the parse from scratch. [`SubtermCursor`] tracks this incrementally instead — replaying it per
 /// descent step made completing an L-byte subterm O(L^2), which dominated the join on MORK's real
@@ -117,7 +70,7 @@ fn first_subterm(bytes: &[u8]) -> Option<SubtermProps> {
 fn is_complete(bytes: &[u8]) -> bool {
     let (mut subterms, mut payload) = (1u32, 0u32);
     for &b in bytes {
-        subterm_parse_step(b, &mut subterms, &mut payload);
+        mork_expr::subterm_parse_step(b, &mut subterms, &mut payload);
     }
     subterms == 0 && payload == 0
 }
@@ -284,7 +237,7 @@ impl<Z: Zipper + ZipperMoving + ZipperIteration> SubtermCursor<Z> {
                 _ => {}
             }
         }
-        subterm_parse_step(b, &mut self.col.owed_subterms, &mut self.col.owed_payload);
+        mork_expr::subterm_parse_step(b, &mut self.col.owed_subterms, &mut self.col.owed_payload);
     }
 
     /// Account for the key's last byte `b` leaving (the caller moves the zipper), restoring the
@@ -661,13 +614,7 @@ fn push_steps<'a>(
     // The body is engine-produced and already validated by the factor parse; the encoding is
     // trusted, so this walk reads it raw.
     let b = unsafe { *base.ptr.add(offset) };
-    let env = ExprEnv {
-        n: QUERY_NS,
-        v: intro,
-        offset: offset as u32,
-        ground_skip: 0,
-        base,
-    };
+    let env = ExprEnv::with_intro(QUERY_NS, intro, base).offset(offset as u32);
     match byte_item(b) {
         Tag::NewVar => {
             out.push(Step::Var(intro as usize));
@@ -995,7 +942,7 @@ pub fn unify_join_zipper(
         .into_iter()
         .filter_map(|row| {
             row.into_iter()
-                .map(|component| component.filter(|bytes| first_subterm(bytes).is_some_and(|props| props.ground)))
+                .map(|component| component.filter(|bytes| Expr::from_slice(bytes).variables() == 0))
                 .collect::<Option<Vec<Vec<u8>>>>()
         })
         .collect()
@@ -1138,7 +1085,9 @@ fn join_state<'a>(
         nvars,
         next_step: vec![0; nf],
         data_intro: vec![0; nf],
-        bindings: BTreeMap::new(),
+        bindings: Bindings::new(),
+        trail: Vec::new(),
+        unify_stack: Vec::new(),
         free_bufs: Vec::new(),
         free_child_bufs: Vec::new(),
         lead_max: Vec::new(),
@@ -1367,7 +1316,7 @@ fn scan_subterm(body: Expr, at: usize, intro: &mut u8) -> Option<SubtermScan> {
 /// not a well-formed conjunction at all -- see [`parse_body_factors`] -- which the caller sends
 /// down the ProductZipper path. Every CONJUNCT shape is handled here, including the degenerate
 /// body with no conjunct. A `false` from `effect` stops the search, as it stops the stock scan.
-pub fn query_multi_leapfrog<F: FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(
+pub fn query_multi_leapfrog<F: FnMut(Result<&[u32], &Bindings>, Expr) -> bool>(
     map: &PathMap<()>,
     pat_expr: Expr,
     mut effect: F,
@@ -1385,7 +1334,7 @@ pub fn query_multi_leapfrog<F: FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>
         // bindings. This mirrors `Space::query_multi`'s `n_factors == 1` arm byte for byte,
         // including that it calls `effect` once, ignores the answer, and returns 1 -- and that it
         // does NOT bump the `unifications` counter, so the printed statistics stay identical.
-        effect(Err(BTreeMap::new()), pat_expr);
+        effect(Err(&Bindings::new()), pat_expr);
         return 1;
     }
     let var_order: Vec<usize> = (0..nvars).collect();
@@ -1402,10 +1351,9 @@ pub fn query_multi_leapfrog<F: FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>
     let mut on_match = |bindings: &Bindings, loc: Expr| -> bool {
         unsafe { crate::space::unifications += 1 };
         candidate += 1;
-        // `effect` owns its map, so hand it a copy of the join's; the join keeps solving from
-        // the original as the recursion unwinds. A handful of entries per answer, against the
-        // whole-tuple re-unification (plus a fact rebuild per factor) this replaces.
-        effect(Err(bindings.clone()), loc)
+        // The effect borrows the join's live map for the duration of the answer -- the last
+        // per-answer allocation of the emit path (a BTreeMap deep clone) is gone.
+        effect(Err(bindings), loc)
     };
     run_unify_join_stream_bindings(map, &factors, &var_order, nvars, &mut on_match);
     candidate
@@ -1486,6 +1434,11 @@ struct UnifyJoin<'a> {
     next_step: Vec<usize>,
     data_intro: Vec<u8>,
     bindings: Bindings,
+    /// Keys inserted into `bindings` by incremental unification, in order; `match_candidate`
+    /// unwinds to its mark on backtrack. See [`mork_expr::unify_into`].
+    trail: Vec<ExprVar>,
+    /// Scratch equation stack for [`mork_expr::unify_into`], reused across candidates.
+    unify_stack: Vec<(ExprEnv, ExprEnv)>,
     /// Pool of [`CandidateBuf`]s for the lead enumeration, one in flight per active recursion
     /// depth; released buffers return here with their allocations intact.
     free_bufs: Vec<CandidateBuf>,
@@ -1905,23 +1858,12 @@ impl UnifyJoin<'_> {
     }
 
     fn query_var_env(&self, v: usize) -> ExprEnv {
-        ExprEnv {
-            n: QUERY_NS,
-            v: v as u8,
-            offset: 0,
-            ground_skip: 0,
-            base: Expr::from_slice(&NEW_VAR_EXPR_BYTES),
-        }
+        ExprEnv::with_intro(QUERY_NS, v as u8, Expr::from_slice(&NEW_VAR_EXPR_BYTES))
     }
 
+    #[allow(dead_code)]
     fn var_env(&self, (n, v): ExprVar) -> ExprEnv {
-        ExprEnv {
-            n,
-            v,
-            offset: 0,
-            ground_skip: 0,
-            base: Expr::from_slice(&NEW_VAR_EXPR_BYTES),
-        }
+        ExprEnv::with_intro(n, v, Expr::from_slice(&NEW_VAR_EXPR_BYTES))
     }
 
     /// An env viewing `bytes` where they already are. The candidate's bytes always live in memory
@@ -1937,28 +1879,18 @@ impl UnifyJoin<'_> {
     fn env_over(&mut self, namespace: u8, intro: u8, bytes: &[u8], ground: bool) -> ExprEnv {
         // Groundness arrives from whoever walked the bytes (the enumerating cursor's exact tag
         // counts, or a wildcard branch that knows it descended a variable) -- never from a rescan.
-        let ground_skip = if ground && bytes.len() <= u16::MAX as usize { bytes.len() as u16 } else { 0 };
-        ExprEnv {
-            n: namespace,
-            v: intro,
-            offset: 0,
-            ground_skip,
-            base: Expr::from_slice(bytes),
+        let mut env = ExprEnv::with_intro(namespace, intro, Expr::from_slice(bytes));
+        if ground && bytes.len() <= u16::MAX as usize {
+            // SAFETY: `bytes` IS the subterm (the enumeration copied exactly one complete value),
+            // and `ground` came from the walk that produced it, not from a guess.
+            unsafe { env.stamp_ground(bytes.len() as u16) };
         }
+        env
     }
 
     fn data_env_for(&mut self, f: usize, bytes: &[u8], vars: (u8, u8)) -> ExprEnv {
         // Factor f's data lives in namespace 1 + f; QUERY_NS = 0 is the query's own.
         self.env_over(1 + f as u8, self.data_intro[f], bytes, vars.1 == 0)
-    }
-
-    fn unified_bindings(&self, lhs: ExprEnv, rhs: ExprEnv) -> Option<Bindings> {
-        let mut pairs = Vec::with_capacity(self.bindings.len() + 1);
-        for (&var, &env) in &self.bindings {
-            pairs.push((self.var_env(var), env));
-        }
-        pairs.push((lhs, rhs));
-        unify(&mut pairs).ok()
     }
 
     fn deref_env(&self, env: ExprEnv) -> ExprEnv {
@@ -2356,15 +2288,29 @@ impl UnifyJoin<'_> {
         if self.stopped {
             return;
         }
-        let saved_bindings = self.bindings.clone();
+        // Bind the ONE new equation against the live map, and unwind by trail instead of cloning
+        // the whole map and re-solving every prior equation per candidate. The 3-axiom step trace
+        // showed the same binding re-derived up to 18x per answer under the old scheme, and on the
+        // big.metta self-join the re-solving cost 11.6x the ProductZipper's unification work.
         let data_env = self.data_env_for(f, bytes, vars);
-        if let Some(bindings) = self.unified_bindings(pattern, data_env) {
-            self.bindings = bindings;
+        let mark = self.trail.len();
+        self.unify_stack.clear();
+        self.unify_stack.push((pattern, data_env));
+        let mut stack = std::mem::take(&mut self.unify_stack);
+        let mut trail = std::mem::take(&mut self.trail);
+        let ok = unify_into(&mut self.bindings, &mut stack, &mut trail).is_ok();
+        self.unify_stack = stack;
+        self.trail = trail;
+        if ok {
             // The intro delta is the candidate's NewVar count, which the enumeration walk already
             // counted exactly -- no rescan, no `newvars` item walk.
             self.with_bound_path_bytes(f, bytes, vars.0, cont);
         }
-        self.bindings = saved_bindings;
+        // A failed unify may have inserted before failing; unwind either way. An insert target is
+        // always a previously-unbound key, so removal restores the map exactly.
+        for k in self.trail.split_off(mark) {
+            self.bindings.remove(&k);
+        }
     }
 
     fn match_expr_at_current(
@@ -2561,7 +2507,7 @@ mod tests {
         rows.into_iter()
             .map(|row| {
                 row.into_iter()
-                    .map(|component| component.filter(|bytes| first_subterm(bytes).is_some_and(|props| props.ground)))
+                    .map(|component| component.filter(|bytes| Expr::from_slice(bytes).variables() == 0))
                     .collect::<Option<Vec<Vec<u8>>>>()
             })
             .collect()
@@ -3184,49 +3130,6 @@ mod tests {
         ])));
     }
 
-    /// Test-local aliases over the shared walk (the join's own copies are gone).
-    fn first_subterm_len(bytes: &[u8]) -> usize {
-        first_subterm(bytes).expect("well-formed test term").length
-    }
-    fn first_subterm_is_ground(bytes: &[u8]) -> bool {
-        first_subterm(bytes).expect("well-formed test term").ground
-    }
-
-    #[test]
-    fn first_subterm_len_parses_each_shape() {
-        // symbol "ab": SymbolSize(2), 'a', 'b'  -> 3 bytes
-        let sym = [item_byte(Tag::SymbolSize(2)), b'a', b'b'];
-        assert_eq!(first_subterm_len(&sym), 3);
-        assert!(first_subterm_is_ground(&sym));
-
-        // NewVar -> 1 byte, non-ground
-        let nv = [item_byte(Tag::NewVar)];
-        assert_eq!(first_subterm_len(&nv), 1);
-        assert!(!first_subterm_is_ground(&nv));
-
-        // VarRef(0) -> 1 byte, non-ground
-        let vr = [item_byte(Tag::VarRef(0))];
-        assert_eq!(first_subterm_len(&vr), 1);
-        assert!(!first_subterm_is_ground(&vr));
-
-        // (k v0):  Arity(2), Sym("k"), Sym("v0")
-        let k = item_byte(Tag::SymbolSize(1));
-        let v0 = item_byte(Tag::SymbolSize(2));
-        let compound = [item_byte(Tag::Arity(2)), k, b'k', v0, b'v', b'0'];
-        assert_eq!(first_subterm_len(&compound), 6);
-        assert!(first_subterm_is_ground(&compound));
-
-        // (k $x): Arity(2), Sym("k"), NewVar  -> 4 bytes, non-ground
-        let compound_var = [item_byte(Tag::Arity(2)), k, b'k', item_byte(Tag::NewVar)];
-        assert_eq!(first_subterm_len(&compound_var), 4);
-        assert!(!first_subterm_is_ground(&compound_var));
-
-        // trailing bytes after the first subterm are ignored: (e A B) prefix then junk
-        let mut buf = compound.to_vec();
-        buf.extend_from_slice(&[0xFF, 0xFF]);
-        assert_eq!(first_subterm_len(&buf), 6);
-    }
-
     /// A generated fact column: a ground symbol, or a fact variable slot (a slot shared within the
     /// fact encodes as NewVar on first use and VarRef after, so facts can be coreferent).
     enum FCol {
@@ -3310,13 +3213,8 @@ mod tests {
         if fi == query_exprs.len() {
             let mut row = Vec::with_capacity(nvars);
             for v in 0..nvars {
-                let mut env = ExprEnv {
-                    n: QUERY_NS,
-                    v: v as u8,
-                    offset: 0,
-                    ground_skip: 0,
-                    base: Expr::from_slice(&NEW_VAR_EXPR_BYTES),
-                };
+                let mut env =
+                    ExprEnv::with_intro(QUERY_NS, v as u8, Expr::from_slice(&NEW_VAR_EXPR_BYTES));
                 loop {
                     let Some(var) = env.var_opt() else { break };
                     match bindings.get(&var) {
@@ -3325,7 +3223,7 @@ mod tests {
                     }
                 }
                 let bytes = unsafe { env.subsexpr().span().as_ref().unwrap() }.to_vec();
-                if !first_subterm(&bytes).is_some_and(|props| props.ground) {
+                if Expr::from_slice(&bytes).variables() != 0 {
                     return;
                 }
                 row.push(bytes);
@@ -3564,13 +3462,8 @@ mod tests {
         v: usize,
         cycled: &mut BTreeMap<ExprVar, u8>,
     ) -> Option<Vec<u8>> {
-        let mut env = ExprEnv {
-            n: QUERY_NS,
-            v: v as u8,
-            offset: 0,
-            ground_skip: 0,
-            base: Expr::from_slice(&NEW_VAR_EXPR_BYTES),
-        };
+        let mut env =
+            ExprEnv::with_intro(QUERY_NS, v as u8, Expr::from_slice(&NEW_VAR_EXPR_BYTES));
         loop {
             match env.var_opt() {
                 Some(var) => match bindings.get(&var) {
